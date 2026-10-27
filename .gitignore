@@ -1,0 +1,11 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies & Build Artifacts
+target/
+dist/
+build/
+*.log
+.DS_Store

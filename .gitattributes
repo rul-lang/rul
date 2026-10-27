@@ -1,0 +1,2 @@
+# Rul (.rl) Binary Language & GitHub Linguist Configuration
+*.rl binary diff=rul linguist-language=Rul
