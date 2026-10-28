@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+title: "Rul (.rl): A 128-Bit Schedule- and Proof-Carrying Binary SSA-DAG Programming Language and Execution Engine for Autonomous AI Agents"
+message: "If you use Rul (.rl), its binary specification, O(N) linear verifier, or execution engine in your research or software, please cite it using the metadata below."
+type: software
+authors:
+  - family-names: "Tran"
+    given-names: "Trong Tri"
+    alias: "Tymon Tran"
+    email: "tymon3568@gmail.com"
+repository-code: "https://github.com/rul-lang/rul"
+url: "https://github.com/rul-lang/rul"
+license:
+  - MIT
+  - Apache-2.0
+version: "0.1.0"
+date-released: "2026-10-28"
+keywords:
+  - "AI Agents"
+  - "Programming Language"
+  - "Binary Intermediate Representation"
+  - "Proof-Carrying Code"
+  - "Schedule-Carrying Code"
+  - "Affine Types"
+  - "SIMD Kernel Fusion"
+  - "Columnar Execution Engine"
+abstract: >-
+  Traditional programming languages (C, Go, Rust, Python) are designed around human biological constraints:
+  low-bandwidth keyboard input and visual ASCII source reading, which impose a massive serialization,
+  parsing, type-inference, and LLVM optimization tax on autonomous AI Agents. Rul (.rl) eliminates textual
+  source code as the primary representation, replacing it with a memory-mapped flat binary topological
+  SSA-DAG where every instruction is a fixed 128-bit (16-byte) NodeFrame encoding Algorithm + ScheduleHint + ProofIdx + AffineToken/ReadLease.
+  Because the AI Agent emits explicit schedule hints and safety witnesses alongside the algorithm, the Rul
+  compiler performs zero type inference and zero search: a single-pass O(N) linear verifier mathematically
+  guarantees 100% absence of memory aliasing, use-after-consume, buffer overflows, and sandbox capability
+  violations in under 1 millisecond, while the 3-tier execution engine and direct x86_64 ELF64 AOT compiler
+  fuse multi-stage columnar pipelines into single-pass register loops.

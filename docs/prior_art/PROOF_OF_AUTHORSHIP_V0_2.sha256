@@ -1,0 +1,30 @@
+# RUL (.rl) CRYPTOGRAPHIC PRIOR ART & AUTHORSHIP MANIFEST (v0.2 Complete — AVX2 AOT + MCP + CAS + FFI)
+# Inventor & Copyright Holder: Tran Trong Tri (Tymon Tran) <tymon3568@gmail.com>
+# Canonical Repository: https://github.com/rul-lang/rul
+# License: MIT OR Apache-2.0
+# Timestamp (UTC): 2026-10-28T06:13:39Z
+
+441fd74eb4aa891b422b8459648b33889d82c6d9fd4c9ac36ba3e739f1295899  Cargo.toml
+662c0c4e2c8429d872754af1fcdff869e2db9273654829319f35f2f0c199a82c  LICENSE-MIT
+7ffcbadd2a899f1be13d7aae6c0e1ef5e2b1b3a3edc059bd3fd9b6d42092b556  LICENSE-APACHE
+0e9200f40494de89ac89fb403f61a14c3100a8533d8a7d29b6dc448b4a117802  NOTICE
+6307ece1c297bf377a91c4f84db9e99762e316d3362154afddca8c70d3720d6b  TRADEMARK.md
+d3a2337c531698de54886098d8a195abe43115d1cc45eacebaea36474cfc47a0  CITATION.cff
+b1555f7c6319480347bf78051058d36cfba185a5ef0dde621b06e5089015ed96  .zenodo.json
+4995b224c422fcfa17517efa071f1c3cd69a0f8d907450fe70e109e3169788bf  README.md
+0c9781f37b54ba02f6b2c53c40f39f1e0d6b8ff76ef66a1d8b767777e364d6d3  docs/new_language_for_AI.md
+7bc840856386f408b206d535c6905ac667175e52526bbc293ea51571c304388a  docs/rul_spec_v0.md
+c18fc129d30783f6cebe00006d01fdb530088c7cc1e90b95dda34ce520936507  docs/about_rul.md
+7165594b124b58febd2dfa28d4cadc919d6fbd34c724d1d42692e5ec9d885cf3  docs/WHITEPAPER_RUL_V0_1.md
+2e6f5cd236b9fbaf2d851750c2ec93cc50d2b2747fb44ceb14ee13024a74df4e  src/aot.rs
+61062797aa0090c3ef3159a822f6b3802618b0781cecc906d1e78de7c64174a6  src/bytecode.rs
+7aceb729710c90c051f42cd5ccb96280f2e9c0bddcd24001a088f7a6de6147fc  src/cas.rs
+4c51f83efd5d1edd409a9e819f75275e0ddf369830b115136a28b31628a66def  src/engine.rs
+db1cc29b099d5f6b9659970e4c99bb2445e0a9201ee3cb5d23dcdc134cdf3fae  src/ffi.rs
+f920df6dce886def837b2c8fa3fb9fb6397ba3b923fce3f272e9e4c905fa7c0a  src/lib.rs
+e841dabf602da9712083148233a32e8350260fe4df9d2eb2fb387f2b4e6f36f9  src/mcp.rs
+8cf66bfa6182463d24916b31d5fe86c9e345f1cf5e10aec1c67af768021d51cb  src/suite10.rs
+20d153bf9325a3eb242d8120addf990d564dcd709dd059cbc7619a1cc23d38c5  src/transpiler.rs
+76c5727ebe6a83b108b56111181d2669369629563357fbe2ad02dffcae96db84  src/verifier.rs
+a070925d3a028561e5751aa6de17f190e9732ade8ed9fb7aa894a12dfb0e4ef9  src/bin/rul_bench.rs
+22f6c705c3da670ccae17789afa96ae53765f62ed0435530285bbeee49d42839  src/bin/rul_mcp.rs

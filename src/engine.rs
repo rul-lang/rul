@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::Instant;
 
-use crate::bytecode::{ExecPolicy, NodeFrame, Opcode, RulProgram};
+use crate::bytecode::{ExecPolicy, NodeFrame, Opcode, RulProgram, ScheduleHint};
 use crate::verifier::{verify_program, VerifyDiagnostic};
 
 /// L1-Cache Tile width (`1,024` `f64` elements = `8 KB`, fitting comfortably inside 32–48 KB L1d).
@@ -1397,4 +1397,129 @@ fn eval_tile_cmp_gt(
         }
     }
     Some(())
+}
+
+/// Telemetry and schedule configuration for a single evaluated schedule candidate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutotuneCandidate {
+    /// Execution policy tested (`AutoL1Tile`, `SimdStream`, `MultiCore`).
+    pub policy: ExecPolicy,
+    /// Fusion group ID applied (`0` for unfused, `1` for fused).
+    pub fusion_group: u8,
+    /// Measured hardware telemetry for this candidate.
+    pub telemetry: HardwareTelemetry,
+}
+
+/// Result of running the automatic hardware schedule explorer (`autotune_schedule`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutotuneReport {
+    /// Winning `ScheduleHint` that achieved the highest `reward_score`.
+    pub best_schedule: ScheduleHint,
+    /// Hardware telemetry of the winning schedule.
+    pub best_telemetry: HardwareTelemetry,
+    /// Verified output value (guaranteed equivalent to Tier 0 Interpreter).
+    pub output: RuntimeValue,
+    /// All evaluated schedule candidates in exploration order.
+    pub candidates: Vec<AutotuneCandidate>,
+}
+
+fn values_approx_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
+    match (a, b) {
+        (RuntimeValue::Scalar(x), RuntimeValue::Scalar(y)) => {
+            let diff = (x - y).abs();
+            let scale = x.abs().max(y.abs()).max(1.0);
+            diff / scale <= 1e-9
+        }
+        (RuntimeValue::ColumnF64(xs), RuntimeValue::ColumnF64(ys)) => {
+            if xs.len() != ys.len() {
+                return false;
+            }
+            xs.iter().zip(ys.iter()).all(|(&x, &y)| {
+                let diff = (x - y).abs();
+                let scale = x.abs().max(y.abs()).max(1.0);
+                diff / scale <= 1e-9
+            })
+        }
+        (RuntimeValue::ColumnMask(xs), RuntimeValue::ColumnMask(ys)) => xs == ys,
+        _ => false,
+    }
+}
+
+/// Automatically sweeps `ScheduleHint` policies (`AutoL1Tile`, `SimdStream`, `MultiCore`)
+/// against `execute_tier2_with_zonemap`, verifies differential equivalence against
+/// `execute_tier0_interpreter`, mutates `program` in-place with the winning schedule,
+/// and returns the [`AutotuneReport`].
+pub fn autotune_schedule(
+    program: &mut RulProgram,
+    inputs: &[&[f64]],
+    zonemap_a0: Option<&ArenaZoneMap>,
+) -> Result<AutotuneReport, ExecError> {
+    let baseline = execute_tier0_interpreter(program, inputs)?;
+
+    let schedule_space = [
+        ScheduleHint {
+            fusion_group: 0,
+            policy: ExecPolicy::AutoL1Tile,
+        },
+        ScheduleHint {
+            fusion_group: 1,
+            policy: ExecPolicy::AutoL1Tile,
+        },
+        ScheduleHint {
+            fusion_group: 1,
+            policy: ExecPolicy::SimdStream,
+        },
+        ScheduleHint {
+            fusion_group: 1,
+            policy: ExecPolicy::MultiCore,
+        },
+    ];
+
+    let mut candidates = Vec::with_capacity(schedule_space.len());
+    let mut best_schedule = ScheduleHint::fused_simd(1);
+    let mut best_telemetry: Option<HardwareTelemetry> = None;
+
+    for sched in schedule_space {
+        for node in &mut program.nodes {
+            node.schedule = sched;
+        }
+        let rep = execute_tier2_with_zonemap(program, inputs, zonemap_a0)?;
+        if !values_approx_equal(&baseline.output, &rep.output) {
+            return Err(ExecError::ContractAssertionFailed {
+                node_idx: program.output_node,
+                observed: f64::NAN,
+            });
+        }
+
+        let is_better = match &best_telemetry {
+            None => true,
+            Some(prev) => {
+                rep.telemetry.reward_score > prev.reward_score
+                    || ((rep.telemetry.reward_score - prev.reward_score).abs() <= f64::EPSILON
+                        && rep.telemetry.exec_ns < prev.exec_ns)
+            }
+        };
+
+        if is_better {
+            best_schedule = sched;
+            best_telemetry = Some(rep.telemetry);
+        }
+
+        candidates.push(AutotuneCandidate {
+            policy: sched.policy,
+            fusion_group: sched.fusion_group,
+            telemetry: rep.telemetry,
+        });
+    }
+
+    for node in &mut program.nodes {
+        node.schedule = best_schedule;
+    }
+
+    Ok(AutotuneReport {
+        best_schedule,
+        best_telemetry: best_telemetry.unwrap_or(baseline.telemetry),
+        output: baseline.output,
+        candidates,
+    })
 }

@@ -11,7 +11,11 @@ use std::fmt::{self, Write as _};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::aot::{
+    compile_rl_to_executable, run_compiled_executable, write_arena_data_file, AotError,
+};
 use crate::bytecode::{
     Opcode, ProofEntry, ProofRuleKind, RulFormatError, RulProgram, ScheduleHint, TypeLane,
     CAP_NET_RING, CAP_NONE,
@@ -19,8 +23,12 @@ use crate::bytecode::{
 use crate::engine::{
     execute_tier0_interpreter, execute_tier1_stencil, execute_tier2_fused, ExecError, RuntimeValue,
 };
-use crate::transpiler::{SymbolicGraphBuilder, TranspileError};
+use crate::transpiler::{
+    assemble_rls, program_to_rls, RlsError, SymbolicGraphBuilder, TranspileError,
+};
 use crate::verifier::{verify_program, VerifyDiagnostic};
+
+static SUITE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum permitted `.rl` file size when loading from disk (16 MiB bounded read).
 pub const MAX_RL_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -36,6 +44,10 @@ pub enum SuiteError {
     Format(RulFormatError),
     /// Symbolic transpiler error.
     Transpile(TranspileError),
+    /// Flat `.rls` assembly error.
+    Rls(RlsError),
+    /// Standalone AOT compilation or execution error.
+    Aot(AotError),
     /// Static $O(N)$ verification error.
     Verify(VerifyDiagnostic),
     /// Runtime execution error.
@@ -58,6 +70,8 @@ impl fmt::Display for SuiteError {
             Self::FileTooLarge(sz) => write!(f, ".rl file too large: {sz} bytes"),
             Self::Format(e) => write!(f, "format error: {e}"),
             Self::Transpile(e) => write!(f, "transpile error: {e}"),
+            Self::Rls(e) => write!(f, ".rls error: {e}"),
+            Self::Aot(e) => write!(f, "AOT error: {e}"),
             Self::Verify(e) => write!(f, "verify error: {e}"),
             Self::Exec(e) => write!(f, "execution error: {e}"),
             Self::OracleMismatch {
@@ -112,6 +126,10 @@ pub struct PipelineCaseReport {
     pub node_count: usize,
     /// Total `.rl` binary size in bytes (including 64-byte header).
     pub rl_bytes: usize,
+    /// Standalone Zero-Runtime `ELF64` executable size in bytes.
+    pub aot_elf_bytes: usize,
+    /// Total `rul compile` AOT latency (`verify + x86_64 stencil codegen`) in nanoseconds.
+    pub aot_compile_ns: u64,
     /// Intermediate heap bytes allocated by Tier 2 (`0` for L1-tiled/fused pipelines).
     pub interm_bytes_t2: usize,
     /// Single-pass $O(N)$ verification latency in nanoseconds.
@@ -120,7 +138,7 @@ pub struct PipelineCaseReport {
     pub exec_ns: u64,
     /// Verified scalar output.
     pub output_scalar: f64,
-    /// True if `Tier 0 == Tier 1 == Tier 2 == Ground-Truth`.
+    /// True if `Tier 0 == Tier 1 == Tier 2 == AOT_ELF64 == Ground-Truth`.
     pub tiers_matched: bool,
     /// Whether sidecar `ProofEntry`, `L1-Tiled`, or `AffineConsume` was exercised.
     pub proof_feature: &'static str,
@@ -512,10 +530,33 @@ fn eval_case(
 ) -> Result<PipelineCaseReport, SuiteError> {
     let _summary = verify_program(prog).map_err(SuiteError::Verify)?;
 
-    // Execute across all 3 tiers and enforce differential equivalence!
+    // 1. Verify lossless .rls flat symbolic roundtrip without rustc!
+    let rls_src = program_to_rls(prog);
+    let rls_prog = assemble_rls(&rls_src).map_err(SuiteError::Rls)?;
+    if &rls_prog != prog {
+        return Err(SuiteError::OracleMismatch {
+            pipeline: name,
+            expected,
+            observed: f64::NAN,
+        });
+    }
+
+    // 2. Execute across all 3 in-memory tiers AND standalone Zero-Runtime AOT ELF64 binary!
     let rep0 = execute_tier0_interpreter(prog, inputs).map_err(SuiteError::Exec)?;
     let rep1 = execute_tier1_stencil(prog, inputs).map_err(SuiteError::Exec)?;
     let rep2 = execute_tier2_fused(prog, inputs).map_err(SuiteError::Exec)?;
+
+    let seq = SUITE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let exe_path = std::env::temp_dir().join(format!("rul_aot_{name}_{pid}_{seq}"));
+    let data_path = std::env::temp_dir().join(format!("rul_aot_{name}_{pid}_{seq}.bin"));
+
+    let aot_rep = compile_rl_to_executable(prog, &exe_path).map_err(SuiteError::Aot)?;
+    write_arena_data_file(&data_path, inputs).map_err(SuiteError::Aot)?;
+    let obs_aot_res = run_compiled_executable(&exe_path, &data_path);
+    let _ = fs::remove_file(&exe_path);
+    let _ = fs::remove_file(&data_path);
+    let obs_aot = obs_aot_res.map_err(SuiteError::Aot)?;
 
     let (RuntimeValue::Scalar(obs0), RuntimeValue::Scalar(obs1), RuntimeValue::Scalar(obs2)) =
         (rep0.output, rep1.output, rep2.output)
@@ -531,13 +572,14 @@ fn eval_case(
     let err0 = (obs0 - expected).abs() / denom;
     let err1 = (obs1 - expected).abs() / denom;
     let err2 = (obs2 - expected).abs() / denom;
+    let err_aot = (obs_aot - expected).abs() / denom;
     let err_t0_t2 = (obs0 - obs2).abs() / denom;
 
-    if err0 > 1e-9 || err1 > 1e-9 || err2 > 1e-9 || err_t0_t2 > 1e-9 {
+    if err0 > 1e-9 || err1 > 1e-9 || err2 > 1e-9 || err_aot > 1e-9 || err_t0_t2 > 1e-9 {
         return Err(SuiteError::OracleMismatch {
             pipeline: name,
             expected,
-            observed: obs2,
+            observed: obs_aot,
         });
     }
 
@@ -545,6 +587,8 @@ fn eval_case(
         name,
         node_count: prog.nodes.len(),
         rl_bytes: prog.to_rl_bytes().len(),
+        aot_elf_bytes: aot_rep.elf_bytes,
+        aot_compile_ns: aot_rep.total_compile_ns,
         interm_bytes_t2: rep2.telemetry.intermediate_bytes_allocated,
         verify_ns: rep2.telemetry.verify_ns,
         exec_ns: rep2.telemetry.exec_ns,
@@ -560,25 +604,26 @@ pub fn format_suite10_table(reports: &[PipelineCaseReport]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "=== 4. 10-PIPELINE DIFFERENTIAL VERIFICATION SUITE (T0 == T1 == T2 == ORACLE) ==="
+        "=== 4. 10-PIPELINE DIFFERENTIAL & ZERO-RUNTIME AOT SUITE (T0 == T1 == T2 == AOT_ELF64 == ORACLE) ==="
     );
     let _ = writeln!(
         out,
-        "PIPELINE                   | NODES | .RL BYTES | T2 INTERM RAM | VERIFY (ns) | T0==T1==T2 | PROOF / SCHEDULE CERTIFICATE"
+        "PIPELINE                   | NODES | .RL BYTES | ELF64 BIN | AOT COMPILE | VERIFY (ns) | T0=T1=T2=AOT | PROOF / SCHEDULE CERTIFICATE"
     );
     let _ = writeln!(
         out,
-        "---------------------------------------------------------------------------------------------------------------------------"
+        "-------------------------------------------------------------------------------------------------------------------------------------------"
     );
     for r in reports {
         let match_str = if r.tiers_matched { "PASS" } else { "FAIL" };
         let _ = writeln!(
             out,
-            "{:<26} | {:>5} | {:>7} B | {:>11} B | {:>9} ns | {:>10} | {}",
+            "{:<26} | {:>5} | {:>7} B | {:>7} B | {:>8} ns | {:>8} ns | {:>12} | {}",
             r.name,
             r.node_count,
             r.rl_bytes,
-            r.interm_bytes_t2,
+            r.aot_elf_bytes,
+            r.aot_compile_ns,
             r.verify_ns,
             match_str,
             r.proof_feature

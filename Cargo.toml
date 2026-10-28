@@ -2,8 +2,14 @@
 name = "rul"
 version = "0.1.0"
 edition = "2021"
-description = "Programming language for AI agents."
-license = "MIT"
+authors = ["Tran Trong Tri (Tymon Tran) <tymon3568@gmail.com>"]
+description = "Rul (.rl) — Schedule- and Proof-Carrying 128-Bit Binary Programming Language & Execution Engine for AI Agents."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rul-lang/rul"
+homepage = "https://github.com/rul-lang/rul"
+readme = "README.md"
+keywords = ["ai-agents", "compiler", "binary-ir", "simd", "columnar"]
+categories = ["compilers", "science", "concurrency"]
 
 [lib]
 name = "rul"
@@ -12,6 +18,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "rul-bench"
 path = "src/bin/rul_bench.rs"
+
+[[bin]]
+name = "rul-mcp"
+path = "src/bin/rul_mcp.rs"
 
 [profile.release]
 opt-level = 3

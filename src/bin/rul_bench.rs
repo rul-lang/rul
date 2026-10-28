@@ -16,16 +16,21 @@
 #![deny(clippy::unimplemented)]
 #![deny(clippy::indexing_slicing)]
 
+use std::fs::File;
 use std::hint::black_box;
+use std::io::Read;
 use std::time::Instant;
 
+use rul::aot::{compile_rl_to_executable, compile_to_elf64_bytes, run_compiled_executable};
 use rul::bytecode::{
     ArenaDescriptor, ExecPolicy, NodeFrame, Opcode, RulProgram, ScheduleHint, TokenOp, TypeLane,
     CAP_NONE,
 };
 use rul::engine::{execute_tier2_fused, execute_tier2_with_zonemap, ArenaZoneMap, RuntimeValue};
-use rul::suite10::{format_suite10_table, load_rl_file, run_10_pipeline_suite, save_rl_file};
-use rul::transpiler::{disassemble_rl, SymbolicGraphBuilder};
+use rul::suite10::{
+    format_suite10_table, load_rl_file, run_10_pipeline_suite, save_rl_file, MAX_RL_FILE_BYTES,
+};
+use rul::transpiler::{assemble_rls, disassemble_rl, program_to_rls, SymbolicGraphBuilder};
 use rul::verifier::verify_program;
 
 /// Traditional human-written Array-of-Structs (AoS) record (64 bytes per record,
@@ -234,15 +239,45 @@ where
     )
 }
 
-fn main() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
-    if let (Some(cmd), Some(path)) = (args.get(1), args.get(2)) {
-        if cmd == "inspect" {
-            let prog = load_rl_file(path).map_err(|e| e.to_string())?;
+fn read_bounded_utf8(path: &str) -> Result<String, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let mut s = String::new();
+    file.take(MAX_RL_FILE_BYTES)
+        .read_to_string(&mut s)
+        .map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+fn load_rl_or_rls(path: &str) -> Result<RulProgram, String> {
+    if path.ends_with(".rls") {
+        let text = read_bounded_utf8(path)?;
+        assemble_rls(&text).map_err(|e| e.to_string())
+    } else {
+        load_rl_file(path).map_err(|e| e.to_string())
+    }
+}
+
+fn handle_cli(args: &[String]) -> Result<bool, String> {
+    let Some(cmd) = args.get(1).map(String::as_str) else {
+        return Ok(false);
+    };
+    let Some(path) = args.get(2).map(String::as_str) else {
+        return Ok(false);
+    };
+
+    match cmd {
+        "inspect" => {
+            let prog = load_rl_or_rls(path)?;
             println!("{}", disassemble_rl(&prog));
-            return Ok(());
-        } else if cmd == "verify" {
+            Ok(true)
+        }
+        "decompile" => {
             let prog = load_rl_file(path).map_err(|e| e.to_string())?;
+            print!("{}", program_to_rls(&prog));
+            Ok(true)
+        }
+        "verify" => {
+            let prog = load_rl_or_rls(path)?;
             let t0 = Instant::now();
             let summary = verify_program(&prog).map_err(|e| e.to_string())?;
             let ns = t0.elapsed().as_nanos();
@@ -253,21 +288,92 @@ fn main() -> Result<(), String> {
                 summary.output_shape,
                 summary.zero_runtime_bounds_checks
             );
-            return Ok(());
+            Ok(true)
         }
+        "pack" => {
+            let out_path = args
+                .get(3)
+                .map(String::as_str)
+                .ok_or_else(|| "usage: rul_bench pack <input.rls> <output.rl>".to_owned())?;
+            let text = read_bounded_utf8(path)?;
+            let t0 = Instant::now();
+            let prog = assemble_rls(&text).map_err(|e| e.to_string())?;
+            let summary = verify_program(&prog).map_err(|e| e.to_string())?;
+            let pack_ns = t0.elapsed().as_nanos();
+            let bytes = save_rl_file(out_path, &prog).map_err(|e| e.to_string())?;
+            println!(
+                "[PACKED OK] {path} -> {out_path} ({bytes} bytes) | Nodes={} | Verify+Pack={pack_ns} ns (0 rustc invocations)",
+                summary.node_count
+            );
+            Ok(true)
+        }
+        "compile" => {
+            let out_exe = args.get(3).map(String::as_str).ok_or_else(|| {
+                "usage: rul_bench compile <input.rl|.rls> <output_exe>".to_owned()
+            })?;
+            let prog = load_rl_or_rls(path)?;
+            let rep = compile_rl_to_executable(&prog, out_exe).map_err(|e| e.to_string())?;
+            println!(
+                "[AOT COMPILED OK] {path} -> {out_exe} | ELF64={0} B (MachineCode={1} B) | Verify={2} ns | Codegen={3} ns | Total={4} ns (< 1 ms, Zero Runtime)",
+                rep.elf_bytes,
+                rep.machine_code_bytes,
+                rep.verify_ns,
+                rep.codegen_ns,
+                rep.total_compile_ns
+            );
+            Ok(true)
+        }
+        "exec-aot" => {
+            let data_path = args.get(3).map(String::as_str).ok_or_else(|| {
+                "usage: rul_bench exec-aot <compiled_exe> <arena_data.bin>".to_owned()
+            })?;
+            let t0 = Instant::now();
+            let val = run_compiled_executable(path, data_path).map_err(|e| e.to_string())?;
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            println!("[AOT EXEC OK] Binary={path} | Output={val:.6e} | Time={us:.2} us");
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn main() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if handle_cli(&args)? {
+        return Ok(());
     }
 
     let record_count: u32 = 10_000_000;
     let threshold = 1000.0_f64;
     let soa_bytes = (record_count as usize) * std::mem::size_of::<f64>();
 
-    // 1. Emit, save to disk (.rl), reload, and inspect the canonical .rl binary program
+    // 1. Emit, save to disk (.rl & .rls), reload, and inspect the canonical .rl binary program
     let simd_prog = build_rl_pipeline(record_count, threshold, ExecPolicy::SimdStream)?;
     let multicore_prog = build_rl_pipeline(record_count, threshold, ExecPolicy::MultiCore)?;
     let rl_path = "target/risk_pipeline.rl";
+    let rls_path = "target/risk_pipeline.rls";
+    let aot_exe_path = "target/risk_pipeline_aot";
     let written_bytes = save_rl_file(rl_path, &simd_prog).map_err(|e| e.to_string())?;
+    let rls_text = program_to_rls(&simd_prog);
+    std::fs::write(rls_path, &rls_text).map_err(|e| e.to_string())?;
     let reloaded_prog = load_rl_file(rl_path).map_err(|e| e.to_string())?;
-    println!("Saved & reloaded canonical binary: {rl_path} ({written_bytes} bytes)");
+
+    // Measure .rls -> .rl assembly speed and Zero-Runtime ELF64 AOT compilation speed
+    let t_rls = Instant::now();
+    let rls_assembled = assemble_rls(black_box(&rls_text)).map_err(|e| e.to_string())?;
+    let rls_assemble_ns = t_rls.elapsed().as_nanos();
+    if rls_assembled != simd_prog {
+        return Err("rls roundtrip mismatch".to_owned());
+    }
+    let (_elf_img, aot_mem_rep) =
+        compile_to_elf64_bytes(black_box(&simd_prog)).map_err(|e| e.to_string())?;
+    let aot_disk_rep =
+        compile_rl_to_executable(&simd_prog, aot_exe_path).map_err(|e| e.to_string())?;
+
+    println!(
+        "Saved & reloaded canonical binary: {rl_path} ({written_bytes} B) | {rls_path} (Assemble={rls_assemble_ns} ns) | Standalone ELF64: {aot_exe_path} ({} B, In-RAM Compile={} ns)",
+        aot_disk_rep.elf_bytes, aot_mem_rep.total_compile_ns
+    );
     println!("{}", disassemble_rl(&reloaded_prog));
 
     // 2. Benchmark O(N) Verifier throughput on a 10,000-node .rl graph

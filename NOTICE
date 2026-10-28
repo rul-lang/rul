@@ -1,0 +1,18 @@
+Rul (.rl) — Schedule- and Proof-Carrying Binary Programming Language & Execution Engine for AI Agents
+Copyright (c) 2026 Tran Trong Tri (Tymon Tran) <tymon3568@gmail.com>
+
+This product includes software and architectural specifications originally
+invented, designed, and developed by Tran Trong Tri (Tymon Tran):
+- The Rul (.rl) 128-bit Fixed-Frame Binary SSA-DAG Specification
+  (Algorithm + ScheduleHint + ProofIdx + AffineToken/ReadLease)
+- The Single-Pass O(N) Linear Static Verifier (Safety & Capability Sandbox)
+- The 3-Tier Execution Engine (Tier 0 Oracle, Tier 1 Vector Stencils,
+  Tier 2 Whole-Graph Kernel Fuser with L1 Zone-Map Skipping)
+- The Direct x86_64 ELF64 Standalone Ahead-of-Time (AOT) Compiler (`src/aot.rs`)
+
+Canonical Repository: https://github.com/rul-lang/rul
+Original Author Contact: tymon3568@gmail.com
+
+Under Section 4(d) of the Apache License, Version 2.0, and the MIT License,
+all copies, forks, or derivative works (in source or binary form) must retain
+this NOTICE attribution intact.

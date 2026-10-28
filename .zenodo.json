@@ -1,0 +1,26 @@
+{
+  "title": "Rul (.rl): A 128-Bit Schedule- and Proof-Carrying Binary SSA-DAG Programming Language and Execution Engine for Autonomous AI Agents",
+  "upload_type": "software",
+  "description": "<p><strong>Rul (<code>.rl</code>)</strong> is an AI-native binary programming language and execution engine invented by Tran Trong Tri (Tymon Tran). Instead of forcing autonomous AI Agents to emit verbose ASCII source text and wait seconds or minutes for lexer/parser/borrow-checker/LLVM optimization passes, Rul represents programs as memory-mapped flat topological SSA-DAGs made of fixed 128-bit (16-byte) instruction frames (<code>NodeFrame = Algorithm + ScheduleHint + ProofIdx + TokenOp</code>).</p><p>Key architectural contributions in v0.1.0:</p><ul><li><strong>Zero-Parse 128-Bit Binary Format (<code>.rl</code>)</strong>: 64-byte aligned header (<code>RL_MAGIC = RUL\\x00\\x01\\x00\\x00\\x00</code>), 16-byte SoA <code>ArenaDescriptor</code> table, 16-byte <code>ProofEntry</code> refinement sidecar table, and 16-byte <code>NodeFrame</code> instruction DAG.</li><li><strong>Single-Pass O(N) Linear Static Verifier</strong>: Verifies topological termination, linear ownership (<code>AffineConsume</code> + shared <code>ReadLease</code>), bounds-safety by construction (<code>Shape</code> + <code>ProofEntry</code>), and zero-trust hardware sandboxing (<code>CapabilityMask</code>) in ~46 ns/node (&lt; 0.5 ms for 10,000 nodes).</li><li><strong>3-Tier Execution Engine &amp; Direct x86_64 ELF64 AOT Compiler</strong>: Tier 0 Reference Oracle Interpreter, Tier 1 Copy-and-Patch Vector Stencils, Tier 2 Whole-Graph Kernel Fuser with L1-Cache Zone-Map tile skipping, and standalone zero-dependency Linux <code>ELF64</code> machine-code emission.</li><li><strong>Closed-Loop Hardware Telemetry</strong>: Returns a structured reward vector (verification time, execution time, effective memory bandwidth GB/s, intermediate allocations) enabling AI Agents to autonomously mutate <code>ScheduleHint</code> bytes.</li></ul>",
+  "creators": [
+    {
+      "name": "Tran, Trong Tri (Tymon Tran)",
+      "affiliation": "Independent Researcher & Creator of Rul"
+    }
+  ],
+  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "publication_date": "2026-10-28",
+  "keywords": [
+    "AI Agents",
+    "Programming Languages",
+    "Binary IR",
+    "Proof-Carrying Code",
+    "Schedule-Carrying Code",
+    "Affine Ownership",
+    "Columnar SIMD",
+    "Kernel Fusion",
+    "Zero-Trust Sandbox"
+  ],
+  "notes": "Dual-licensed under MIT OR Apache-2.0. Canonical repository: https://github.com/rul-lang/rul"
+}
