@@ -1,5 +1,6 @@
 # Rul (`.rl`) — The AI-Native 128-Bit Binary Programming Language & Execution Engine
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23722094.svg)](https://doi.org/10.5281/zenodo.23722094)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](./LICENSE-APACHE)
 [![Spec: Rul v0.1](https://img.shields.io/badge/Spec-.rl%20v0.1%20(128--bit%20SSA--DAG)-success.svg)](./docs/rul_spec_v0.md)
 [![Whitepaper: v0.1](https://img.shields.io/badge/Whitepaper-Rul%20v0.1-orange.svg)](./docs/WHITEPAPER_RUL_V0_1.md)

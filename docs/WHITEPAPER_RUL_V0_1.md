@@ -2,6 +2,7 @@
 
 - **Author & Inventor**: Tran Trong Tri (Tymon Tran) `<tymon3568@gmail.com>`
 - **Version**: `v0.1.0` (2026-10-28)
+- **Official DOI (CERN Zenodo)**: [`10.5281/zenodo.23722094`](https://doi.org/10.5281/zenodo.23722094) (Concept DOI: [`10.5281/zenodo.23722093`](https://doi.org/10.5281/zenodo.23722093))
 - **Canonical Repository**: `https://github.com/rul-lang/rul`
 - **License**: Dual-licensed under `MIT OR Apache-2.0`
 
@@ -107,7 +108,9 @@ Evaluated on the canonical 10,000,000-element financial risk pipeline (`Filter(a
   year         = {2026},
   month        = oct,
   version      = {0.1.0},
-  url          = {https://github.com/rul-lang/rul},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.23722094},
+  url          = {https://doi.org/10.5281/zenodo.23722094},
   license      = {MIT OR Apache-2.0}
 }
 ```
