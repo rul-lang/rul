@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <!--
+    Rul (.rl) — Official 1-Bit Monochrome Binary Block Logo
+    White Squircle ('1') + 6 Carved Black Binary Register Blocks ('0')
+  -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="#F8FAFC"/>
+  <g fill="#090D16">
+    <!-- 1. Left Columnar Arena Spine (64B-aligned column / stem of R & L) -->
+    <rect x="88" y="80" width="76" height="352" rx="16"/>
+    <!-- 2. Top Algorithm Word Block -->
+    <rect x="184" y="80" width="164" height="72" rx="16"/>
+    <!-- 3. Right Schedule Word Block -->
+    <rect x="348" y="152" width="76" height="84" rx="16"/>
+    <!-- 4. Middle Proof / AffineToken Verifier Bar -->
+    <rect x="184" y="236" width="164" height="72" rx="16"/>
+    <!-- 5. Forward Execution Block (in_a) -->
+    <rect x="272" y="328" width="76" height="104" rx="16"/>
+    <!-- 6. Terminal Output Node Block (in_b / .rl dot) -->
+    <rect x="364" y="360" width="60" height="72" rx="16"/>
+  </g>
+</svg>

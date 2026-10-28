@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/logo/rul-banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/logo/rul-banner-light.svg">
+    <img alt="Rul (.rl) — AI-Native 128-Bit Binary Programming Language" src="./assets/logo/rul-banner-dark.svg" width="100%">
+  </picture>
+</p>
+
 # Rul (`.rl`) — The AI-Native 128-Bit Binary Programming Language & Execution Engine
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23722094.svg)](https://doi.org/10.5281/zenodo.23722094)

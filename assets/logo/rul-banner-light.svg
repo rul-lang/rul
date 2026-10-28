@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340" fill="none">
+  <defs>
+    <clipPath id="bannerClipLight">
+      <rect x="8" y="8" width="1184" height="324" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#bannerClipLight)">
+    <rect x="8" y="8" width="1184" height="324" rx="28" fill="#F8FAFC"/>
+    <g stroke="#E2E8F0" stroke-width="1">
+      <line x1="8" y1="88" x2="1192" y2="88"/>
+      <line x1="8" y1="170" x2="1192" y2="170"/>
+      <line x1="8" y1="252" x2="1192" y2="252"/>
+      <line x1="340" y1="8" x2="340" y2="332"/>
+      <line x1="624" y1="8" x2="624" y2="332"/>
+      <line x1="908" y1="8" x2="908" y2="332"/>
+    </g>
+  </g>
+
+  <rect x="8" y="8" width="1184" height="324" rx="28" stroke="#CBD5E1" stroke-width="2"/>
+
+  <g transform="translate(48, 36) scale(0.5234375)">
+    <rect x="16" y="16" width="480" height="480" rx="96" fill="#FFFFFF" stroke="#090D16" stroke-width="8"/>
+    <g fill="#090D16">
+      <rect x="88" y="80" width="76" height="352" rx="16"/>
+      <rect x="184" y="80" width="164" height="72" rx="16"/>
+      <rect x="348" y="152" width="76" height="84" rx="16"/>
+      <rect x="184" y="236" width="164" height="72" rx="16"/>
+      <rect x="272" y="328" width="76" height="104" rx="16"/>
+      <rect x="364" y="360" width="60" height="72" rx="16"/>
+    </g>
+  </g>
+
+  <text x="364" y="156" fill="#090D16" font-family="system-ui, -apple-system, 'Inter', 'Segoe UI', sans-serif" font-size="112" font-weight="900" letter-spacing="2">
+    rul
+  </text>
+
+  <rect x="572" y="88" width="92" height="52" rx="12" fill="#090D16"/>
+  <text x="618" y="124" text-anchor="middle" fill="#F8FAFC" font-family="ui-monospace, 'JetBrains Mono', 'Fira Code', monospace" font-size="28" font-weight="900">
+    .rl
+  </text>
+
+  <rect x="680" y="88" width="464" height="52" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="912" y="120" text-anchor="middle" fill="#334155" font-family="ui-monospace, 'JetBrains Mono', 'Fira Code', monospace" font-size="16" font-weight="600">
+    magic = b"RUL\x00\x01\x00\x00\x00" · 128-Bit IR
+  </text>
+
+  <text x="368" y="206" fill="#1E293B" font-family="system-ui, -apple-system, 'Inter', 'Segoe UI', sans-serif" font-size="20.5" font-weight="700" letter-spacing="0.2">
+    Rule-Carrying Unified Linear Graph · The AI-Native Binary Language
+  </text>
+
+  <rect x="368" y="236" width="236" height="48" rx="10" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+  <rect x="388" y="253" width="14" height="14" rx="3" fill="#090D16"/>
+  <text x="498" y="266" text-anchor="middle" fill="#090D16" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="15" font-weight="700">
+    16B SSA-DAG IR
+  </text>
+
+  <text x="620" y="267" text-anchor="middle" fill="#64748B" font-family="ui-monospace, monospace" font-size="20" font-weight="700">+</text>
+
+  <rect x="636" y="236" width="236" height="48" rx="10" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+  <rect x="656" y="253" width="14" height="14" rx="3" fill="#090D16"/>
+  <text x="766" y="266" text-anchor="middle" fill="#090D16" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="15" font-weight="700">
+    AVX2 ELF64 AOT
+  </text>
+
+  <text x="888" y="267" text-anchor="middle" fill="#64748B" font-family="ui-monospace, monospace" font-size="20" font-weight="700">+</text>
+
+  <rect x="904" y="236" width="240" height="48" rx="10" fill="#090D16"/>
+  <rect x="924" y="253" width="14" height="14" rx="3" fill="#F8FAFC"/>
+  <text x="1036" y="266" text-anchor="middle" fill="#F8FAFC" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="15" font-weight="800">
+    O(N) 6.1ns Proof
+  </text>
+</svg>
