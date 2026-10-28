@@ -10,10 +10,15 @@ homepage = "https://github.com/rul-lang/rul"
 readme = "README.md"
 keywords = ["ai-agents", "compiler", "binary-ir", "simd", "columnar"]
 categories = ["compilers", "science", "concurrency"]
+default-run = "rul"
 
 [lib]
 name = "rul"
 path = "src/lib.rs"
+
+[[bin]]
+name = "rul"
+path = "src/bin/rul.rs"
 
 [[bin]]
 name = "rul-bench"

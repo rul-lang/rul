@@ -97,38 +97,45 @@ $$\text{Rul Engine} = \text{Single-Pass } O(N) \text{ Verifier} + O(N) \text{ Ve
 
 ---
 
-## Quick Start & CLI (`rul-bench` & `rul-mcp`)
+## Install & Standalone `rul` Toolchain (`Zero-Cargo` Project Workflow)
 
-### 1. Run the Full Benchmark & 10-Pipeline Differential + AVX2 `ELF64` AOT Suite
+### 1. Install the `rul` Toolchain Globally
 ```bash
-cargo run --release --bin rul-bench
+curl -fsSL https://raw.githubusercontent.com/rul-lang/rul/main/install.sh | sh
+# Or via cargo:
+cargo install --git https://github.com/rul-lang/rul --bins --force
 ```
 
-### 2. Pack `.rls`, Inspect, Verify, Compile Standalone `ELF64`, and Execute
+### 2. Create & Run a Pure Rul (`.rl`) Project Anywhere (No `Cargo.toml` / No `rustc`)
 ```bash
-# Decompile a 192-byte .rl binary into lossless flat symbolic .rls text
-cargo run --release --bin rul-bench -- decompile target/risk_pipeline.rl
+# Scaffold a pure Rul project (rul.toml + src/main.rls + data/arena_0.bin)
+rul new my-ai-pipeline
+cd my-ai-pipeline
 
-# Assemble a flat symbolic .rls file directly into a .rl binary (0 rustc invocations)
-cargo run --release --bin rul-bench -- pack target/risk_pipeline.rls target/risk_pipeline.rl
+# Run the single-pass O(N) static verifier (< 50 us)
+rul check
 
-# Disassemble a .rl or .rls program into a human-auditable table
-cargo run --release --bin rul-bench -- inspect target/risk_pipeline.rl
+# Pack .rls -> build/main.rl (208 B) and compile standalone Linux x86_64 AVX2 ELF64 binary (< 10 us)
+rul build
 
-# Run the O(N) static verifier
-cargo run --release --bin rul-bench -- verify target/risk_pipeline.rl
+# Execute via Tier 2 Fused SIMD + Standalone ELF64 AOT + print HardwareTelemetry
+rul run
 
-# Compile .rl / .rls directly into a zero-runtime Linux x86_64 AVX2 ELF64 executable (< 10 us)
-cargo run --release --bin rul-bench -- compile target/risk_pipeline.rl target/risk_pipeline_aot
+# Sweep hardware ScheduleHint policies (AutoL1Tile, SimdStream, MultiCore)
+rul autotune
 ```
 
-### 3. Run the In-Memory MCP Server (`rul-mcp`) for AI Agents
+### 3. Run the Full Benchmark & 10-Pipeline Differential Suite (`rul-bench`)
 ```bash
-cargo build --release --bin rul-mcp
-./target/release/rul-mcp
+rul-bench
 ```
 
-### 4. Run the Verification, Differential, AVX2 AOT, MCP, CAS & FFI Test Suite
+### 4. Run the In-Memory MCP Server (`rul-mcp`) for AI Agents
+```bash
+rul-mcp
+```
+
+### 5. Run the Verification, Differential, AVX2 AOT, MCP, CAS & FFI Test Suite
 ```bash
 cargo test
 ```
