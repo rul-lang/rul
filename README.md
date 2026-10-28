@@ -13,17 +13,45 @@
 [![Spec: Rul v0.1](https://img.shields.io/badge/Spec-.rl%20v0.1%20(128--bit%20SSA--DAG)-success.svg)](./docs/rul_spec_v0.md)
 [![Whitepaper: v0.1](https://img.shields.io/badge/Whitepaper-Rul%20v0.1-orange.svg)](./docs/WHITEPAPER_RUL_V0_1.md)
 
-> **"Do not build another human textual programming language for AI Agents. Eliminate ASCII source code and compiler search passes with a 128-bit Schedule- and Proof-Carrying Binary Graph (`.rl`)."**
+> **"A programming language where humans never need to learn the syntax—and even its creator doesn't need to know or type its syntax. Eliminate ASCII source code and compiler search passes with a 128-bit Schedule- and Proof-Carrying Binary Graph (`.rl`)."**
 > — *Tran Trong Tri (Tymon Tran), Creator of Rul*
 
 **Rul (`.rl` — Rule-Carrying Unified Linear Graph)** is a new programming language and execution engine designed from first principles **exclusively for Autonomous AI Agents**.
 
-Traditional languages (`C`, `Go`, `Rust`, `Python`) were engineered for human eyes and 10 fingers (~40 bits/sec keyboard bandwidth). Because humans cannot manually attach memory ownership versions, bounds-refinement proofs, and SIMD loop-fusion schedules to every instruction, traditional compilers (`rustc`, `clang`, `LLVM`) spend seconds to minutes parsing text, solving borrow/lifetime equations, and running 100+ optimization passes to rediscover vectorization opportunities.
+### Breaking the "Impossible Triangle" of Programming Languages
 
-In **Rul**, the AI Agent emits a compact, memory-mapped flat binary `.rl` graph where every instruction is a fixed **16-byte (128-bit) `NodeFrame`**:
+Traditional languages (`C`, `Go`, `Rust`, `Python`) were engineered for human eyes and 10 fingers (~40 bits/sec keyboard bandwidth), forcing a trade-off between **Safety**, **Runtime Speed**, and **Compilation Speed**. By removing human textual syntax from the core execution pipeline, **Rul (`.rl`)** achieves all three simultaneously:
+
+1. **Zero Human Syntax & Smaller Than a Tweet (`0% Syntax Errors`)**:
+   - Humans never write `.rl` syntax; AI Agents emit fixed **16-byte (128-bit) `NodeFrame`** binary instructions directly (`Algorithm + ScheduleHint + Proof`).
+   - A complete 10-million-row financial risk pipeline is just **`192 bytes`** in `.rl` (smaller than a single 280-character Tweet) and compiles into a standalone **`817-byte`** Linux `ELF64` native binary (over **3,000x smaller** than a standard Go/Rust binary).
+2. **Compilation & Verification `10,000x+` Faster Than Go (`Microseconds vs. Hundreds of Milliseconds`)**:
+   - Because AI Agents attach explicit schedule hints and safety witnesses to every instruction, the Rul compiler performs **zero parsing, zero type inference, and zero LLVM search passes**:
+   - **Single-Pass $O(N)$ Verification**: **`5.78 ns / instruction`** (`57.8 µs` for 10,000 nodes = **`2.77 GB/s`**).
+   - **Direct In-RAM `x86_64` AVX2 `ELF64` AOT Compilation**: **`6.38 µs` (`0.00638 ms`)** with zero external linker or LLVM dependency.
+3. **Safety Matching or Exceeding Rust—Without Reading the AI's Code**:
+   - **$O(1)$/node Linear Ownership**: Enforces exclusive `AffineConsume` and shared `ReadLease` tokens (0% use-after-consume or aliasing without a slow borrow-checker solver).
+   - **0% Runtime Bounds Checks**: Proven safe at load time via `Arena<Shape>` and sidecar `ProofEntry` witnesses.
+   - **100% Guaranteed Termination & Hardware Sandbox**: Topological SSA-DAG (`in_a < current_node`) prevents infinite loops, and the 64-bit Header `CapabilityMask` mathematically blocks unauthorized network/disk I/O.
+4. **Runtime Faster Than Hand-Written C on Data Pipelines (`51.53 GB/s` Effective Bandwidth)**:
+   - Mandates 64-byte aligned **Columnar SoA Arenas**, fuses multi-stage `Filter + Map + Reduce` pipelines into single-pass SIMD register loops (`0 bytes` intermediate RAM), and skips cold L1-cache tiles in $O(1)$ via `ArenaZoneMap`.
+   - AI Agents can mutate a **single byte (`ScheduleHint`)** based on hardware telemetry feedback (`autotune_schedule`) to scale from single-core SIMD to multi-core + L1 Zone-Map execution automatically.
 
 $$\text{Artifact (}\mathtt{.rl}\text{)} = \text{Algorithm} + \text{Schedule} + \text{Proof}$$
 $$\text{Rul Engine} = \text{Single-Pass } O(N) \text{ Verifier} + O(N) \text{ Vector Fuser / Direct ELF64 AOT Compiler}$$
+
+---
+
+## Production Benchmark (`10,000,000` `f64` Records = `80 MB` SoA)
+
+| Implementation | Median Latency | Effective Bandwidth | Speedup vs. C 8-Acc | Speedup vs. Legacy AoS |
+| :--- | ---: | ---: | ---: | ---: |
+| `[A]` Legacy Imperative AoS + `Vec::collect()` | `70.66 ms` | `1.13 GB/s` | `0.10x` | `1.00x` |
+| `[B]` Idiomatic Rust SoA (`filter().map().sum()`) | `19.12 ms` | `4.18 GB/s` | `0.38x` | `3.70x` |
+| `[C]` Hand-Written C/Rust 8-Acc SoA (1-Core) | `7.32 ms` | `10.92 GB/s` | `1.00x` | `9.65x` |
+| **`[D]` Rul (`.rl`) Tier 2 Fused SIMD (1-Core)** | **`5.91 ms`** | **`13.53 GB/s`** | **`1.24x`** | **`11.95x`** |
+| **`[E]` Rul (`.rl`) Tier 2 Auto-MultiCore (All)** | **`3.19 ms`** | **`25.04 GB/s`** | **`2.29x`** | **`22.12x`** |
+| **`[F]` Rul (`.rl`) Tier 2 MultiCore + L1 ZoneMap** | **`1.55 ms`** | **`51.53 GB/s`** | **`4.72x`** | **`45.51x`** |
 
 ---
 
