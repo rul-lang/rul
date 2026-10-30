@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "💡 Feature Request / Language RFC (GitHub Discussions)"
+    url: "https://github.com/rul-lang/rul/discussions/categories/ideas"
+    about: "Propose new opcodes, schedule hints, intrinsics, or architectural enhancements. Approved proposals are promoted to Issues by maintainers."
+  - name: "💬 Questions, Help & Usage (GitHub Discussions)"
+    url: "https://github.com/rul-lang/rul/discussions/categories/q-a"
+    about: "Ask questions about building, embedding, or using Rul (.rl), the MCP server, or the CLI."
+  - name: "🔒 Report a Security or Verifier Soundness Vulnerability"
+    url: "https://github.com/rul-lang/rul/security/advisories/new"
+    about: "Privately report a verifier bypass, out-of-bounds escape, or host FFI memory safety vulnerability."

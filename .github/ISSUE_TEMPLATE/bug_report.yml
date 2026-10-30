@@ -1,0 +1,97 @@
+name: "🐛 Bug Report / Miscompilation"
+description: "Report a reproducible defect in the Rul verifier, execution engine, transpiler, or tooling."
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Note:** Our Issue Tracker is strictly reserved for **reproducible bugs** and **maintainer-approved tasks**.
+        > - For **feature requests, language design ideas, or RFCs**, please start a thread in [GitHub Discussions → Ideas](https://github.com/rul-lang/rul/discussions/categories/ideas).
+        > - For **questions or usage help**, please post in [GitHub Discussions → Q&A](https://github.com/rul-lang/rul/discussions/categories/q-a).
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: "Affected Component"
+      description: "Which subsystem of Rul is exhibiting the bug?"
+      options:
+        - "Verifier (Single-Pass O(N) Type, Affine & Bounds Checker)"
+        - "Bytecode / Binary Format (.rl Serialization & Disassembler)"
+        - "Execution Engine (Tier 0 Oracle / Schedule Execution)"
+        - "Transpiler / Codegen (Standalone Rust / Native Emission)"
+        - "CAS & Intrinsics (Content-Addressed Store / Sort / Join / SIMD Scan)"
+        - "FFI Host Bridge (C ABI / Embedded Runtime)"
+        - "MCP Server (rul-mcp Agent Tools)"
+        - "CLI / Benchmarks (rul / rul-bench)"
+        - "Other"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: schedule_tier
+    attributes:
+      label: "Execution Tier / Schedule Hint"
+      description: "If this is an execution or differential mismatch bug, which schedule mode was active?"
+      options:
+        - "N/A (Compile-time / Verifier / Tooling stage)"
+        - "Sequential (Tier 0 Reference Oracle)"
+        - "AutoL1Tile"
+        - "SimdStream"
+        - "MultiCore"
+        - "Differential Mismatch (Tier 0 vs. Scheduled/Transpiled output differs)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Bug Summary"
+      description: "Provide a clear, concise description of the defect."
+      placeholder: "Describe what went wrong..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: "Minimal Reproducible Example (MRE)"
+      description: |
+        Provide a minimal `.rl` disassembly listing, hex byte sequence, Rust API test case, or CLI invocation that reproduces the issue.
+        Issues without a reproducible example may be labeled `needs-repro` and converted to a Discussion.
+      placeholder: |
+        ```rust
+        // Or paste `rul disasm` output / CLI commands here
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_vs_actual
+    attributes:
+      label: "Expected vs. Actual Behavior"
+      description: "What did you expect Rul to produce, and what actually happened (include error codes, verifier diagnostics, or wrong outputs)?"
+      placeholder: |
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: "Environment & Target Architecture"
+      description: "OS, CPU architecture (including SIMD support like AVX2/AVX-512/NEON), and Rust/Rul version (`rustc --version`, commit SHA)."
+      placeholder: "e.g., Linux x86_64 (AMD Zen 4, AVX-512), rustc 1.82.0, rul commit abc1234"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "Pre-submission Checklist"
+      options:
+        - label: "I have searched existing Issues and Discussions to ensure this bug has not already been reported."
+          required: true
+        - label: "This is a reproducible bug report, not a feature request or usage question."
+          required: true

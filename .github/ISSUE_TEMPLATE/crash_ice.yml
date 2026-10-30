@@ -1,0 +1,51 @@
+name: "💥 Crash / Internal Error (ICE) / Soundness Defect"
+description: "Report a panic, segmentation fault, illegal instruction, or verifier soundness escape."
+title: "[ICE]: "
+labels: ["bug", "crash-ice", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Critical Defect Report:** Use this form when Rul panics, crashes with a hardware fault (`SIGSEGV`, `SIGILL`, `SIGBUS`), or when a malformed `.rl` binary bypasses the verifier (`verify_program`) and causes undefined behavior during execution.
+
+  - type: dropdown
+    id: defect_kind
+    attributes:
+      label: "Crash / Soundness Category"
+      options:
+        - "Verifier Soundness Escape (Invalid .rl program passed verification and failed/crashed at runtime)"
+        - "Runtime Panic / Unwrap Failure (Internal Error in Rust engine/tooling)"
+        - "Native Codegen / FFI Crash (SIGSEGV / SIGILL / Memory Corruption)"
+        - "Infinite Loop / Hang / Resource Exhaustion (DoS in O(N) Verifier or Loader)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: "Triggering Input / Reproducer"
+      description: "Provide the exact `.rl` byte slice, instruction sequence, or Rust test case that triggers the crash."
+      placeholder: |
+        ```rust
+        let bytes: &[u8] = &[ /* ... */ ];
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: backtrace
+    attributes:
+      label: "Backtrace / Crash Log"
+      description: "Paste the output with `RUST_BACKTRACE=1` (or debugger/sanitizer output if applicable)."
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: "Platform & Toolchain"
+      description: "OS, CPU architecture, `rustc --version`, and Rul version/commit SHA."
+      placeholder: "e.g., Ubuntu 24.04 x86_64, rustc 1.82.0, rul v0.1.0"
+    validations:
+      required: true
