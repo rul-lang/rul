@@ -210,6 +210,7 @@ fn tool_test_differential(
 
     let mut out = String::with_capacity(512);
     let _ = writeln!(out, "STATUS: DIFFERENTIAL_EQUIVALENCE_PASS");
+    let _ = writeln!(out, "DATA_SOURCE: SYNTHETIC_PATTERN (arena[0][i] = (i % 2000) + 1; arena[k>0][i] = (i % 2000) * 0.5 + 10) — generated in-memory sample data, NOT user-supplied data; this check proves Tier0/Tier1/Tier2 equivalence only");
     let _ = writeln!(out, "OUTPUT: {}", format_runtime_value(&rep2.output));
     let _ = writeln!(
         out,
@@ -247,6 +248,7 @@ fn tool_autotune_schedule(
 
     let mut out = String::with_capacity(512 + tuned_rls.len());
     let _ = writeln!(out, "STATUS: AUTOTUNE_COMPLETE");
+    let _ = writeln!(out, "DATA_SOURCE: SYNTHETIC_PATTERN (arena[0][i] = (i % 2000) + 1; arena[k>0][i] = (i % 2000) * 0.5 + 10) — generated in-memory sample data, NOT user-supplied data; schedule ranking may differ on real data");
     let _ = writeln!(
         out,
         "WINNING_SCHEDULE: policy={:?} fusion_group={}",
@@ -309,8 +311,8 @@ fn tools_list_json() -> &'static str {
     concat!(
         r#"{"tools":["#,
         r#"{"name":"rul_assemble_and_verify","description":"Assemble flat symbolic .rls IR into a 128-bit .rl binary program and run the O(N) linear verifier (< 0.1 ms).","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"}},"required":["rls_source"]}},"#,
-        r#"{"name":"rul_test_differential","description":"Run differential execution comparing Tier 0 Interpreter, Tier 1 Stencil, and Tier 2 Fused L1-Tile Engine on sample arenas.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"sample_size":{"type":"integer","description":"Optional element count override for sample arenas"}},"required":["rls_source"]}},"#,
-        r#"{"name":"rul_autotune_schedule","description":"Sweep ScheduleHint policies (AutoL1Tile, SimdStream, MultiCore), pick the highest hardware reward score, and return the tuned .rls program.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"sample_size":{"type":"integer","description":"Optional element count override for autotuning"}},"required":["rls_source"]}},"#,
+        r#"{"name":"rul_test_differential","description":"Run differential execution comparing Tier 0 Interpreter, Tier 1 Stencil, and Tier 2 Fused L1-Tile Engine on generated SYNTHETIC sample arenas (deterministic pattern, not user data — this tool accepts no real arena data).","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"sample_size":{"type":"integer","description":"Optional element count override for sample arenas"}},"required":["rls_source"]}},"#,
+        r#"{"name":"rul_autotune_schedule","description":"Sweep ScheduleHint policies (AutoL1Tile, SimdStream, MultiCore) on generated SYNTHETIC sample arenas (deterministic pattern, not user data — this tool accepts no real arena data), pick the highest hardware reward score, and return the tuned .rls program.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"sample_size":{"type":"integer","description":"Optional element count override for autotuning"}},"required":["rls_source"]}},"#,
         r#"{"name":"rul_compile_standalone","description":"Compile a .rls program directly into a zero-runtime standalone Linux x86_64 ELF64 native executable in < 1 ms.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"output_path":{"type":"string","description":"Output filesystem path for the standalone ELF64 binary"}},"required":["rls_source"]}},"#,
         r#"{"name":"rul_cas_intrinsics","description":"List content-addressed 64-bit verified intrinsics (I64 Sort, HashJoin, GroupBy, U8 SIMD Scan) in rul-cas.","inputSchema":{"type":"object","properties":{}}}"#,
         r#"]}"#
