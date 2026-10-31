@@ -353,6 +353,8 @@ fn main() -> Result<(), String> {
     let rl_path = "target/risk_pipeline.rl";
     let rls_path = "target/risk_pipeline.rls";
     let aot_exe_path = "target/risk_pipeline_aot";
+    std::fs::create_dir_all("target")
+        .map_err(|e| format!("failed to create target/ for benchmark artifacts: {e}"))?;
     let written_bytes = save_rl_file(rl_path, &simd_prog).map_err(|e| e.to_string())?;
     let rls_text = program_to_rls(&simd_prog);
     std::fs::write(rls_path, &rls_text).map_err(|e| e.to_string())?;
