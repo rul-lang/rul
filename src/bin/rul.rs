@@ -250,20 +250,44 @@ fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram), String
 
 fn load_or_synthesize_arenas(prog: &RulProgram) -> Result<(Vec<Vec<f64>>, PathBuf), String> {
     let data_dir = PathBuf::from("data");
-    let default_arena_file = data_dir.join("arena_0.bin");
 
-    if prog.arenas.len() == 1 {
-        if let Some(first_desc) = prog.arenas.first() {
-            let len = first_desc.element_count as usize;
-            if default_arena_file.exists() {
-                if let Ok(col) = read_bounded_f64_column(&default_arena_file, len) {
-                    return Ok((vec![col], default_arena_file));
-                }
-            }
+    // Load every declared arena from `data/arena_<idx>.bin`, for any arena
+    // count. Real user data must never be silently replaced by synthetic
+    // data: a program that declares N arenas runs on the user's N columns,
+    // fails loudly, or — only when no arena files exist at all — runs on
+    // clearly-labelled synthetic demo data.
+    let mut cols: Vec<Vec<f64>> = Vec::with_capacity(prog.arenas.len());
+    let mut loaded = 0usize;
+    for (idx, desc) in prog.arenas.iter().enumerate() {
+        let path = data_dir.join(format!("arena_{idx}.bin"));
+        if path.exists() {
+            let col = read_bounded_f64_column(&path, desc.element_count as usize)
+                .map_err(|e| format!("arena #{idx}: {e}"))?;
+            cols.push(col);
+            loaded += 1;
         }
     }
+    if !prog.arenas.is_empty() && loaded == prog.arenas.len() {
+        // All arenas came from user files. The AOT runner consumes a single
+        // data file, so persist the columns in `write_arena_data_file`
+        // layout (the same layout the synthesis path below already uses).
+        let build_dir = PathBuf::from("build");
+        fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build/: {e}"))?;
+        let combined_path = build_dir.join("arena_input.bin");
+        let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
+        write_arena_data_file(&combined_path, &refs).map_err(|e| e.to_string())?;
+        return Ok((cols, combined_path));
+    }
+    if loaded > 0 {
+        return Err(format!(
+            "found data files for {loaded} of {} declared arenas; refusing to mix real and synthetic data — provide data/arena_<idx>.bin for every arena, or remove all arena files to run on synthetic demo data",
+            prog.arenas.len()
+        ));
+    }
 
-    let mut cols = Vec::with_capacity(prog.arenas.len());
+    eprintln!(
+        "[RUL WARN] No data/arena_*.bin files found — executing on SYNTHETIC demo data; results are NOT computed from user data."
+    );
     for (idx, desc) in prog.arenas.iter().enumerate() {
         let len = desc.element_count as usize;
         let col: Vec<f64> = (0..len)
