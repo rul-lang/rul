@@ -6,6 +6,7 @@
 //! - `rul build [path]`   : Assemble `.rls` -> `.rl` and compile a standalone Linux `x86_64` AVX2 `ELF64` binary
 //! - `rul run [path]`     : Execute `.rl`/`.rls` via Tier 2 Fused SIMD + native `ELF64` AOT with telemetry
 //! - `rul autotune [path]`: Sweep hardware schedules (`AutoL1Tile`, `SimdStream`, `MultiCore`) for max reward
+//! - `rul trace [path]`   : Run white-box node-by-node execution trace (`min`, `max`, `sum`, `NaN/Inf`, samples)
 //! - `rul inspect <path>` : Disassemble a `.rl` or `.rls` program into a 128-bit `NodeFrame` table
 //! - `rul decompile <rl>` : Decompile a `.rl` binary into lossless flat symbolic `.rls` text
 
@@ -25,7 +26,8 @@ use std::time::Instant;
 use rul::aot::{compile_rl_to_executable, run_compiled_executable, write_arena_data_file};
 use rul::bytecode::RulProgram;
 use rul::engine::{
-    autotune_schedule, execute_tier0_interpreter, execute_tier2_fused, RuntimeValue,
+    autotune_schedule, execute_tier0_interpreter, execute_tier2_fused, format_trace_table,
+    trace_program, RuntimeValue,
 };
 use rul::suite10::{load_rl_file, save_rl_file, MAX_RL_FILE_BYTES};
 use rul::transpiler::{assemble_rls, disassemble_rl, program_to_rls};
@@ -61,6 +63,7 @@ COMMANDS:
     build [file]        Pack .rls -> build/*.rl and compile standalone x86_64 AVX2 ELF64 binary
     run [file]          Verify, execute (Tier 2 SIMD + ELF64 AOT), and print HardwareTelemetry
     autotune [file]     Autotune hardware ScheduleHint (AutoL1Tile, SimdStream, MultiCore)
+    trace [file]        Execute in white-box trace mode (inspect per-node min/max/sum/NaN/samples)
     inspect <file>      Disassemble a .rl or .rls file into a 128-bit NodeFrame table
     decompile <file.rl> Decompile a binary .rl graph into lossless .rls symbolic text
     version             Print the Rul toolchain version"
@@ -346,6 +349,16 @@ fn cmd_autotune(arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_trace(arg: Option<&str>) -> Result<(), String> {
+    let entry = resolve_entry_path(arg)?;
+    let prog = load_program(&entry)?;
+    let (cols, _arena_file) = load_or_synthesize_arenas(&prog)?;
+    let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
+    let report = trace_program(&prog, &refs).map_err(|e| e.to_string())?;
+    print!("{}", format_trace_table(&report));
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let Some(cmd) = args.get(1).map(String::as_str) else {
@@ -368,6 +381,7 @@ fn main() -> Result<(), String> {
         }
         "run" => cmd_run(args.get(2).map(String::as_str)),
         "autotune" => cmd_autotune(args.get(2).map(String::as_str)),
+        "trace" => cmd_trace(args.get(2).map(String::as_str)),
         "inspect" => {
             let path = resolve_entry_path(args.get(2).map(String::as_str))?;
             let prog = load_program(&path)?;

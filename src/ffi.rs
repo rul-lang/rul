@@ -1,9 +1,9 @@
-//! Zero-Panic Embeddable Bridge & `#[repr(C)]` FFI Surface (`rul-ffi` / `rul-embed`).
+//! Zero-Panic Rust Embedding API with `#[repr(C)]` Result Pods (`rul-ffi` / `rul-embed`).
 //!
-//! Allows host applications (Rust web/DB frameworks, Python, Go, Bun/Node, or WASM)
-//! to load `.rl` binary graphs in-memory, linearly verify them in $O(N)$, execute them
-//! on the Tier 2 Fused L1-Tile / Multi-Core engine, or emit standalone `ELF64` binaries
-//! into caller-owned buffers using C-compatible `#[repr(C)]` status pods.
+//! Allows Rust host applications and language-binding wrappers to load `.rl` binary graphs
+//! in-memory, linearly verify them in $O(N)$, execute them on the Tier 2 Fused L1-Tile /
+//! Multi-Core engine, or emit standalone `ELF64` binaries into caller-owned buffers using
+//! fixed-layout `#[repr(C)]` status pods while maintaining `#![forbid(unsafe_code)]`.
 
 use crate::aot::compile_to_elf64_bytes;
 use crate::bytecode::RulProgram;
@@ -23,7 +23,7 @@ pub const RUL_ERR_AOT: i32 = -4;
 /// Caller-provided output buffer is too small (`-5`).
 pub const RUL_ERR_BUFFER_TOO_SMALL: i32 = -5;
 
-/// C-ABI compatible (`#[repr(C)]`) result returned by [`rul_embed_verify_bytes`].
+/// Fixed-layout (`#[repr(C)]`) result pod returned by [`rul_embed_verify_bytes`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RulFfiVerifyResult {
@@ -35,11 +35,11 @@ pub struct RulFfiVerifyResult {
     pub fusion_groups: u32,
     /// `1` if zero runtime bounds checks are guaranteed, `0` otherwise.
     pub zero_runtime_bounds_checks: u32,
-    ///Deterministic 64-bit graph hash from the `.rl` header.
+    /// Deterministic 64-bit graph hash from the `.rl` header.
     pub graph_hash: u64,
 }
 
-/// C-ABI compatible (`#[repr(C)]`) result returned by [`rul_embed_exec_tier2_1col`]
+/// Fixed-layout (`#[repr(C)]`) result pod returned by [`rul_embed_exec_tier2_1col`]
 /// and [`rul_embed_exec_tier2_2col`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,7 +62,7 @@ pub struct RulFfiExecResult {
     pub reward_score: f64,
 }
 
-/// C-ABI compatible (`#[repr(C)]`) result returned by [`rul_embed_compile_elf64_to_buffer`].
+/// Fixed-layout (`#[repr(C)]`) result pod returned by [`rul_embed_compile_elf64_to_buffer`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RulFfiAotResult {

@@ -13,7 +13,7 @@ use crate::bytecode::RulProgram;
 use crate::cas::builtin_intrinsics;
 use crate::engine::{
     autotune_schedule, execute_tier0_interpreter, execute_tier1_stencil,
-    execute_tier2_with_zonemap, ArenaZoneMap, RuntimeValue,
+    execute_tier2_with_zonemap, format_trace_table, trace_program, ArenaZoneMap, RuntimeValue,
 };
 use crate::transpiler::{assemble_rls, disassemble_rl, program_to_rls};
 use crate::verifier::verify_program;
@@ -63,7 +63,7 @@ pub fn handle_mcp_request(json_line: &str) -> String {
             let result = concat!(
                 r#"{"protocolVersion":"2024-11-05","#,
                 r#""capabilities":{"tools":{"listChanged":false}},"#,
-                r#""serverInfo":{"name":"rul-mcp","version":"0.1.0"}}"#
+                r#""serverInfo":{"name":"rul-mcp","version":"0.3.0"}}"#
             );
             json_rpc_result(&req_id, result)
         }
@@ -108,6 +108,13 @@ fn dispatch_tool_call(tool_name: &str, raw_json: &str) -> Result<String, String>
             let out_path = extract_json_string_field(raw_json, "output_path")
                 .unwrap_or_else(|| "/tmp/rul_mcp_standalone.elf".to_string());
             tool_compile_standalone(&rls, Path::new(&out_path))
+        }
+        "rul_trace" => {
+            let rls = extract_json_string_field(raw_json, "rls_source")
+                .ok_or_else(|| "Missing required string argument 'rls_source'".to_string())?;
+            let sample_size =
+                extract_json_u64_field(raw_json, "sample_size").and_then(|v| u32::try_from(v).ok());
+            tool_trace(&rls, sample_size)
         }
         "rul_cas_intrinsics" => Ok(tool_cas_intrinsics()),
         _ => Err(format!("Unknown Rul MCP tool: {tool_name}")),
@@ -292,6 +299,18 @@ fn tool_compile_standalone(rls_source: &str, output_path: &Path) -> Result<Strin
     Ok(out)
 }
 
+fn tool_trace(rls_source: &str, sample_size_override: Option<u32>) -> Result<String, String> {
+    let (program, owned_arenas) = prepare_program_and_arenas(rls_source, sample_size_override)?;
+    let input_slices: Vec<&[f64]> = owned_arenas.iter().map(Vec::as_slice).collect();
+    let report =
+        trace_program(&program, &input_slices).map_err(|e| format!("TRACE_ERROR: {e:?}"))?;
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(out, "STATUS: WHITE_BOX_TRACE_OK");
+    let _ = writeln!(out, "OUTPUT: {}", format_runtime_value(&report.output));
+    out.push_str(&format_trace_table(&report));
+    Ok(out)
+}
+
 fn tool_cas_intrinsics() -> String {
     let mut out = String::with_capacity(512);
     let _ = writeln!(out, "STATUS: RUL_CAS_INTRINSICS_CATALOG");
@@ -312,6 +331,7 @@ fn tools_list_json() -> &'static str {
         r#"{"name":"rul_test_differential","description":"Run differential execution comparing Tier 0 Interpreter, Tier 1 Stencil, and Tier 2 Fused L1-Tile Engine on sample arenas.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"sample_size":{"type":"integer","description":"Optional element count override for sample arenas"}},"required":["rls_source"]}},"#,
         r#"{"name":"rul_autotune_schedule","description":"Sweep ScheduleHint policies (AutoL1Tile, SimdStream, MultiCore), pick the highest hardware reward score, and return the tuned .rls program.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"sample_size":{"type":"integer","description":"Optional element count override for autotuning"}},"required":["rls_source"]}},"#,
         r#"{"name":"rul_compile_standalone","description":"Compile a .rls program directly into a zero-runtime standalone Linux x86_64 ELF64 native executable in < 1 ms.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"output_path":{"type":"string","description":"Output filesystem path for the standalone ELF64 binary"}},"required":["rls_source"]}},"#,
+        r#"{"name":"rul_trace","description":"Execute a .rls program in White-Box Trace mode, returning deterministic per-node statistics (min, max, sum/trues, NaN/Inf count, sample values) for every SSA node.","inputSchema":{"type":"object","properties":{"rls_source":{"type":"string","description":"Flat symbolic .rls program text"},"sample_size":{"type":"integer","description":"Optional element count override for sample arenas"}},"required":["rls_source"]}},"#,
         r#"{"name":"rul_cas_intrinsics","description":"List content-addressed 64-bit verified intrinsics (I64 Sort, HashJoin, GroupBy, U8 SIMD Scan) in rul-cas.","inputSchema":{"type":"object","properties":{}}}"#,
         r#"]}"#
     )

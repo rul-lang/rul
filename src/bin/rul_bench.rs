@@ -26,7 +26,10 @@ use rul::bytecode::{
     ArenaDescriptor, ExecPolicy, NodeFrame, Opcode, RulProgram, ScheduleHint, TokenOp, TypeLane,
     CAP_NONE,
 };
-use rul::engine::{execute_tier2_fused, execute_tier2_with_zonemap, ArenaZoneMap, RuntimeValue};
+use rul::engine::{
+    execute_tier2_fused, execute_tier2_with_zonemap, format_trace_table, trace_program,
+    ArenaZoneMap, RuntimeValue,
+};
 use rul::suite10::{
     format_suite10_table, load_rl_file, run_10_pipeline_suite, save_rl_file, MAX_RL_FILE_BYTES,
 };
@@ -269,6 +272,24 @@ fn handle_cli(args: &[String]) -> Result<bool, String> {
         "inspect" => {
             let prog = load_rl_or_rls(path)?;
             println!("{}", disassemble_rl(&prog));
+            Ok(true)
+        }
+        "trace" => {
+            let prog = load_rl_or_rls(path)?;
+            let mut cols = Vec::with_capacity(prog.arenas.len());
+            for (idx, desc) in prog.arenas.iter().enumerate() {
+                let len = desc.element_count as usize;
+                let col: Vec<f64> = (0..len)
+                    .map(|i| {
+                        let v = ((i.saturating_mul(idx.saturating_add(1))) % 250) as f64;
+                        v + 0.5
+                    })
+                    .collect();
+                cols.push(col);
+            }
+            let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
+            let rep = trace_program(&prog, &refs).map_err(|e| e.to_string())?;
+            print!("{}", format_trace_table(&rep));
             Ok(true)
         }
         "decompile" => {

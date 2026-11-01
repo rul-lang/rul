@@ -922,4 +922,252 @@ mod tests {
         assert!(aot_res.elf_bytes > 120);
         assert_eq!(elf_buf.get(0..4), Some(&[0x7F, b'E', b'L', b'F'][..]));
     }
+
+    #[test]
+    fn test_new_opcodes_div_min_max_cmplt_cmpeq_all_tiers_and_aot() {
+        // Odd length (1,027 = 256 * 4 + 3) exercises both AVX2 256-bit YMM vectors and SSE2 scalar tail
+        let rls_src = "\
+            arena 0 len=1027 lane=f64x8
+            arena 1 len=1027 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $b = ArenaInput f64x8 a=1
+            node $c2 = ConstF64 f64x1 const=2.0
+            node $c50 = ConstF64 f64x1 const=50.0
+            node $quot = Div f64x8 a=$a b=$c2
+            node $mn = Min f64x8 a=$quot b=$b
+            node $mx = Max f64x8 a=$mn b=$c2
+            node $lt = CmpLt maskx8 a=$mx b=$c50
+            node $sel1 = SelectZero f64x8 a=$lt b=$mx
+            node $eq = CmpEq maskx8 a=$b b=$c2
+            node $bonus = SelectZero f64x8 a=$eq b=$c50
+            node $comb = Add f64x8 a=$sel1 b=$bonus
+            node $sum = ReduceSum f64x1 a=$comb
+            output $sum
+        ";
+        let prog = crate::transpiler::assemble_rls(rls_src);
+        assert!(prog.is_ok());
+        let Ok(p) = prog else { return };
+
+        // Verify lossless .rls roundtrip for all 5 new opcodes
+        let decompiled = crate::transpiler::program_to_rls(&p);
+        assert!(decompiled.contains("Div"));
+        assert!(decompiled.contains("Min"));
+        assert!(decompiled.contains("Max"));
+        assert!(decompiled.contains("CmpLt"));
+        assert!(decompiled.contains("CmpEq"));
+        assert_eq!(crate::transpiler::assemble_rls(&decompiled), Ok(p.clone()));
+
+        let col_a: Vec<f64> = (0..1027_u32).map(|i| f64::from(i % 120) + 1.0).collect();
+        let col_b: Vec<f64> = (0..1027_u32).map(|i| f64::from(i % 40) + 0.5).collect();
+
+        let r0 = execute_tier0_interpreter(&p, &[&col_a, &col_b]);
+        let r1 = execute_tier1_stencil(&p, &[&col_a, &col_b]);
+        let r2 = execute_tier2_fused(&p, &[&col_a, &col_b]);
+        assert!(r0.is_ok() && r1.is_ok() && r2.is_ok());
+        let (Ok(rep0), Ok(rep1), Ok(rep2)) = (r0, r1, r2) else {
+            return;
+        };
+        assert_eq!(rep0.output, rep1.output);
+        assert_eq!(rep0.output, rep2.output);
+        assert_eq!(rep2.telemetry.intermediate_bytes_allocated, 0);
+
+        // Verify standalone Linux x86_64 AVX2 ELF64 AOT binary matches Tier 0
+        let exe_path = std::env::temp_dir().join("rul_test_new_opcodes_aot_bin");
+        let data_path = std::env::temp_dir().join("rul_test_new_opcodes_aot_data.bin");
+        let aot_rep = crate::aot::compile_rl_to_executable(&p, &exe_path);
+        assert!(aot_rep.is_ok());
+        assert!(crate::aot::write_arena_data_file(&data_path, &[&col_a, &col_b]).is_ok());
+        let aot_val = crate::aot::run_compiled_executable(&exe_path, &data_path);
+        assert!(aot_val.is_ok());
+        if let (Ok(v_aot), RuntimeValue::Scalar(v0)) = (aot_val, rep0.output) {
+            assert!(
+                (v_aot - v0).abs() < 1e-6,
+                "New opcodes AOT mismatch: aot={v_aot}, tier0={v0}"
+            );
+        }
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+    }
+
+    #[test]
+    fn test_community_ieee754_challenge_suite_and_edge_cases() {
+        use crate::engine::{format_trace_table, trace_program};
+
+        // 1. Community Challenge Test 1: Column * Scalar (0.1)
+        {
+            let rls_t1 = "\
+                cap 0x0
+                arena 0 len=5 lane=f64x8 mut=false align=64 ver=1
+                node $n0 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+                node $n1 = ConstF64 f64x1 fg=1 pol=simd proof=0 tok=pure const=0.1
+                node $n2 = Mul f64x8 fg=1 pol=simd proof=0 tok=pure a=$n0 b=$n1
+                output $n2
+            ";
+            let Ok(p1) = crate::transpiler::assemble_rls(rls_t1) else {
+                return;
+            };
+            let in1 = [100.0_f64, 250.5, 99.9, 1000.0, 0.0];
+            let Ok(rep1) = execute_tier2_fused(&p1, &[&in1]) else {
+                return;
+            };
+            let RuntimeValue::ColumnF64(out1) = rep1.output else {
+                return;
+            };
+            let expected1 = [10.0_f64, 25.05, 9.99, 100.0, 0.0];
+            for (got, exp) in out1.iter().zip(expected1.iter()) {
+                assert!((got - exp).abs() < 1e-12);
+            }
+        }
+
+        // 2. Community Challenge Test 2: Multi-Arena Mul + ReduceMax (-3.0 * -2.0 = 6.0)
+        {
+            let rls_t2 = "\
+                cap 0x0
+                arena 0 len=4 lane=f64x8 mut=false align=64 ver=1
+                arena 1 len=4 lane=f64x8 mut=false align=64 ver=1
+                node $n0 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+                node $n1 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+                node $n2 = Mul f64x8 fg=1 pol=simd proof=0 tok=pure a=$n0 b=$n1
+                node $n3 = ReduceMax f64x1 fg=1 pol=simd proof=0 tok=pure a=$n2 b=0
+                output $n3
+            ";
+            let Ok(p2) = crate::transpiler::assemble_rls(rls_t2) else {
+                return;
+            };
+            let a0 = [1.5_f64, 2.0, -3.0, 4.0];
+            let a1 = [2.0_f64, 0.5, -2.0, 0.25];
+            let Ok(rep2) = execute_tier2_fused(&p2, &[&a0, &a1]) else {
+                return;
+            };
+            assert_eq!(rep2.output, RuntimeValue::Scalar(6.0));
+        }
+
+        // 3. Community Challenge Test 3: IEEE-754 Edge Cases (0*Inf=NaN, -0.0*1.0=-0.0, Overflow, Subnormal, 0.1*0.2)
+        {
+            let rls_t3 = "\
+                cap 0x0
+                arena 0 len=8 lane=f64x8 mut=false align=64 ver=1
+                arena 1 len=8 lane=f64x8 mut=false align=64 ver=1
+                node $n0 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+                node $n1 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+                node $n2 = Mul f64x8 fg=1 pol=simd proof=0 tok=pure a=$n0 b=$n1
+                output $n2
+            ";
+            let Ok(p3) = crate::transpiler::assemble_rls(rls_t3) else {
+                return;
+            };
+            let a0 = [
+                0.0_f64,
+                -0.0_f64,
+                1.0e308,
+                1.0e-308,
+                5.0e-324,
+                f64::NAN,
+                0.1,
+                1.0,
+            ];
+            let a1 = [f64::INFINITY, 1.0, 10.0, 1.0e-308, 0.5, 1.0, 0.2, 1.0];
+            let Ok(rep3) = execute_tier2_fused(&p3, &[&a0, &a1]) else {
+                return;
+            };
+            let RuntimeValue::ColumnF64(ref out3) = rep3.output else {
+                return;
+            };
+            assert_eq!(out3.len(), 8);
+            assert!(out3.first().is_some_and(|v| v.is_nan())); // 0.0 * Inf == NaN
+            assert!(out3
+                .get(1)
+                .is_some_and(|v| *v == 0.0 && v.is_sign_negative())); // -0.0 * 1.0 == -0.0
+            assert_eq!(out3.get(2).copied(), Some(f64::INFINITY)); // 1e308 * 10.0 == +Inf
+            assert!(out3
+                .get(3)
+                .is_some_and(|v| *v == 0.0 && v.is_sign_positive())); // 1e-308 * 1e-308 == +0.0
+            assert!(out3
+                .get(4)
+                .is_some_and(|v| *v == 0.0 && v.is_sign_positive())); // 5e-324 * 0.5 == +0.0
+            assert!(out3.get(5).is_some_and(|v| v.is_nan())); // NaN * 1.0 == NaN
+            assert_eq!(
+                out3.get(6).map(|v| v.to_bits()),
+                Some((0.1_f64 * 0.2_f64).to_bits())
+            );
+            assert_eq!(out3.get(7).copied(), Some(1.0));
+
+            // Verify White-Box Execution Tracer (`trace_program`) detects the 3 non-finite values (`NaN`, `Inf`, `NaN`)
+            let Ok(trace_rep) = trace_program(&p3, &[&a0, &a1]) else {
+                return;
+            };
+            assert_eq!(trace_rep.entries.len(), 3);
+            assert_eq!(
+                trace_rep.entries.get(2).map(|e| e.nan_or_inf_count),
+                Some(3)
+            );
+            let table_str = format_trace_table(&trace_rep);
+            assert!(table_str.contains("WHITE-BOX EXECUTION TRACE"));
+            assert!(table_str.contains("Mul"));
+        }
+
+        // 4. Verifier Hardening: u16::MAX TokenVersionOverflow & Gather zero_runtime_bounds_checks == false
+        {
+            let sched = ScheduleHint::UNFUSED;
+            let prog_overflow = RulProgram {
+                capability_mask: CAP_NONE,
+                arenas: vec![ArenaDescriptor {
+                    arena_id: 0,
+                    element_count: 8,
+                    type_lane: TypeLane::F64X8,
+                    mutable: true,
+                    alignment: 64,
+                    initial_version: u16::MAX,
+                }],
+                proofs: Vec::new(),
+                nodes: vec![
+                    NodeFrame::const_f64(1.0, sched),
+                    NodeFrame {
+                        opcode: Opcode::ArenaMutate,
+                        type_lane: TypeLane::F64X8,
+                        schedule: sched,
+                        proof_idx: 0,
+                        token_op: TokenOp::affine_consume(0, u16::MAX),
+                        in_a: 0,
+                        in_b: 0,
+                    },
+                ],
+                output_node: 1,
+            };
+            assert_eq!(
+                verify_program(&prog_overflow).err().map(|d| d.kind),
+                Some(VerifyErrorKind::TokenVersionOverflow(0))
+            );
+
+            // Fractional Gather index (2.7) must be rejected with GatherIndexOutOfBounds
+            let rls_gather = "\
+                arena 0 len=8 lane=f64x8
+                arena 1 len=8 lane=f64x8
+                proof 1 rule=gather_bounds target=0 lo=0 hi=8 witness=1
+                node $t = ArenaInput f64x8 a=0
+                node $idx = ArenaInput f64x8 a=1
+                node $g = Gather f64x8 proof=1 a=$t b=$idx
+                output $g
+            ";
+            let Ok(pg) = crate::transpiler::assemble_rls(rls_gather) else {
+                return;
+            };
+            let Ok(summary) = verify_program(&pg) else {
+                return;
+            };
+            assert!(!summary.zero_runtime_bounds_checks);
+            let target = [10.0_f64; 8];
+            let frac_idx = [0.0_f64, 1.0, 2.7, 3.0, 0.0, 0.0, 0.0, 0.0];
+            assert!(matches!(
+                execute_tier0_interpreter(&pg, &[&target, &frac_idx]),
+                Err(ExecError::GatherIndexOutOfBounds { .. })
+            ));
+        }
+
+        // 5. MCP `rul_trace` tool test
+        let server = crate::mcp::RulMcpServer::new();
+        let trace_req = r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"rul_trace","arguments":{"rls_source":"arena 0 len=16 lane=f64x8\nnode $a = ArenaInput f64x8 a=0\nnode $s = ReduceSum f64x1 a=$a\noutput $s","sample_size":16}}}"#;
+        let trace_resp = server.handle_line(trace_req);
+        assert!(trace_resp.contains("STATUS: WHITE_BOX_TRACE_OK"));
+    }
 }

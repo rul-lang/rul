@@ -517,6 +517,27 @@ fn emit_x86_64_machine_code(
                     code.extend_from_slice(&disp_b.to_le_bytes());
                     emit_store_ymm0_rbp(&mut code, disp);
                 }
+                Opcode::Div => {
+                    emit_load_ymm0_rbp(&mut code, disp_a);
+                    // vdivpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x5E, 0x85]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::Min => {
+                    emit_load_ymm0_rbp(&mut code, disp_a);
+                    // vminpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x85]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::Max => {
+                    emit_load_ymm0_rbp(&mut code, disp_a);
+                    // vmaxpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x85]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
                 Opcode::CmpGt => {
                     // Load `b` into ymm0 and `a` into ymm1; `vcmpltpd ymm0, ymm0, ymm1` computes `b < a` (`a > b`).
                     emit_load_ymm0_rbp(&mut code, disp_b);
@@ -525,6 +546,24 @@ fn emit_x86_64_machine_code(
                     code.extend_from_slice(&disp_a.to_le_bytes());
                     // vcmpltpd ymm0, ymm0, ymm1 (C5 FD C2 C1 01)
                     code.extend_from_slice(&[0xC5, 0xFD, 0xC2, 0xC1, 0x01]);
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::CmpLt => {
+                    emit_load_ymm0_rbp(&mut code, disp_a);
+                    // vmovupd ymm1, ymmword ptr [rbp + disp_b]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    // vcmpltpd ymm0, ymm0, ymm1 (C5 FD C2 C1 01)
+                    code.extend_from_slice(&[0xC5, 0xFD, 0xC2, 0xC1, 0x01]);
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::CmpEq => {
+                    emit_load_ymm0_rbp(&mut code, disp_a);
+                    // vmovupd ymm1, ymmword ptr [rbp + disp_b]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    // vcmpeqpd ymm0, ymm0, ymm1 (C5 FD C2 C1 00)
+                    code.extend_from_slice(&[0xC5, 0xFD, 0xC2, 0xC1, 0x00]);
                     emit_store_ymm0_rbp(&mut code, disp);
                 }
                 Opcode::SelectZero => {
@@ -661,6 +700,27 @@ fn emit_x86_64_machine_code(
                 code.extend_from_slice(&disp_b.to_le_bytes());
                 emit_store_xmm0_rbp(&mut code, disp);
             }
+            Opcode::Div => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // divsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5E, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Min => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // minsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Max => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // maxsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
             Opcode::CmpGt => {
                 // Load `b` into xmm0 and `a` into xmm1; `cmpltsd xmm0, xmm1` computes `b < a` (`a > b`).
                 emit_load_xmm0_rbp(&mut code, disp_b);
@@ -669,6 +729,24 @@ fn emit_x86_64_machine_code(
                 code.extend_from_slice(&disp_a.to_le_bytes());
                 // cmpltsd xmm0, xmm1 (F2 0F C2 C1 01)
                 code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::CmpLt => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // movsd xmm1, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                // cmpltsd xmm0, xmm1 (F2 0F C2 C1 01)
+                code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::CmpEq => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // movsd xmm1, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                // cmpeqsd xmm0, xmm1 (F2 0F C2 C1 00)
+                code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x00]);
                 emit_store_xmm0_rbp(&mut code, disp);
             }
             Opcode::SelectZero => {
@@ -974,7 +1052,12 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             Opcode::Add
             | Opcode::Sub
             | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Min
+            | Opcode::Max
             | Opcode::CmpGt
+            | Opcode::CmpLt
+            | Opcode::CmpEq
             | Opcode::SelectZero
             | Opcode::FilterCompact
             | Opcode::Gather => {

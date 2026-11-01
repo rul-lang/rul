@@ -225,7 +225,7 @@ pub fn run_10_pipeline_suite(elem_count: u32) -> Result<Vec<PipelineCaseReport>,
         )?);
     }
 
-    // P03: Filter (> 1500) -> Identity -> ReduceSum (Fused SIMD Group 1)
+    // P03: Filter (< 1500 via CmpLt) -> Scale (/ 4.0 via Div) -> Clamp [50..300] (Max + Min) -> ReduceSum (Fused SIMD Group 1)
     {
         let mut b = SymbolicGraphBuilder::new(CAP_NONE);
         let a0 = b.add_arena(elem_count, TypeLane::F64X8, false);
@@ -234,20 +234,44 @@ pub fn run_10_pipeline_suite(elem_count: u32) -> Result<Vec<PipelineCaseReport>,
             .map_err(SuiteError::Transpile)?;
         b.emit_const_f64("$thr", 1500.0, s)
             .map_err(SuiteError::Transpile)?;
-        b.emit_binary_op("$m", Opcode::CmpGt, TypeLane::MASKX8, "$a", "$thr", s)
+        b.emit_binary_op("$m", Opcode::CmpLt, TypeLane::MASKX8, "$a", "$thr", s)
             .map_err(SuiteError::Transpile)?;
-        b.emit_binary_op("$sel", Opcode::SelectZero, TypeLane::F64X8, "$m", "$a", s)
+        b.emit_const_f64("$div_k", 4.0, s)
             .map_err(SuiteError::Transpile)?;
+        b.emit_binary_op("$scaled", Opcode::Div, TypeLane::F64X8, "$a", "$div_k", s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_const_f64("$lo", 50.0, s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_const_f64("$hi", 300.0, s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_binary_op("$c_lo", Opcode::Max, TypeLane::F64X8, "$scaled", "$lo", s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_binary_op("$clamped", Opcode::Min, TypeLane::F64X8, "$c_lo", "$hi", s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_binary_op(
+            "$sel",
+            Opcode::SelectZero,
+            TypeLane::F64X8,
+            "$m",
+            "$clamped",
+            s,
+        )
+        .map_err(SuiteError::Transpile)?;
         b.emit_unary_op("$sum", Opcode::ReduceSum, TypeLane::F64_SCALAR, "$sel", s)
             .map_err(SuiteError::Transpile)?;
         let prog = b.finish("$sum").map_err(SuiteError::Transpile)?;
-        let expected: f64 = col_a.iter().copied().filter(|&x| x > 1500.0).sum();
+        let expected: f64 = col_a
+            .iter()
+            .copied()
+            .filter(|&x| x < 1500.0)
+            .map(|x| (x / 4.0).clamp(50.0, 300.0))
+            .sum();
         reports.push(eval_case(
-            "P03_HighValueFilterSum",
+            "P03_CmpLtDivClampSum",
             &prog,
             &[&col_a],
             expected,
-            "Shape-Trivial (Fused 8-Acc)",
+            "CmpLt+Div+Min+Max (L1Tile)",
         )?);
     }
 
@@ -367,7 +391,7 @@ pub fn run_10_pipeline_suite(elem_count: u32) -> Result<Vec<PipelineCaseReport>,
         )?);
     }
 
-    // P07: Two-Column SoA Weighted (Arena0 * Arena1 + Arena0) -> ReduceMax (L1-Cache Tile Engine)
+    // P07: Two-Column SoA Weighted + Exact Match Bonus via CmpEq (Arena0 * Arena1 + Arena0 + (Arena0 == 100 ? 250 : 0)) -> ReduceMax
     {
         let mut b = SymbolicGraphBuilder::new(CAP_NONE);
         let a0 = b.add_arena(elem_count, TypeLane::F64X8, false);
@@ -381,20 +405,40 @@ pub fn run_10_pipeline_suite(elem_count: u32) -> Result<Vec<PipelineCaseReport>,
             .map_err(SuiteError::Transpile)?;
         b.emit_binary_op("$w", Opcode::Add, TypeLane::F64X8, "$prod", "$a", s)
             .map_err(SuiteError::Transpile)?;
-        b.emit_unary_op("$max", Opcode::ReduceMax, TypeLane::F64_SCALAR, "$w", s)
+        b.emit_const_f64("$target", 100.0, s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_const_f64("$bonus_k", 250.0, s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_binary_op("$eq", Opcode::CmpEq, TypeLane::MASKX8, "$a", "$target", s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_binary_op(
+            "$bonus",
+            Opcode::SelectZero,
+            TypeLane::F64X8,
+            "$eq",
+            "$bonus_k",
+            s,
+        )
+        .map_err(SuiteError::Transpile)?;
+        b.emit_binary_op("$w2", Opcode::Add, TypeLane::F64X8, "$w", "$bonus", s)
+            .map_err(SuiteError::Transpile)?;
+        b.emit_unary_op("$max", Opcode::ReduceMax, TypeLane::F64_SCALAR, "$w2", s)
             .map_err(SuiteError::Transpile)?;
         let prog = b.finish("$max").map_err(SuiteError::Transpile)?;
         let expected: f64 = col_a
             .iter()
             .zip(col_b.iter())
-            .map(|(&x, &y)| x * y + x)
+            .map(|(&x, &y)| {
+                let bonus = if (x - 100.0).abs() == 0.0 { 250.0 } else { 0.0 };
+                x * y + x + bonus
+            })
             .fold(f64::NEG_INFINITY, f64::max);
         reports.push(eval_case(
-            "P07_TwoColumnWeightedMax",
+            "P07_TwoColCmpEqWeightedMax",
             &prog,
             &[&col_a, &col_b],
             expected,
-            "Dual ReadLease+L1Tile",
+            "Dual ReadLease+CmpEq+L1Tile",
         )?);
     }
 

@@ -251,7 +251,12 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             Opcode::Add
             | Opcode::Sub
             | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Min
+            | Opcode::Max
             | Opcode::CmpGt
+            | Opcode::CmpLt
+            | Opcode::CmpEq
             | Opcode::SelectZero
             | Opcode::FilterCompact
             | Opcode::Gather => {
@@ -364,7 +369,7 @@ fn eval_node_tier0<'a>(
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             Ok(src)
         }
-        Opcode::Add | Opcode::Sub | Opcode::Mul => {
+        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Min | Opcode::Max => {
             let left = values
                 .get(frame.in_a as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
@@ -373,22 +378,35 @@ fn eval_node_tier0<'a>(
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             eval_arith_tier0(frame.opcode, left, right, node_idx, intermediate_bytes)
         }
-        Opcode::CmpGt => {
+        Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
             let left = values
                 .get(frame.in_a as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             let right = values
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let cmp = |x: f64, y: f64| -> bool {
+                match frame.opcode {
+                    Opcode::CmpGt => x > y,
+                    Opcode::CmpLt => x < y,
+                    _ => x == y,
+                }
+            };
             match (left, right) {
                 (EvalValue::ColumnF64(col), EvalValue::Scalar(thr)) => {
                     *intermediate_bytes = intermediate_bytes.saturating_add(col.len());
-                    let mask: Vec<bool> = col.iter().map(|&x| x > *thr).collect();
+                    let mask: Vec<bool> = col.iter().map(|&x| cmp(x, *thr)).collect();
+                    Ok(EvalValue::ColumnMask(mask))
+                }
+                (EvalValue::Scalar(thr), EvalValue::ColumnF64(col)) => {
+                    *intermediate_bytes = intermediate_bytes.saturating_add(col.len());
+                    let mask: Vec<bool> = col.iter().map(|&y| cmp(*thr, y)).collect();
                     Ok(EvalValue::ColumnMask(mask))
                 }
                 (EvalValue::ColumnF64(a), EvalValue::ColumnF64(b)) => {
                     *intermediate_bytes = intermediate_bytes.saturating_add(a.len());
-                    let mask: Vec<bool> = a.iter().zip(b.iter()).map(|(&x, &y)| x > y).collect();
+                    let mask: Vec<bool> =
+                        a.iter().zip(b.iter()).map(|(&x, &y)| cmp(x, y)).collect();
                     Ok(EvalValue::ColumnMask(mask))
                 }
                 _ => Err(ExecError::InvalidOperandState(node_idx)),
@@ -401,16 +419,22 @@ fn eval_node_tier0<'a>(
             let col_val = values
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
-            if let (EvalValue::ColumnMask(mask), EvalValue::ColumnF64(col)) = (mask_val, col_val) {
-                *intermediate_bytes = intermediate_bytes.saturating_add(col.len() * 8);
-                let out: Vec<f64> = mask
-                    .iter()
-                    .zip(col.iter())
-                    .map(|(&m, &v)| if m { v } else { 0.0 })
-                    .collect();
-                Ok(EvalValue::ColumnF64(Cow::Owned(out)))
-            } else {
-                Err(ExecError::InvalidOperandState(node_idx))
+            match (mask_val, col_val) {
+                (EvalValue::ColumnMask(mask), EvalValue::ColumnF64(col)) => {
+                    *intermediate_bytes = intermediate_bytes.saturating_add(col.len() * 8);
+                    let out: Vec<f64> = mask
+                        .iter()
+                        .zip(col.iter())
+                        .map(|(&m, &v)| if m { v } else { 0.0 })
+                        .collect();
+                    Ok(EvalValue::ColumnF64(Cow::Owned(out)))
+                }
+                (EvalValue::ColumnMask(mask), EvalValue::Scalar(s)) => {
+                    *intermediate_bytes = intermediate_bytes.saturating_add(mask.len() * 8);
+                    let out: Vec<f64> = mask.iter().map(|&m| if m { *s } else { 0.0 }).collect();
+                    Ok(EvalValue::ColumnF64(Cow::Owned(out)))
+                }
+                _ => Err(ExecError::InvalidOperandState(node_idx)),
             }
         }
         Opcode::FilterCompact => {
@@ -471,7 +495,11 @@ fn eval_node_tier0<'a>(
                 let max_bound = proof.bound_hi as usize;
                 let mut gathered = Vec::with_capacity(indices.len());
                 for &raw_idx in indices.iter() {
-                    if !raw_idx.is_finite() || raw_idx < 0.0 || raw_idx >= (max_bound as f64) {
+                    if !raw_idx.is_finite()
+                        || raw_idx < 0.0
+                        || raw_idx >= (max_bound as f64)
+                        || raw_idx.fract() != 0.0
+                    {
                         return Err(ExecError::GatherIndexOutOfBounds {
                             node_idx,
                             index: raw_idx,
@@ -535,7 +563,22 @@ fn eval_arith_tier0<'a>(
         match opcode {
             Opcode::Add => a + b,
             Opcode::Sub => a - b,
-            _ => a * b,
+            Opcode::Mul => a * b,
+            Opcode::Div => a / b,
+            Opcode::Min => {
+                if a < b {
+                    a
+                } else {
+                    b
+                }
+            }
+            _ => {
+                if a > b {
+                    a
+                } else {
+                    b
+                }
+            }
         }
     };
     match (left, right) {
@@ -712,6 +755,7 @@ enum ExactValueExpr {
     Identity,
     Square,
     MulConst(f64),
+    DivConst(f64),
     AddConst(f64),
 }
 
@@ -784,7 +828,12 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
             | Opcode::Add
             | Opcode::Sub
             | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Min
+            | Opcode::Max
             | Opcode::CmpGt
+            | Opcode::CmpLt
+            | Opcode::CmpEq
             | Opcode::SelectZero => {}
             _ => return None,
         }
@@ -868,6 +917,13 @@ fn trace_exact_predicated_dag(
                     return None;
                 }
                 ExactValueExpr::MulConst(c.decode_const_f64())
+            }
+            Opcode::Div if val_node.in_a as usize == col_idx => {
+                let c = program.nodes.get(val_node.in_b as usize)?;
+                if c.opcode != Opcode::ConstF64 {
+                    return None;
+                }
+                ExactValueExpr::DivConst(c.decode_const_f64())
             }
             Opcode::Add if val_node.in_a as usize == col_idx => {
                 let c = program.nodes.get(val_node.in_b as usize)?;
@@ -1016,6 +1072,19 @@ fn eval_unconditional_tile_f64x8(tile: &[f64], expr: ExactValueExpr) -> f64 {
             }
             sum
         }
+        ExactValueExpr::DivConst(k) => {
+            for chunk in chunks {
+                for (lane, &x) in acc.iter_mut().zip(chunk.iter()) {
+                    *lane += x / k;
+                }
+            }
+            let mut sum =
+                (acc[0] + acc[1]) + (acc[2] + acc[3]) + (acc[4] + acc[5]) + (acc[6] + acc[7]);
+            for &x in remainder {
+                sum += x / k;
+            }
+            sum
+        }
         ExactValueExpr::AddConst(k) => {
             for chunk in chunks {
                 for (lane, &x) in acc.iter_mut().zip(chunk.iter()) {
@@ -1064,6 +1133,21 @@ fn eval_predicated_slice_f64x8(slice: &[f64], threshold: f64, expr: ExactValueEx
             for &x in remainder {
                 if x > threshold {
                     sum += x * k;
+                }
+            }
+            sum
+        }
+        ExactValueExpr::DivConst(k) => {
+            for chunk in chunks {
+                for (lane, &x) in acc.iter_mut().zip(chunk.iter()) {
+                    *lane += if x > threshold { x / k } else { 0.0 };
+                }
+            }
+            let mut sum =
+                (acc[0] + acc[1]) + (acc[2] + acc[3]) + (acc[4] + acc[5]) + (acc[6] + acc[7]);
+            for &x in remainder {
+                if x > threshold {
+                    sum += x / k;
                 }
             }
             sum
@@ -1232,7 +1316,12 @@ fn eval_general_tiles_range(
                         .ok_or(ExecError::InvalidOperandState(node_idx))?;
                     dst.copy_from_slice(src);
                 }
-                Opcode::Add | Opcode::Sub | Opcode::Mul => {
+                Opcode::Add
+                | Opcode::Sub
+                | Opcode::Mul
+                | Opcode::Div
+                | Opcode::Min
+                | Opcode::Max => {
                     eval_tile_arith(
                         frame.opcode,
                         idx,
@@ -1245,8 +1334,9 @@ fn eval_general_tiles_range(
                     )
                     .ok_or(ExecError::InvalidOperandState(node_idx))?;
                 }
-                Opcode::CmpGt => {
-                    eval_tile_cmp_gt(
+                Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
+                    eval_tile_cmp(
+                        frame.opcode,
                         idx,
                         frame.in_a as usize,
                         frame.in_b as usize,
@@ -1268,17 +1358,32 @@ fn eval_general_tiles_range(
                         .get(m_idx)
                         .and_then(|r| r.get(0..tile_len))
                         .ok_or(ExecError::InvalidOperandState(node_idx))?;
-                    let (left, right) = f64_regs.split_at_mut(idx);
-                    let val = left
-                        .get(v_idx)
-                        .and_then(|r| r.get(0..tile_len))
-                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
-                    let dst = right
-                        .first_mut()
-                        .and_then(|r| r.get_mut(0..tile_len))
-                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
-                    for ((d, &m), &v) in dst.iter_mut().zip(mask.iter()).zip(val.iter()) {
-                        *d = if m { v } else { 0.0 };
+                    let v_is_scalar = is_scalar.get(v_idx).copied().unwrap_or(false);
+                    if v_is_scalar {
+                        let s = scalars
+                            .get(v_idx)
+                            .copied()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        let dst = f64_regs
+                            .get_mut(idx)
+                            .and_then(|r| r.get_mut(0..tile_len))
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        for (d, &m) in dst.iter_mut().zip(mask.iter()) {
+                            *d = if m { s } else { 0.0 };
+                        }
+                    } else {
+                        let (left, right) = f64_regs.split_at_mut(idx);
+                        let val = left
+                            .get(v_idx)
+                            .and_then(|r| r.get(0..tile_len))
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        let dst = right
+                            .first_mut()
+                            .and_then(|r| r.get_mut(0..tile_len))
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        for ((d, &m), &v) in dst.iter_mut().zip(mask.iter()).zip(val.iter()) {
+                            *d = if m { v } else { 0.0 };
+                        }
                     }
                 }
                 _ => return Err(ExecError::InvalidOperandState(node_idx)),
@@ -1335,7 +1440,22 @@ fn eval_tile_arith(
         match opcode {
             Opcode::Add => x + y,
             Opcode::Sub => x - y,
-            _ => x * y,
+            Opcode::Mul => x * y,
+            Opcode::Div => x / y,
+            Opcode::Min => {
+                if x < y {
+                    x
+                } else {
+                    y
+                }
+            }
+            _ => {
+                if x > y {
+                    x
+                } else {
+                    y
+                }
+            }
         }
     };
 
@@ -1373,7 +1493,8 @@ fn eval_tile_arith(
     clippy::too_many_arguments,
     reason = "internal L1-tile predicate evaluator"
 )]
-fn eval_tile_cmp_gt(
+fn eval_tile_cmp(
+    opcode: Opcode,
     dst_idx: usize,
     a_idx: usize,
     b_idx: usize,
@@ -1383,17 +1504,37 @@ fn eval_tile_cmp_gt(
     scalars: &[f64],
     is_scalar: &[bool],
 ) -> Option<()> {
-    let a = f64_regs.get(a_idx)?.get(0..tile_len)?;
     let dst = mask_regs.get_mut(dst_idx)?.get_mut(0..tile_len)?;
-    if *is_scalar.get(b_idx)? {
-        let thr = *scalars.get(b_idx)?;
-        for (m, &x) in dst.iter_mut().zip(a.iter()) {
-            *m = x > thr;
+    let cmp = |x: f64, y: f64| -> bool {
+        match opcode {
+            Opcode::CmpGt => x > y,
+            Opcode::CmpLt => x < y,
+            _ => x == y,
         }
-    } else {
-        let b = f64_regs.get(b_idx)?.get(0..tile_len)?;
-        for ((m, &x), &y) in dst.iter_mut().zip(a.iter()).zip(b.iter()) {
-            *m = x > y;
+    };
+    let a_is_scalar = *is_scalar.get(a_idx)?;
+    let b_is_scalar = *is_scalar.get(b_idx)?;
+    match (a_is_scalar, b_is_scalar) {
+        (false, true) => {
+            let a = f64_regs.get(a_idx)?.get(0..tile_len)?;
+            let thr = *scalars.get(b_idx)?;
+            for (m, &x) in dst.iter_mut().zip(a.iter()) {
+                *m = cmp(x, thr);
+            }
+        }
+        (true, false) => {
+            let thr = *scalars.get(a_idx)?;
+            let b = f64_regs.get(b_idx)?.get(0..tile_len)?;
+            for (m, &y) in dst.iter_mut().zip(b.iter()) {
+                *m = cmp(thr, y);
+            }
+        }
+        _ => {
+            let a = f64_regs.get(a_idx)?.get(0..tile_len)?;
+            let b = f64_regs.get(b_idx)?.get(0..tile_len)?;
+            for ((m, &x), &y) in dst.iter_mut().zip(a.iter()).zip(b.iter()) {
+                *m = cmp(x, y);
+            }
         }
     }
     Some(())
@@ -1522,4 +1663,228 @@ pub fn autotune_schedule(
         output: baseline.output,
         candidates,
     })
+}
+
+/// Deterministic white-box execution trace entry for a single 128-bit [`NodeFrame`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeTraceEntry {
+    /// 0-based index of the SSA node.
+    pub node_idx: u32,
+    /// Executed opcode.
+    pub opcode: Opcode,
+    /// True if this node is backward-reachable from `output_node`.
+    pub is_live: bool,
+    /// Runtime value category (`Scalar`, `ColumnF64`, `ColumnMask`).
+    pub value_kind: &'static str,
+    /// Number of elements produced (`1` for scalars).
+    pub element_count: usize,
+    /// Minimum finite value (or `0.0`/`1.0` for boolean masks).
+    pub min_val: f64,
+    /// Maximum finite value (or `0.0`/`1.0` for boolean masks).
+    pub max_val: f64,
+    /// Sum of values (or `true` count for boolean masks).
+    pub sum_or_true_count: f64,
+    /// Count of `NaN` or `±Infinity` values observed in this node's output.
+    pub nan_or_inf_count: usize,
+    /// Up to 4 sample values from the head of the node's output for human/agent inspection.
+    pub sample_head: Vec<f64>,
+}
+
+/// Complete white-box execution trace report for a `.rl` program.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgramTraceReport {
+    /// Per-node execution trace entries in topological order `#0..#N-1`.
+    pub entries: Vec<NodeTraceEntry>,
+    /// Final verified output of the program.
+    pub output: RuntimeValue,
+    /// Execution telemetry from the trace run.
+    pub telemetry: HardwareTelemetry,
+}
+
+/// Executes a `.rl` program in **White-Box Trace Mode**, recording deterministic per-node
+/// statistics (`min`, `max`, `sum`, `nan_or_inf_count`, and sample head values) at every
+/// SSA instruction `#0..#N-1`.
+///
+/// This eliminates any "black-box" opacity when auditing AI-generated `.rl` modules:
+/// engineers and agents can pinpoint the exact node where a predicate, scaling factor,
+/// or IEEE-754 `NaN`/`Inf` anomaly originates.
+///
+/// # Errors
+/// Returns [`ExecError`] if static verification or node evaluation fails.
+pub fn trace_program(
+    program: &RulProgram,
+    inputs: &[&[f64]],
+) -> Result<ProgramTraceReport, ExecError> {
+    let t_verify = Instant::now();
+    verify_program(program).map_err(ExecError::VerificationFailed)?;
+    let verify_ns = u64::try_from(t_verify.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+    let elements_processed = validate_inputs(program, inputs)?;
+    let live = compute_live_nodes(program);
+
+    let t_exec = Instant::now();
+    let mut values: Vec<EvalValue<'_>> = Vec::with_capacity(program.nodes.len());
+    let mut entries: Vec<NodeTraceEntry> = Vec::with_capacity(program.nodes.len());
+    let mut intermediate_bytes = 0usize;
+
+    for (idx, frame) in program.nodes.iter().enumerate() {
+        let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
+        let is_live = live.get(idx).copied().unwrap_or(false);
+        let val = eval_node_tier0(
+            program,
+            frame,
+            node_idx,
+            inputs,
+            &values,
+            &mut intermediate_bytes,
+        )?;
+        let entry = summarize_eval_value(node_idx, frame.opcode, is_live, &val);
+        entries.push(entry);
+        values.push(val);
+    }
+
+    let exec_ns = u64::try_from(t_exec.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let out_eval = values
+        .get(program.output_node as usize)
+        .cloned()
+        .ok_or(ExecError::InvalidOperandState(program.output_node))?;
+    let output = out_eval.into_runtime_value(program.output_node)?;
+
+    Ok(ProgramTraceReport {
+        entries,
+        output,
+        telemetry: build_telemetry(verify_ns, exec_ns, elements_processed, intermediate_bytes),
+    })
+}
+
+fn summarize_eval_value(
+    node_idx: u32,
+    opcode: Opcode,
+    is_live: bool,
+    val: &EvalValue<'_>,
+) -> NodeTraceEntry {
+    match val {
+        EvalValue::Scalar(x) => NodeTraceEntry {
+            node_idx,
+            opcode,
+            is_live,
+            value_kind: "Scalar",
+            element_count: 1,
+            min_val: *x,
+            max_val: *x,
+            sum_or_true_count: *x,
+            nan_or_inf_count: usize::from(!x.is_finite()),
+            sample_head: vec![*x],
+        },
+        EvalValue::ColumnF64(col) => {
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            let mut sum_v = 0.0f64;
+            let mut non_finite = 0usize;
+            for &x in col.iter() {
+                if !x.is_finite() {
+                    non_finite = non_finite.saturating_add(1);
+                } else {
+                    if x < min_v {
+                        min_v = x;
+                    }
+                    if x > max_v {
+                        max_v = x;
+                    }
+                }
+                sum_v += x;
+            }
+            if min_v == f64::INFINITY {
+                min_v = f64::NAN;
+                max_v = f64::NAN;
+            }
+            let sample_head: Vec<f64> = col.iter().take(4).copied().collect();
+            NodeTraceEntry {
+                node_idx,
+                opcode,
+                is_live,
+                value_kind: "ColumnF64",
+                element_count: col.len(),
+                min_val: min_v,
+                max_val: max_v,
+                sum_or_true_count: sum_v,
+                nan_or_inf_count: non_finite,
+                sample_head,
+            }
+        }
+        EvalValue::ColumnMask(mask) => {
+            let trues = mask.iter().filter(|&&b| b).count();
+            let min_v = if trues == mask.len() && !mask.is_empty() {
+                1.0
+            } else {
+                0.0
+            };
+            let max_v = if trues > 0 { 1.0 } else { 0.0 };
+            let sample_head: Vec<f64> = mask
+                .iter()
+                .take(4)
+                .map(|&b| if b { 1.0 } else { 0.0 })
+                .collect();
+            NodeTraceEntry {
+                node_idx,
+                opcode,
+                is_live,
+                value_kind: "ColumnMask",
+                element_count: mask.len(),
+                min_val: min_v,
+                max_val: max_v,
+                sum_or_true_count: trues as f64,
+                nan_or_inf_count: 0,
+                sample_head,
+            }
+        }
+        EvalValue::Unused => NodeTraceEntry {
+            node_idx,
+            opcode,
+            is_live,
+            value_kind: "Unused",
+            element_count: 0,
+            min_val: 0.0,
+            max_val: 0.0,
+            sum_or_true_count: 0.0,
+            nan_or_inf_count: 0,
+            sample_head: Vec::new(),
+        },
+    }
+}
+
+/// Formats a [`ProgramTraceReport`] as a deterministic human- and agent-readable
+/// white-box inspection table.
+#[must_use]
+pub fn format_trace_table(report: &ProgramTraceReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(512 + report.entries.len() * 128);
+    let _ = writeln!(
+        out,
+        "=== RUL (.rl) WHITE-BOX EXECUTION TRACE ({} SSA Nodes) ===",
+        report.entries.len()
+    );
+    let _ = writeln!(
+        out,
+        "{:<6} {:<15} {:<5} {:<11} {:>8} {:>12} {:>12} {:>14} {:>7}  SAMPLE[0..4]",
+        "NODE", "OPCODE", "LIVE", "KIND", "LEN", "MIN", "MAX", "SUM/TRUES", "NAN/INF"
+    );
+    for e in &report.entries {
+        let preview: Vec<String> = e.sample_head.iter().map(|v| format!("{v:.3}")).collect();
+        let _ = writeln!(
+            out,
+            "#{:<5} {:<15} {:<5} {:<11} {:>8} {:>12.4} {:>12.4} {:>14.4} {:>7}  [{}]",
+            e.node_idx,
+            format!("{:?}", e.opcode),
+            if e.is_live { "yes" } else { "dead" },
+            e.value_kind,
+            e.element_count,
+            e.min_val,
+            e.max_val,
+            e.sum_or_true_count,
+            e.nan_or_inf_count,
+            preview.join(", ")
+        );
+    }
+    out
 }

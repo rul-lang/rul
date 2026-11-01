@@ -21,7 +21,7 @@ body:
         - "Execution Engine (Tier 0 Oracle / Schedule Execution)"
         - "Transpiler / Codegen (Standalone Rust / Native Emission)"
         - "CAS & Intrinsics (Content-Addressed Store / Sort / Join / SIMD Scan)"
-        - "FFI Host Bridge (C ABI / Embedded Runtime)"
+        - "FFI / Embedding API (rul-ffi Rust Embedding API)"
         - "MCP Server (rul-mcp Agent Tools)"
         - "CLI / Benchmarks (rul / rul-bench)"
         - "Other"

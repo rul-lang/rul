@@ -75,6 +75,8 @@ pub enum VerifyErrorKind {
     },
     /// Attempted `AffineConsume` or `ArenaMutate` on an immutable input arena.
     ImmutableArenaMutation(u16),
+    /// `AffineConsume` token version reached `u16::MAX` (65,535) and cannot be incremented without overflow.
+    TokenVersionOverflow(u16),
     /// Instruction expected a `ReadLease` or `AffineConsume` token for the target arena.
     MissingArenaToken(u16),
     /// Incompatible `ValueShape` between binary operands (`in_a` vs `in_b`).
@@ -165,12 +167,16 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
     // Track inferred ValueShape, ElemType, and origin Arena per SSA node.
     let mut metas: Vec<NodeMeta> = Vec::with_capacity(node_count);
     let mut max_fusion_group: u8 = 0;
+    let mut has_gather = false;
 
     for (idx, frame) in program.nodes.iter().enumerate() {
         let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
 
         if frame.schedule.fusion_group > max_fusion_group {
             max_fusion_group = frame.schedule.fusion_group;
+        }
+        if frame.opcode == Opcode::Gather {
+            has_gather = true;
         }
 
         // 1. Verify AffineToken / ReadLease transition if present.
@@ -193,7 +199,7 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         node_count,
         fusion_groups: usize::from(max_fusion_group),
         output_shape: output_meta.shape,
-        zero_runtime_bounds_checks: true,
+        zero_runtime_bounds_checks: !has_gather,
     })
 }
 
@@ -252,8 +258,13 @@ fn verify_token_transition(
                     },
                 });
             }
-            // Linear consumption: advance version so old token can never be reused!
-            *live_ver_slot = live_ver_slot.wrapping_add(1);
+            // Linear consumption: advance version so old token can never be reused,
+            // and reject u16::MAX overflow so version can never wrap around to 0!
+            let next_ver = live_ver_slot.checked_add(1).ok_or(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::TokenVersionOverflow(frame.token_op.arena_id),
+            })?;
+            *live_ver_slot = next_ver;
             Ok(())
         }
     }
@@ -437,7 +448,7 @@ fn verify_node_semantics(
                 origin_arena: Some(expected_id),
             })
         }
-        Opcode::Add | Opcode::Sub | Opcode::Mul => {
+        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Min | Opcode::Max => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas)?;
             let meta_b = get_prior_meta(node_idx, frame.in_b, metas)?;
             if meta_a.elem != ElemType::F64 || meta_b.elem != ElemType::F64 {
@@ -460,7 +471,7 @@ fn verify_node_semantics(
                 origin_arena: None,
             })
         }
-        Opcode::CmpGt => {
+        Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas)?;
             let meta_b = get_prior_meta(node_idx, frame.in_b, metas)?;
             if meta_a.elem != ElemType::F64 || meta_b.elem != ElemType::F64 {

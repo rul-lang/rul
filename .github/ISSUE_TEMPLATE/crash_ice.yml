@@ -15,7 +15,7 @@ body:
       options:
         - "Verifier Soundness Escape (Invalid .rl program passed verification and failed/crashed at runtime)"
         - "Runtime Panic / Unwrap Failure (Internal Error in Rust engine/tooling)"
-        - "Native Codegen / FFI Crash (SIGSEGV / SIGILL / Memory Corruption)"
+        - "Native AOT Codegen / Embedding API Crash (SIGSEGV / SIGILL / Memory Corruption)"
         - "Infinite Loop / Hang / Resource Exhaustion (DoS in O(N) Verifier or Loader)"
     validations:
       required: true

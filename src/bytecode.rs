@@ -44,10 +44,20 @@ pub enum Opcode {
     Sub = 0x11,
     /// Branchless elementwise multiplication (`out[i] = a[i] * b[i]`).
     Mul = 0x12,
+    /// Branchless elementwise IEEE-754 division (`out[i] = a[i] / b[i]`).
+    Div = 0x13,
     /// Branchless elementwise greater-than comparison (`mask[i] = a[i] > b[i]`).
     CmpGt = 0x14,
     /// Branchless predicated selection (`out[i] = mask[i] ? val[i] : 0.0`).
     SelectZero = 0x15,
+    /// Branchless elementwise minimum (`out[i] = min(a[i], b[i])`).
+    Min = 0x16,
+    /// Branchless elementwise maximum (`out[i] = max(a[i], b[i])`).
+    Max = 0x17,
+    /// Branchless elementwise less-than comparison (`mask[i] = a[i] < b[i]`).
+    CmpLt = 0x18,
+    /// Branchless elementwise equality comparison (`mask[i] = a[i] == b[i]`).
+    CmpEq = 0x19,
     /// Stream compaction filtering elements of `in_b` where mask `in_a` is true.
     FilterCompact = 0x20,
     /// Horizontal sum reduction of column `in_a` to a scalar `f64`.
@@ -76,8 +86,13 @@ impl Opcode {
             0x10 => Ok(Self::Add),
             0x11 => Ok(Self::Sub),
             0x12 => Ok(Self::Mul),
+            0x13 => Ok(Self::Div),
             0x14 => Ok(Self::CmpGt),
             0x15 => Ok(Self::SelectZero),
+            0x16 => Ok(Self::Min),
+            0x17 => Ok(Self::Max),
+            0x18 => Ok(Self::CmpLt),
+            0x19 => Ok(Self::CmpEq),
             0x20 => Ok(Self::FilterCompact),
             0x21 => Ok(Self::ReduceSum),
             0x22 => Ok(Self::ReduceMax),
