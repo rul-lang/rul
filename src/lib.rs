@@ -1173,4 +1173,234 @@ mod tests {
         assert!(trace_resp.contains("STATUS: WHITE_BOX_TRACE_OK"));
         assert!(trace_resp.contains("DATA_SOURCE: SYNTHETIC_PATTERN"));
     }
+
+    #[test]
+    fn test_v040_math_and_logic_isa_all_tiers_and_aot() {
+        // Odd length (1,027 = 256 * 4 + 3) exercises both AVX2 256-bit YMM vectors and scalar tail
+        // across all 9 v0.4.0 opcodes: Abs, Sqrt, Floor, Ceil, Ln, Exp, MaskAnd, MaskOr, ReduceMin
+        let rls_src = "\
+            arena 0 len=1027 lane=f64x8
+            arena 1 len=1027 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $b = ArenaInput f64x8 a=1
+            node $c_neg = ConstF64 f64x1 const=-3.25
+            node $c_pos = ConstF64 f64x1 const=1.0
+            node $c_scale = ConstF64 f64x1 const=0.05
+            node $c_hi = ConstF64 f64x1 const=90.0
+            node $c_lo = ConstF64 f64x1 const=10.0
+            node $shifted = Add f64x8 a=$a b=$c_neg
+            node $abs_a = Abs f64x8 a=$shifted
+            node $fl = Floor f64x8 a=$abs_a
+            node $cl = Ceil f64x8 a=$abs_a
+            node $avg_round = Add f64x8 a=$fl b=$cl
+            node $plus1 = Add f64x8 a=$avg_round b=$c_pos
+            node $rt = Sqrt f64x8 a=$plus1
+            node $log_v = Ln f64x8 a=$plus1
+            node $scaled = Mul f64x8 a=$b b=$c_scale
+            node $exp_v = Exp f64x8 a=$scaled
+            node $math_sum = Add f64x8 a=$rt b=$log_v
+            node $math_tot = Mul f64x8 a=$math_sum b=$exp_v
+            node $m_gt = CmpGt maskx8 a=$a b=$c_lo
+            node $m_lt = CmpLt maskx8 a=$a b=$c_hi
+            node $m_and = MaskAnd maskx8 a=$m_gt b=$m_lt
+            node $m_eq = CmpEq maskx8 a=$b b=$c_pos
+            node $m_or = MaskOr maskx8 a=$m_and b=$m_eq
+            node $sel = SelectZero f64x8 a=$m_or b=$math_tot
+            node $sum = ReduceSum f64x1 a=$sel
+            output $sum
+        ";
+        let prog = crate::transpiler::assemble_rls(rls_src);
+        assert!(prog.is_ok());
+        let Ok(p) = prog else { return };
+
+        let decompiled = crate::transpiler::program_to_rls(&p);
+        for op_name in [
+            "Abs", "Sqrt", "Floor", "Ceil", "Ln", "Exp", "MaskAnd", "MaskOr",
+        ] {
+            assert!(decompiled.contains(op_name), "missing {op_name} in .rls");
+        }
+        assert_eq!(crate::transpiler::assemble_rls(&decompiled), Ok(p.clone()));
+
+        let col_a: Vec<f64> = (0..1027_u32)
+            .map(|i| f64::from(i % 100) * 1.15 - 15.0)
+            .collect();
+        let col_b: Vec<f64> = (0..1027_u32).map(|i| f64::from(i % 25) * 0.5).collect();
+
+        let r0 = execute_tier0_interpreter(&p, &[&col_a, &col_b]);
+        let r1 = execute_tier1_stencil(&p, &[&col_a, &col_b]);
+        let r2 = execute_tier2_fused(&p, &[&col_a, &col_b]);
+        assert!(r0.is_ok() && r1.is_ok() && r2.is_ok());
+        let (Ok(rep0), Ok(rep1), Ok(rep2)) = (r0, r1, r2) else {
+            return;
+        };
+        assert_eq!(rep0.output, rep1.output);
+        if let (RuntimeValue::Scalar(v0), RuntimeValue::Scalar(v2)) = (&rep0.output, &rep2.output) {
+            assert!((v0 - v2).abs() < 1e-9, "tier0={v0} vs tier2={v2}");
+        }
+        assert_eq!(rep2.telemetry.intermediate_bytes_allocated, 0);
+
+        // Verify standalone Linux x86_64 AVX2 ELF64 AOT binary matches Tier 0
+        let exe_path = std::env::temp_dir().join("rul_test_v040_math_aot_bin");
+        let data_path = std::env::temp_dir().join("rul_test_v040_math_aot_data.bin");
+        let aot_rep = crate::aot::compile_rl_to_executable(&p, &exe_path);
+        assert!(aot_rep.is_ok());
+        assert!(crate::aot::write_arena_data_file(&data_path, &[&col_a, &col_b]).is_ok());
+        let aot_val = crate::aot::run_compiled_executable(&exe_path, &data_path);
+        assert!(aot_val.is_ok());
+        if let (Ok(v_aot), RuntimeValue::Scalar(v0)) = (aot_val, rep0.output) {
+            let rel_err = (v_aot - v0).abs() / v0.abs().max(1.0);
+            assert!(
+                rel_err < 1e-9,
+                "v0.4.0 Math AOT mismatch: aot={v_aot}, tier0={v0}, rel_err={rel_err}"
+            );
+        }
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+
+        // Also test ReduceMin across Tier 0, Tier 1, Tier 2, and standalone AOT
+        let rls_min = "\
+            arena 0 len=1027 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $abs = Abs f64x8 a=$a
+            node $rt = Sqrt f64x8 a=$abs
+            node $min = ReduceMin f64x1 a=$rt
+            output $min
+        ";
+        let Ok(p_min) = crate::transpiler::assemble_rls(rls_min) else {
+            return;
+        };
+        let decomp_min = crate::transpiler::program_to_rls(&p_min);
+        assert!(decomp_min.contains("ReduceMin"));
+        assert_eq!(
+            crate::transpiler::assemble_rls(&decomp_min),
+            Ok(p_min.clone())
+        );
+
+        let (Ok(m0), Ok(m2)) = (
+            execute_tier0_interpreter(&p_min, &[&col_a]),
+            execute_tier2_fused(&p_min, &[&col_a]),
+        ) else {
+            return;
+        };
+        assert_eq!(m0.output, m2.output);
+        assert_eq!(m2.telemetry.intermediate_bytes_allocated, 0);
+
+        let exe_min = std::env::temp_dir().join("rul_test_v040_reducemin_aot_bin");
+        let data_min = std::env::temp_dir().join("rul_test_v040_reducemin_aot_data.bin");
+        assert!(crate::aot::compile_rl_to_executable(&p_min, &exe_min).is_ok());
+        assert!(crate::aot::write_arena_data_file(&data_min, &[&col_a]).is_ok());
+        let aot_min = crate::aot::run_compiled_executable(&exe_min, &data_min);
+        if let (Ok(vm_aot), RuntimeValue::Scalar(vm0)) = (aot_min, m0.output) {
+            assert!((vm_aot - vm0).abs() < 1e-12);
+        }
+        let _ = std::fs::remove_file(&exe_min);
+        let _ = std::fs::remove_file(&data_min);
+
+        // Verify static type-checker rejects invalid operand element types on MaskAnd and Sqrt
+        let bad_mask_rls = "\
+            arena 0 len=8 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $bad = MaskAnd maskx8 a=$a b=$a
+            output $bad
+        ";
+        if let Ok(p_bad_mask) = crate::transpiler::assemble_rls(bad_mask_rls) {
+            assert_eq!(
+                verify_program(&p_bad_mask).err().map(|d| d.kind),
+                Some(VerifyErrorKind::ElementTypeMismatch {
+                    expected: crate::bytecode::ElemType::BoolMask,
+                    actual: crate::bytecode::ElemType::F64,
+                })
+            );
+        }
+
+        let bad_sqrt_rls = "\
+            arena 0 len=8 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $c = ConstF64 f64x1 const=1.0
+            node $m = CmpGt maskx8 a=$a b=$c
+            node $bad = Sqrt f64x8 a=$m
+            output $bad
+        ";
+        if let Ok(p_bad_sqrt) = crate::transpiler::assemble_rls(bad_sqrt_rls) {
+            assert_eq!(
+                verify_program(&p_bad_sqrt).err().map(|d| d.kind),
+                Some(VerifyErrorKind::ElementTypeMismatch {
+                    expected: crate::bytecode::ElemType::F64,
+                    actual: crate::bytecode::ElemType::BoolMask,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_engine_4factor_hybrid_scoring_and_cosine_similarity() {
+        // Full 4-Factor Hybrid Scoring Pipeline from MEMORY_ENGINE_DESIGN.md:
+        // final_score[i] = rrf[i] * (1.0 + 0.15 * ln(1.0 + access[i])) * (0.5 + feedback[i]) * exp(-lambda * age_days[i])
+        let rls_scorer = "\
+            arena 0 len=1024 lane=f64x8
+            arena 1 len=1024 lane=f64x8
+            arena 2 len=1024 lane=f64x8
+            arena 3 len=1024 lane=f64x8
+            node $rrf = ArenaInput f64x8 a=0
+            node $access = ArenaInput f64x8 a=1
+            node $feedback = ArenaInput f64x8 a=2
+            node $age = ArenaInput f64x8 a=3
+            node $c1 = ConstF64 f64x1 const=1.0
+            node $c015 = ConstF64 f64x1 const=0.15
+            node $c05 = ConstF64 f64x1 const=0.5
+            node $neg_lambda = ConstF64 f64x1 const=-0.023104906018664842
+            node $acc_p1 = Add f64x8 a=$access b=$c1
+            node $ln_acc = Ln f64x8 a=$acc_p1
+            node $heb_scaled = Mul f64x8 a=$ln_acc b=$c015
+            node $hebbian = Add f64x8 a=$heb_scaled b=$c1
+            node $fb_boost = Add f64x8 a=$feedback b=$c05
+            node $exp_arg = Mul f64x8 a=$age b=$neg_lambda
+            node $decay = Exp f64x8 a=$exp_arg
+            node $s1 = Mul f64x8 a=$rrf b=$hebbian
+            node $s2 = Mul f64x8 a=$s1 b=$fb_boost
+            node $final_scores = Mul f64x8 a=$s2 b=$decay
+            node $best_score = ReduceMax f64x1 a=$final_scores
+            output $best_score
+        ";
+        let Ok(prog) = crate::transpiler::assemble_rls(rls_scorer) else {
+            return;
+        };
+        let rrf: Vec<f64> = (0..1024_u32)
+            .map(|i| 1.0 / (60.0 + f64::from(i % 50)))
+            .collect();
+        let access: Vec<f64> = (0..1024_u32).map(|i| f64::from(i % 30)).collect();
+        let feedback: Vec<f64> = (0..1024_u32)
+            .map(|i| (f64::from(i % 10) * 0.1).clamp(0.05, 0.95))
+            .collect();
+        let age: Vec<f64> = (0..1024_u32).map(|i| f64::from(i % 90)).collect();
+
+        let (Ok(rep0), Ok(rep2)) = (
+            execute_tier0_interpreter(&prog, &[&rrf, &access, &feedback, &age]),
+            execute_tier2_fused(&prog, &[&rrf, &access, &feedback, &age]),
+        ) else {
+            return;
+        };
+        assert_eq!(rep2.telemetry.intermediate_bytes_allocated, 0);
+        if let (RuntimeValue::Scalar(v0), RuntimeValue::Scalar(v2)) = (&rep0.output, &rep2.output) {
+            assert!((v0 - v2).abs() < 1e-12);
+
+            let exe_scorer = std::env::temp_dir().join("rul_test_memory_scorer_aot_bin");
+            let data_scorer = std::env::temp_dir().join("rul_test_memory_scorer_aot_data.bin");
+            let Ok(compile_rep) = crate::aot::compile_rl_to_executable(&prog, &exe_scorer) else {
+                return;
+            };
+            assert!(compile_rep.avx2_vectorized);
+            assert!(crate::aot::write_arena_data_file(
+                &data_scorer,
+                &[&rrf, &access, &feedback, &age]
+            )
+            .is_ok());
+            let Ok(v_aot) = crate::aot::run_compiled_executable(&exe_scorer, &data_scorer) else {
+                return;
+            };
+            assert!((v_aot - *v0).abs() < 1e-12);
+            let _ = std::fs::remove_file(&exe_scorer);
+            let _ = std::fs::remove_file(&data_scorer);
+        }
+    }
 }

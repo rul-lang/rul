@@ -90,6 +90,7 @@ impl std::error::Error for AotError {}
 enum AotReduction {
     Sum,
     Max,
+    Min,
 }
 
 /// Compiles a verified [`RulProgram`] into an in-memory Linux `x86_64` `ELF64` executable image.
@@ -109,7 +110,7 @@ pub fn compile_to_elf64_bytes(
     let t_cg = Instant::now();
     let live = compute_live_nodes(program);
 
-    // Locate the terminal reduction node (`ReduceSum` or `ReduceMax`) and optional `AssertContract`.
+    // Locate the terminal reduction node (`ReduceSum`, `ReduceMax`, or `ReduceMin`) and optional `AssertContract`.
     let mut reduce_node: Option<(usize, usize, AotReduction)> = None;
     let mut has_assert_contract = false;
     let mut domain_start: u64 = 0;
@@ -127,6 +128,9 @@ pub fn compile_to_elf64_bytes(
             }
             Opcode::ReduceMax => {
                 reduce_node = Some((idx, frame.in_a as usize, AotReduction::Max));
+            }
+            Opcode::ReduceMin => {
+                reduce_node = Some((idx, frame.in_a as usize, AotReduction::Min));
             }
             Opcode::AssertContract => {
                 has_assert_contract = true;
@@ -150,7 +154,7 @@ pub fn compile_to_elf64_bytes(
     }
 
     let (reduce_idx, reduce_input_idx, reduction) = reduce_node.ok_or(
-        AotError::UnsupportedGraph("AOT binary requires a ReduceSum or ReduceMax node"),
+        AotError::UnsupportedGraph("AOT binary requires a ReduceSum, ReduceMax, or ReduceMin node"),
     )?;
 
     // Compute byte offsets for each Arena inside the flat arena input file.
@@ -437,6 +441,20 @@ fn emit_x86_64_machine_code(
             // movq xmm7, rax
             code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xF8]);
         }
+        AotReduction::Min => {
+            let pos_inf = f64::INFINITY.to_bits();
+            // movabs rax, pos_inf
+            code.extend_from_slice(&[0x48, 0xB8]);
+            code.extend_from_slice(&pos_inf.to_le_bytes());
+            for lane in 0..4i32 {
+                let acc_disp = -64 + lane * 8;
+                // mov [rbp + acc_disp], rax
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&acc_disp.to_le_bytes());
+            }
+            // movq xmm7, rax
+            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xF8]);
+        }
     }
 
     // 5. Initialize domain bounds: `rcx` = `domain_start`, `rbx` = `domain_end`.
@@ -566,7 +584,7 @@ fn emit_x86_64_machine_code(
                     code.extend_from_slice(&[0xC5, 0xFD, 0xC2, 0xC1, 0x00]);
                     emit_store_ymm0_rbp(&mut code, disp);
                 }
-                Opcode::SelectZero => {
+                Opcode::SelectZero | Opcode::MaskAnd => {
                     emit_load_ymm0_rbp(&mut code, disp_a);
                     // vmovupd ymm1, ymmword ptr [rbp + disp_b]
                     code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
@@ -575,9 +593,72 @@ fn emit_x86_64_machine_code(
                     code.extend_from_slice(&[0xC5, 0xFD, 0x54, 0xC1]);
                     emit_store_ymm0_rbp(&mut code, disp);
                 }
+                Opcode::MaskOr => {
+                    emit_load_ymm0_rbp(&mut code, disp_a);
+                    // vmovupd ymm1, ymmword ptr [rbp + disp_b]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    // vorpd ymm0, ymm0, ymm1 (C5 FD 56 C1)
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x56, 0xC1]);
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::Abs => {
+                    // Clear IEEE-754 sign bit (bit 63) across all 4 f64 lanes.
+                    for lane_off in [0i32, 8, 16, 24] {
+                        let sa = disp_a.saturating_add(lane_off);
+                        let sd = disp.saturating_add(lane_off);
+                        // mov rax, [rbp + sa]
+                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                        code.extend_from_slice(&sa.to_le_bytes());
+                        // btr rax, 63
+                        code.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]);
+                        // mov [rbp + sd], rax
+                        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                        code.extend_from_slice(&sd.to_le_bytes());
+                    }
+                }
+                Opcode::Sqrt => {
+                    // vsqrtpd ymm0, ymmword ptr [rbp + disp_a]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x51, 0x85]);
+                    code.extend_from_slice(&disp_a.to_le_bytes());
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::Floor => {
+                    // vroundpd ymm0, ymmword ptr [rbp + disp_a], 0x09 (round toward -inf)
+                    code.extend_from_slice(&[0xC4, 0xE3, 0x7D, 0x09, 0x85]);
+                    code.extend_from_slice(&disp_a.to_le_bytes());
+                    code.push(0x09);
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::Ceil => {
+                    // vroundpd ymm0, ymmword ptr [rbp + disp_a], 0x0A (round toward +inf)
+                    code.extend_from_slice(&[0xC4, 0xE3, 0x7D, 0x09, 0x85]);
+                    code.extend_from_slice(&disp_a.to_le_bytes());
+                    code.push(0x0A);
+                    emit_store_ymm0_rbp(&mut code, disp);
+                }
+                Opcode::Ln => {
+                    for lane_off in [0i32, 8, 16, 24] {
+                        emit_x87_ln_slot(
+                            &mut code,
+                            disp_a.saturating_add(lane_off),
+                            disp.saturating_add(lane_off),
+                        );
+                    }
+                }
+                Opcode::Exp => {
+                    for lane_off in [0i32, 8, 16, 24] {
+                        emit_x87_exp_slot(
+                            &mut code,
+                            disp_a.saturating_add(lane_off),
+                            disp.saturating_add(lane_off),
+                        );
+                    }
+                }
                 Opcode::Gather
                 | Opcode::ReduceSum
                 | Opcode::ReduceMax
+                | Opcode::ReduceMin
                 | Opcode::RingEnqueue
                 | Opcode::AssertContract => {}
             }
@@ -607,6 +688,12 @@ fn emit_x86_64_machine_code(
             AotReduction::Max => {
                 // vmaxpd ymm0, ymm0, ymmword ptr [rbp - 64]
                 code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x45, 0xC0]);
+                // vmovupd ymmword ptr [rbp - 64], ymm0
+                code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x45, 0xC0]);
+            }
+            AotReduction::Min => {
+                // vminpd ymm0, ymm0, ymmword ptr [rbp - 64]
+                code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x45, 0xC0]);
                 // vmovupd ymmword ptr [rbp - 64], ymm0
                 code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x45, 0xC0]);
             }
@@ -749,14 +836,55 @@ fn emit_x86_64_machine_code(
                 code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x00]);
                 emit_store_xmm0_rbp(&mut code, disp);
             }
-            Opcode::SelectZero => {
+            Opcode::SelectZero | Opcode::MaskAnd => {
                 emit_load_xmm0_rbp(&mut code, disp_a);
                 // movsd xmm1, [rbp + disp_b]
                 code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
                 code.extend_from_slice(&disp_b.to_le_bytes());
-                // andpd xmm0, xmm1 (branchless bitmask select)
+                // andpd xmm0, xmm1 (branchless bitmask select / conjunction)
                 code.extend_from_slice(&[0x66, 0x0F, 0x54, 0xC1]);
                 emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::MaskOr => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // movsd xmm1, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                // orpd xmm0, xmm1 (branchless bitmask disjunction)
+                code.extend_from_slice(&[0x66, 0x0F, 0x56, 0xC1]);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Abs => {
+                // mov rax, [rbp + disp_a]; btr rax, 63; mov [rbp + disp], rax
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&disp_a.to_le_bytes());
+                code.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]);
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&disp.to_le_bytes());
+            }
+            Opcode::Sqrt => {
+                // sqrtsd xmm0, [rbp + disp_a]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x51, 0x85]);
+                code.extend_from_slice(&disp_a.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Floor => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // roundsd xmm0, xmm0, 0x09
+                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x09]);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Ceil => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // roundsd xmm0, xmm0, 0x0A
+                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0A]);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Ln => {
+                emit_x87_ln_slot(&mut code, disp_a, disp);
+            }
+            Opcode::Exp => {
+                emit_x87_exp_slot(&mut code, disp_a, disp);
             }
             Opcode::Gather => {
                 let proof = program
@@ -796,6 +924,7 @@ fn emit_x86_64_machine_code(
             }
             Opcode::ReduceSum
             | Opcode::ReduceMax
+            | Opcode::ReduceMin
             | Opcode::RingEnqueue
             | Opcode::AssertContract => {}
         }
@@ -835,6 +964,10 @@ fn emit_x86_64_machine_code(
         AotReduction::Max => {
             // maxsd xmm7, xmm0
             code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0xF8]);
+        }
+        AotReduction::Min => {
+            // minsd xmm7, xmm0
+            code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0xF8]);
         }
     }
 
@@ -889,6 +1022,13 @@ fn emit_x86_64_machine_code(
             for disp8 in [0xC0u8, 0xC8, 0xD0, 0xD8] {
                 // maxsd xmm7, [rbp + disp8]
                 code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x7D, disp8]);
+            }
+        }
+        AotReduction::Min => {
+            // Merge the 4 AVX2 `vminpd` lanes `[rbp - 64 .. rbp - 40]` into `xmm7`
+            for disp8 in [0xC0u8, 0xC8, 0xD0, 0xD8] {
+                // minsd xmm7, [rbp + disp8]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0x7D, disp8]);
             }
         }
     }
@@ -956,6 +1096,34 @@ fn emit_store_xmm0_rbp(code: &mut Vec<u8>, disp: i32) {
     // movsd [rbp + disp32], xmm0
     code.extend_from_slice(&[0xF2, 0x0F, 0x11, 0x85]);
     code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_x87_ln_slot(code: &mut Vec<u8>, src_disp: i32, dst_disp: i32) {
+    // fldln2
+    code.extend_from_slice(&[0xD9, 0xED]);
+    // fld qword ptr [rbp + src_disp]
+    code.extend_from_slice(&[0xDD, 0x85]);
+    code.extend_from_slice(&src_disp.to_le_bytes());
+    // fyl2x (computes ln(2) * log2(x) = ln(x) and pops ST)
+    code.extend_from_slice(&[0xD9, 0xF1]);
+    // fstp qword ptr [rbp + dst_disp]
+    code.extend_from_slice(&[0xDD, 0x9D]);
+    code.extend_from_slice(&dst_disp.to_le_bytes());
+}
+
+fn emit_x87_exp_slot(code: &mut Vec<u8>, src_disp: i32, dst_disp: i32) {
+    // fld qword ptr [rbp + src_disp]
+    code.extend_from_slice(&[0xDD, 0x85]);
+    code.extend_from_slice(&src_disp.to_le_bytes());
+    // fldl2e; fmulp; fld st(0); frndint; fsub st(1), st(0); fxch st(1);
+    // f2xm1; fld1; faddp; fscale; fstp st(1)
+    code.extend_from_slice(&[
+        0xD9, 0xEA, 0xDE, 0xC9, 0xD9, 0xC0, 0xD9, 0xFC, 0xDC, 0xE9, 0xD9, 0xC9, 0xD9, 0xF0, 0xD9,
+        0xE8, 0xDE, 0xC1, 0xD9, 0xFD, 0xDD, 0xD9,
+    ]);
+    // fstp qword ptr [rbp + dst_disp]
+    code.extend_from_slice(&[0xDD, 0x9D]);
+    code.extend_from_slice(&dst_disp.to_le_bytes());
 }
 
 fn emit_sys_exit(code: &mut Vec<u8>, status: u32) {
@@ -1036,8 +1204,15 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
         match frame.opcode {
             Opcode::ArenaInput | Opcode::ConstF64 => {}
             Opcode::ArenaSlice
+            | Opcode::Abs
+            | Opcode::Sqrt
+            | Opcode::Floor
+            | Opcode::Ceil
+            | Opcode::Ln
+            | Opcode::Exp
             | Opcode::ReduceSum
             | Opcode::ReduceMax
+            | Opcode::ReduceMin
             | Opcode::RingEnqueue
             | Opcode::AssertContract => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
@@ -1058,6 +1233,8 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::CmpGt
             | Opcode::CmpLt
             | Opcode::CmpEq
+            | Opcode::MaskAnd
+            | Opcode::MaskOr
             | Opcode::SelectZero
             | Opcode::FilterCompact
             | Opcode::Gather => {
