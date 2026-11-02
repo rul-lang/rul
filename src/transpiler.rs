@@ -981,10 +981,19 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::Max => "Max",
         Opcode::CmpLt => "CmpLt",
         Opcode::CmpEq => "CmpEq",
+        Opcode::Abs => "Abs",
+        Opcode::Sqrt => "Sqrt",
+        Opcode::Floor => "Floor",
+        Opcode::Ceil => "Ceil",
+        Opcode::Ln => "Ln",
+        Opcode::Exp => "Exp",
         Opcode::FilterCompact => "FilterCompact",
         Opcode::ReduceSum => "ReduceSum",
         Opcode::ReduceMax => "ReduceMax",
         Opcode::Gather => "Gather",
+        Opcode::ReduceMin => "ReduceMin",
+        Opcode::MaskAnd => "MaskAnd",
+        Opcode::MaskOr => "MaskOr",
         Opcode::RingEnqueue => "RingEnqueue",
         Opcode::AssertContract => "AssertContract",
     }
@@ -1006,10 +1015,19 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "Max" => Opcode::Max,
         "CmpLt" => Opcode::CmpLt,
         "CmpEq" => Opcode::CmpEq,
+        "Abs" => Opcode::Abs,
+        "Sqrt" => Opcode::Sqrt,
+        "Floor" => Opcode::Floor,
+        "Ceil" => Opcode::Ceil,
+        "Ln" => Opcode::Ln,
+        "Exp" => Opcode::Exp,
         "FilterCompact" => Opcode::FilterCompact,
         "ReduceSum" => Opcode::ReduceSum,
         "ReduceMax" => Opcode::ReduceMax,
         "Gather" => Opcode::Gather,
+        "ReduceMin" => Opcode::ReduceMin,
+        "MaskAnd" => Opcode::MaskAnd,
+        "MaskOr" => Opcode::MaskOr,
         "RingEnqueue" => Opcode::RingEnqueue,
         "AssertContract" => Opcode::AssertContract,
         _ => {
@@ -1101,8 +1119,15 @@ fn format_node_ref(opcode: Opcode, is_a: bool, idx: u32) -> String {
             opcode,
             Opcode::ArenaInput
                 | Opcode::ArenaSlice
+                | Opcode::Abs
+                | Opcode::Sqrt
+                | Opcode::Floor
+                | Opcode::Ceil
+                | Opcode::Ln
+                | Opcode::Exp
                 | Opcode::ReduceSum
                 | Opcode::ReduceMax
+                | Opcode::ReduceMin
                 | Opcode::RingEnqueue
                 | Opcode::AssertContract
         )

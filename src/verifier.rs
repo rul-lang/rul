@@ -471,6 +471,23 @@ fn verify_node_semantics(
                 origin_arena: None,
             })
         }
+        Opcode::Abs | Opcode::Sqrt | Opcode::Floor | Opcode::Ceil | Opcode::Ln | Opcode::Exp => {
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas)?;
+            if meta_a.elem != ElemType::F64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::F64,
+                        actual: meta_a.elem,
+                    },
+                });
+            }
+            Ok(NodeMeta {
+                shape: meta_a.shape,
+                elem: ElemType::F64,
+                origin_arena: None,
+            })
+        }
         Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas)?;
             let meta_b = get_prior_meta(node_idx, frame.in_b, metas)?;
@@ -480,6 +497,29 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::ElementTypeMismatch {
                         expected: ElemType::F64,
                         actual: if meta_a.elem != ElemType::F64 {
+                            meta_a.elem
+                        } else {
+                            meta_b.elem
+                        },
+                    },
+                });
+            }
+            let shape = unify_elementwise_shapes(node_idx, meta_a.shape, meta_b.shape)?;
+            Ok(NodeMeta {
+                shape,
+                elem: ElemType::BoolMask,
+                origin_arena: None,
+            })
+        }
+        Opcode::MaskAnd | Opcode::MaskOr => {
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas)?;
+            if meta_a.elem != ElemType::BoolMask || meta_b.elem != ElemType::BoolMask {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::BoolMask,
+                        actual: if meta_a.elem != ElemType::BoolMask {
                             meta_a.elem
                         } else {
                             meta_b.elem
@@ -539,7 +579,7 @@ fn verify_node_semantics(
                 origin_arena: None,
             })
         }
-        Opcode::ReduceSum | Opcode::ReduceMax => {
+        Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin => {
             let src_meta = get_prior_meta(node_idx, frame.in_a, metas)?;
             if src_meta.elem != ElemType::F64 {
                 return Err(VerifyDiagnostic {

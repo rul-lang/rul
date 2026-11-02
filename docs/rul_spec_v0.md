@@ -1,6 +1,6 @@
-# Rul Language & `.rl` Binary Execution Specification (v0.3)
+# Rul Language & `.rl` Binary Execution Specification (v0.4)
 
-- **Status**: APPROVED (`v0.3.0` Production Baseline — Columnar Dataflow & Vector Compute Domain)
+- **Status**: APPROVED (`v0.4.0` Production Baseline — Columnar Dataflow, Math & Vector Compute Domain)
 - **File Extensions**: `.rl` (128-bit binary graph), `.rls` (lossless flat symbolic IR)
 - **Core Equation**:
   $$\text{Artifact (}\mathtt{.rl}\text{)} = \text{Algorithm} + \text{Schedule} + \text{Proof}$$
@@ -89,7 +89,7 @@ Byte:  0          1            2            3            4..7 (32-bit)
 Byte:  8..11 (32-bit)                       12..15 (32-bit)
 ```
 
-1. **`opcode (u8)` — 20-Opcode Instruction Set (`v0.3`)**:
+1. **`opcode (u8)` — 29-Opcode Instruction Set (`v0.4`)**:
    - `0x01` `ArenaInput`: Load columnar slice from `ArenaDescriptor[in_a]`.
    - `0x02` `ConstF64`: 64-bit IEEE-754 floating-point constant (`bits = in_a | (in_b << 32)`).
    - `0x03` `ArenaSlice`: Zero-copy sub-slice of `in_a` certified by `proof_idx`.
@@ -104,10 +104,19 @@ Byte:  8..11 (32-bit)                       12..15 (32-bit)
    - `0x17` `Max`: Branchless elementwise maximum (`out[i] = a[i] > b[i] ? a[i] : b[i]`).
    - `0x18` `CmpLt`: Branchless less-than predicate (`mask[i] = a[i] < b[i]`).
    - `0x19` `CmpEq`: Branchless equality predicate (`mask[i] = a[i] == b[i]`).
+   - `0x1A` `Abs`: Branchless IEEE-754 absolute value (`out[i] = |a[i]|`).
+   - `0x1B` `Sqrt`: Branchless IEEE-754 square root (`out[i] = sqrt(a[i])`).
+   - `0x1C` `Floor`: Branchless floor rounding toward $-\infty$ (`out[i] = floor(a[i])`).
+   - `0x1D` `Ceil`: Branchless ceiling rounding toward $+\infty$ (`out[i] = ceil(a[i])`).
+   - `0x1E` `Ln`: Elementwise natural logarithm (`out[i] = ln(a[i])`).
+   - `0x1F` `Exp`: Elementwise natural exponential (`out[i] = exp(a[i])`).
    - `0x20` `FilterCompact`: Stream compaction filtering elements of `in_b` where mask `in_a` is true.
    - `0x21` `ReduceSum`: Horizontal sum reduction of column `in_a` to a scalar `f64`.
    - `0x22` `ReduceMax`: Horizontal maximum reduction of column `in_a` to a scalar `f64`.
    - `0x23` `Gather`: Indirect indexed gather `target[indices[i]]` (requires `proof_idx > 0` and exact integer float indices `idx.fract() == 0.0`).
+   - `0x24` `ReduceMin`: Horizontal minimum reduction of column `in_a` to a scalar `f64`.
+   - `0x25` `MaskAnd`: Branchless boolean mask conjunction (`mask[i] = a[i] && b[i]`).
+   - `0x26` `MaskOr`: Branchless boolean mask disjunction (`mask[i] = a[i] || b[i]`).
    - `0x30` `RingEnqueue`: Enqueue output to a hardware ring buffer (requires `CAP_NET_RING` in `RulHeader.capability_mask`).
    - `0x40` `AssertContract`: Runtime contract assertion verifying finite, non-NaN scalar output.
 2. **`type_lane (u8)`**:

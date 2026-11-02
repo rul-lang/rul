@@ -235,8 +235,15 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
         match frame.opcode {
             Opcode::ArenaInput | Opcode::ConstF64 => {}
             Opcode::ArenaSlice
+            | Opcode::Abs
+            | Opcode::Sqrt
+            | Opcode::Floor
+            | Opcode::Ceil
+            | Opcode::Ln
+            | Opcode::Exp
             | Opcode::ReduceSum
             | Opcode::ReduceMax
+            | Opcode::ReduceMin
             | Opcode::RingEnqueue
             | Opcode::AssertContract => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
@@ -257,6 +264,8 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::CmpGt
             | Opcode::CmpLt
             | Opcode::CmpEq
+            | Opcode::MaskAnd
+            | Opcode::MaskOr
             | Opcode::SelectZero
             | Opcode::FilterCompact
             | Opcode::Gather => {
@@ -378,6 +387,12 @@ fn eval_node_tier0<'a>(
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             eval_arith_tier0(frame.opcode, left, right, node_idx, intermediate_bytes)
         }
+        Opcode::Abs | Opcode::Sqrt | Opcode::Floor | Opcode::Ceil | Opcode::Ln | Opcode::Exp => {
+            let src = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            eval_unary_math_tier0(frame.opcode, src, node_idx, intermediate_bytes)
+        }
         Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
             let left = values
                 .get(frame.in_a as usize)
@@ -410,6 +425,28 @@ fn eval_node_tier0<'a>(
                     Ok(EvalValue::ColumnMask(mask))
                 }
                 _ => Err(ExecError::InvalidOperandState(node_idx)),
+            }
+        }
+        Opcode::MaskAnd | Opcode::MaskOr => {
+            let left = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let right = values
+                .get(frame.in_b as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            if let (EvalValue::ColumnMask(a), EvalValue::ColumnMask(b)) = (left, right) {
+                *intermediate_bytes = intermediate_bytes.saturating_add(a.len());
+                let out: Vec<bool> = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(&x, &y)| match frame.opcode {
+                        Opcode::MaskAnd => x && y,
+                        _ => x || y,
+                    })
+                    .collect();
+                Ok(EvalValue::ColumnMask(out))
+            } else {
+                Err(ExecError::InvalidOperandState(node_idx))
             }
         }
         Opcode::SelectZero => {
@@ -474,6 +511,17 @@ fn eval_node_tier0<'a>(
             if let EvalValue::ColumnF64(col) = src {
                 let max = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 Ok(EvalValue::Scalar(max))
+            } else {
+                Err(ExecError::InvalidOperandState(node_idx))
+            }
+        }
+        Opcode::ReduceMin => {
+            let src = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            if let EvalValue::ColumnF64(col) = src {
+                let min = col.iter().copied().fold(f64::INFINITY, f64::min);
+                Ok(EvalValue::Scalar(min))
             } else {
                 Err(ExecError::InvalidOperandState(node_idx))
             }
@@ -598,6 +646,33 @@ fn eval_arith_tier0<'a>(
             Ok(EvalValue::ColumnF64(Cow::Owned(out)))
         }
         (EvalValue::Scalar(a), EvalValue::Scalar(b)) => Ok(EvalValue::Scalar(apply(*a, *b))),
+        _ => Err(ExecError::InvalidOperandState(node_idx)),
+    }
+}
+
+fn eval_unary_math_tier0<'a>(
+    opcode: Opcode,
+    src: &EvalValue<'a>,
+    node_idx: u32,
+    intermediate_bytes: &mut usize,
+) -> Result<EvalValue<'a>, ExecError> {
+    let apply = |x: f64| -> f64 {
+        match opcode {
+            Opcode::Abs => x.abs(),
+            Opcode::Sqrt => x.sqrt(),
+            Opcode::Floor => x.floor(),
+            Opcode::Ceil => x.ceil(),
+            Opcode::Ln => x.ln(),
+            _ => x.exp(),
+        }
+    };
+    match src {
+        EvalValue::ColumnF64(col) => {
+            *intermediate_bytes = intermediate_bytes.saturating_add(col.len() * 8);
+            let out: Vec<f64> = col.iter().map(|&x| apply(x)).collect();
+            Ok(EvalValue::ColumnF64(Cow::Owned(out)))
+        }
+        EvalValue::Scalar(s) => Ok(EvalValue::Scalar(apply(*s))),
         _ => Err(ExecError::InvalidOperandState(node_idx)),
     }
 }
@@ -734,6 +809,7 @@ pub fn execute_tier2_with_zonemap(
 enum ReductionKind {
     Sum,
     Max,
+    Min,
 }
 
 /// Exact-DAG verified plan for L1-Cache Tile Execution.
@@ -768,7 +844,7 @@ struct ExactPredicatedKernel {
 
 fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan> {
     // Trace backward from output_node through optional AssertContract / RingEnqueue wrappers
-    // to find the terminal ReduceSum or ReduceMax node.
+    // to find the terminal ReduceSum, ReduceMax, or ReduceMin node.
     let mut cursor = program.output_node as usize;
     let mut has_assert_contract = false;
 
@@ -790,6 +866,7 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
     let reduction = match reduce_frame.opcode {
         Opcode::ReduceSum => ReductionKind::Sum,
         Opcode::ReduceMax => ReductionKind::Max,
+        Opcode::ReduceMin => ReductionKind::Min,
         _ => return None,
     };
     let reduce_node_idx = cursor;
@@ -831,9 +908,17 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
             | Opcode::Div
             | Opcode::Min
             | Opcode::Max
+            | Opcode::Abs
+            | Opcode::Sqrt
+            | Opcode::Floor
+            | Opcode::Ceil
+            | Opcode::Ln
+            | Opcode::Exp
             | Opcode::CmpGt
             | Opcode::CmpLt
             | Opcode::CmpEq
+            | Opcode::MaskAnd
+            | Opcode::MaskOr
             | Opcode::SelectZero => {}
             _ => return None,
         }
@@ -1212,6 +1297,7 @@ fn eval_general_tiles_multicore(
         let mut acc = match plan.reduction {
             ReductionKind::Sum => 0.0f64,
             ReductionKind::Max => f64::NEG_INFINITY,
+            ReductionKind::Min => f64::INFINITY,
         };
         for h in handles {
             let part = h
@@ -1220,6 +1306,7 @@ fn eval_general_tiles_multicore(
             acc = match plan.reduction {
                 ReductionKind::Sum => acc + part,
                 ReductionKind::Max => acc.max(part),
+                ReductionKind::Min => acc.min(part),
             };
         }
         Ok(acc)
@@ -1256,6 +1343,7 @@ fn eval_general_tiles_range(
     let mut global_acc = match plan.reduction {
         ReductionKind::Sum => 0.0f64,
         ReductionKind::Max => f64::NEG_INFINITY,
+        ReductionKind::Min => f64::INFINITY,
     };
 
     let mut tile_start = range_start;
@@ -1334,6 +1422,23 @@ fn eval_general_tiles_range(
                     )
                     .ok_or(ExecError::InvalidOperandState(node_idx))?;
                 }
+                Opcode::Abs
+                | Opcode::Sqrt
+                | Opcode::Floor
+                | Opcode::Ceil
+                | Opcode::Ln
+                | Opcode::Exp => {
+                    eval_tile_unary_math(
+                        frame.opcode,
+                        idx,
+                        frame.in_a as usize,
+                        tile_len,
+                        &mut f64_regs,
+                        &scalars,
+                        &is_scalar,
+                    )
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                }
                 Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
                     eval_tile_cmp(
                         frame.opcode,
@@ -1345,6 +1450,17 @@ fn eval_general_tiles_range(
                         &mut mask_regs,
                         &scalars,
                         &is_scalar,
+                    )
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                }
+                Opcode::MaskAnd | Opcode::MaskOr => {
+                    eval_tile_mask_logic(
+                        frame.opcode,
+                        idx,
+                        frame.in_a as usize,
+                        frame.in_b as usize,
+                        tile_len,
+                        &mut mask_regs,
                     )
                     .ok_or(ExecError::InvalidOperandState(node_idx))?;
                 }
@@ -1406,12 +1522,80 @@ fn eval_general_tiles_range(
                     }
                 }
             }
+            ReductionKind::Min => {
+                for &x in final_tile {
+                    if x < global_acc {
+                        global_acc = x;
+                    }
+                }
+            }
         }
 
         tile_start = tile_end;
     }
 
     Ok(global_acc)
+}
+
+fn eval_tile_unary_math(
+    opcode: Opcode,
+    dst_idx: usize,
+    a_idx: usize,
+    tile_len: usize,
+    f64_regs: &mut [[f64; L1_TILE_LEN]],
+    scalars: &[f64],
+    is_scalar: &[bool],
+) -> Option<()> {
+    if a_idx >= dst_idx {
+        return None;
+    }
+    let a_is_scalar = *is_scalar.get(a_idx)?;
+    let (left, right) = f64_regs.split_at_mut(dst_idx);
+    let dst = right.first_mut()?.get_mut(0..tile_len)?;
+    let apply = |x: f64| -> f64 {
+        match opcode {
+            Opcode::Abs => x.abs(),
+            Opcode::Sqrt => x.sqrt(),
+            Opcode::Floor => x.floor(),
+            Opcode::Ceil => x.ceil(),
+            Opcode::Ln => x.ln(),
+            _ => x.exp(),
+        }
+    };
+    if a_is_scalar {
+        let val = apply(*scalars.get(a_idx)?);
+        dst.fill(val);
+    } else {
+        let a = left.get(a_idx)?.get(0..tile_len)?;
+        for (d, &x) in dst.iter_mut().zip(a.iter()) {
+            *d = apply(x);
+        }
+    }
+    Some(())
+}
+
+fn eval_tile_mask_logic(
+    opcode: Opcode,
+    dst_idx: usize,
+    a_idx: usize,
+    b_idx: usize,
+    tile_len: usize,
+    mask_regs: &mut [[bool; L1_TILE_LEN]],
+) -> Option<()> {
+    if a_idx >= dst_idx || b_idx >= dst_idx {
+        return None;
+    }
+    let (left, right) = mask_regs.split_at_mut(dst_idx);
+    let a = left.get(a_idx)?.get(0..tile_len)?;
+    let b = left.get(b_idx)?.get(0..tile_len)?;
+    let dst = right.first_mut()?.get_mut(0..tile_len)?;
+    for ((d, &x), &y) in dst.iter_mut().zip(a.iter()).zip(b.iter()) {
+        *d = match opcode {
+            Opcode::MaskAnd => x && y,
+            _ => x || y,
+        };
+    }
+    Some(())
 }
 
 #[expect(

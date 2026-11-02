@@ -1,6 +1,6 @@
 [package]
 name = "rul"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["Tran Trong Tri (Tymon Tran) <tymon3568@gmail.com>"]
 description = "The Rul Programming Language For AI/SI Agents."
