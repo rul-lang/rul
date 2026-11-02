@@ -251,10 +251,11 @@ fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram), String
     Ok((rl_out, exe_out, prog))
 }
 
-fn load_or_synthesize_arenas(prog: &RulProgram) -> Result<(Vec<Vec<f64>>, PathBuf), String> {
-    let data_dir = PathBuf::from("data");
-
-    // Load every declared arena from `data/arena_<idx>.bin`, for any arena
+fn load_or_synthesize_arenas_in_dir(
+    prog: &RulProgram,
+    data_dir: &Path,
+) -> Result<(Vec<Vec<f64>>, bool), String> {
+    // Load every declared arena from `<data_dir>/arena_<idx>.bin`, for any arena
     // count. Real user data must never be silently replaced by synthetic
     // data: a program that declares N arenas runs on the user's N columns,
     // fails loudly, or — only when no arena files exist at all — runs on
@@ -271,15 +272,7 @@ fn load_or_synthesize_arenas(prog: &RulProgram) -> Result<(Vec<Vec<f64>>, PathBu
         }
     }
     if !prog.arenas.is_empty() && loaded == prog.arenas.len() {
-        // All arenas came from user files. The AOT runner consumes a single
-        // data file, so persist the columns in `write_arena_data_file`
-        // layout (the same layout the synthesis path below already uses).
-        let build_dir = PathBuf::from("build");
-        fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build/: {e}"))?;
-        let combined_path = build_dir.join("arena_input.bin");
-        let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
-        write_arena_data_file(&combined_path, &refs).map_err(|e| e.to_string())?;
-        return Ok((cols, combined_path));
+        return Ok((cols, false));
     }
     if loaded > 0 {
         return Err(format!(
@@ -302,17 +295,44 @@ fn load_or_synthesize_arenas(prog: &RulProgram) -> Result<(Vec<Vec<f64>>, PathBu
         cols.push(col);
     }
 
+    Ok((cols, true))
+}
+
+fn load_or_synthesize_arenas(prog: &RulProgram) -> Result<(Vec<Vec<f64>>, bool), String> {
+    load_or_synthesize_arenas_in_dir(prog, Path::new("data"))
+}
+
+fn prepare_aot_arena_file(
+    cols: &[Vec<f64>],
+    data_dir: &Path,
+    is_synthetic: bool,
+) -> Result<PathBuf, String> {
+    // Fast zero-copy path: when a single real arena file is exactly sized on disk,
+    // pass `data/arena_0.bin` directly to the standalone ELF64 binary without rewriting `build/arena_input.bin`.
+    if !is_synthetic && cols.len() == 1 {
+        if let Some(first_col) = cols.first() {
+            let direct_path = data_dir.join("arena_0.bin");
+            let expected_bytes = u64::try_from(first_col.len().saturating_mul(8)).unwrap_or(0);
+            if let Ok(meta) = fs::metadata(&direct_path) {
+                if meta.len() == expected_bytes {
+                    return Ok(direct_path);
+                }
+            }
+        }
+    }
+
     let build_dir = PathBuf::from("build");
     fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build/: {e}"))?;
-    let synth_path = build_dir.join("arena_input.bin");
+    let combined_path = build_dir.join("arena_input.bin");
     let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
-    write_arena_data_file(&synth_path, &refs).map_err(|e| e.to_string())?;
-    Ok((cols, synth_path))
+    write_arena_data_file(&combined_path, &refs).map_err(|e| e.to_string())?;
+    Ok(combined_path)
 }
 
 fn cmd_run(arg: Option<&str>) -> Result<(), String> {
     let (_rl_path, exe_path, prog) = cmd_build(arg)?;
-    let (cols, arena_file) = load_or_synthesize_arenas(&prog)?;
+    let (cols, is_synthetic) = load_or_synthesize_arenas(&prog)?;
+    let arena_file = prepare_aot_arena_file(&cols, Path::new("data"), is_synthetic)?;
     let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
 
     let tier0 = execute_tier0_interpreter(&prog, &refs).map_err(|e| e.to_string())?;
@@ -350,7 +370,7 @@ fn cmd_run(arg: Option<&str>) -> Result<(), String> {
 fn cmd_autotune(arg: Option<&str>) -> Result<(), String> {
     let entry = resolve_entry_path(arg)?;
     let mut prog = load_program(&entry)?;
-    let (cols, _arena_file) = load_or_synthesize_arenas(&prog)?;
+    let (cols, _is_synthetic) = load_or_synthesize_arenas(&prog)?;
     let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
     let report = autotune_schedule(&mut prog, &refs, None).map_err(|e| e.to_string())?;
     println!(
@@ -376,7 +396,7 @@ fn cmd_autotune(arg: Option<&str>) -> Result<(), String> {
 fn cmd_trace(arg: Option<&str>) -> Result<(), String> {
     let entry = resolve_entry_path(arg)?;
     let prog = load_program(&entry)?;
-    let (cols, _arena_file) = load_or_synthesize_arenas(&prog)?;
+    let (cols, _is_synthetic) = load_or_synthesize_arenas(&prog)?;
     let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
     let report = trace_program(&prog, &refs).map_err(|e| e.to_string())?;
     print!("{}", format_trace_table(&report));
@@ -432,5 +452,90 @@ fn main() -> Result<(), String> {
         other => Err(format!(
             "unknown subcommand `{other}` (run `rul help` for available commands)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_arena_loading_partial_rejection_and_zero_copy_aot_path() {
+        let rls_two = "\
+            arena 0 len=4 lane=f64x8
+            arena 1 len=4 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $b = ArenaInput f64x8 a=1
+            node $p = Mul f64x8 a=$a b=$b
+            node $s = ReduceSum f64x1 a=$p
+            output $s
+        ";
+        let Ok(prog_two) = assemble_rls(rls_two) else {
+            return;
+        };
+
+        let tmp_dir = std::env::temp_dir().join("rul_cli_test_arenas_dir");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        assert!(fs::create_dir_all(&tmp_dir).is_ok());
+
+        // 1. No arena files -> returns synthetic demo columns (`is_synthetic == true`)
+        let synth_res = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir);
+        assert!(synth_res.is_ok());
+        if let Ok((cols, is_synth)) = synth_res {
+            assert!(is_synth);
+            assert_eq!(cols.len(), 2);
+        }
+
+        // 2. Partial arena files (`arena_0.bin` present, `arena_1.bin` missing) -> hard error
+        let col0 = [10.0_f64, 20.0, 30.0, 40.0];
+        let mut bytes0 = Vec::with_capacity(32);
+        for v in col0 {
+            bytes0.extend_from_slice(&v.to_le_bytes());
+        }
+        let f0 = tmp_dir.join("arena_0.bin");
+        assert!(fs::write(&f0, &bytes0).is_ok());
+
+        let partial_res = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir);
+        assert!(partial_res.is_err());
+        if let Err(msg) = partial_res {
+            assert!(msg.contains("refusing to mix real and synthetic data"));
+        }
+
+        // 3. Single-arena real data -> `prepare_aot_arena_file` returns `arena_0.bin` directly (zero-copy)
+        let rls_one = "\
+            arena 0 len=4 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $s = ReduceSum f64x1 a=$a
+            output $s
+        ";
+        let Ok(prog_one) = assemble_rls(rls_one) else {
+            return;
+        };
+        let one_res = load_or_synthesize_arenas_in_dir(&prog_one, &tmp_dir);
+        assert!(one_res.is_ok());
+        if let Ok((cols1, is_synth1)) = one_res {
+            assert!(!is_synth1);
+            assert_eq!(cols1, vec![col0.to_vec()]);
+            let aot_path = prepare_aot_arena_file(&cols1, &tmp_dir, is_synth1);
+            assert_eq!(aot_path.ok(), Some(f0.clone()));
+        }
+
+        // 4. All 2 arena files present -> returns exact user columns (`is_synthetic == false`)
+        let col1 = [1.0_f64, 2.0, 3.0, 4.0];
+        let mut bytes1 = Vec::with_capacity(32);
+        for v in col1 {
+            bytes1.extend_from_slice(&v.to_le_bytes());
+        }
+        let f1 = tmp_dir.join("arena_1.bin");
+        assert!(fs::write(&f1, &bytes1).is_ok());
+
+        let full_res = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir);
+        assert!(full_res.is_ok());
+        if let Ok((cols2, is_synth2)) = full_res {
+            assert!(!is_synth2);
+            assert_eq!(cols2, vec![col0.to_vec(), col1.to_vec()]);
+        }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -813,10 +813,12 @@ mod tests {
         let diff_req = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"rul_test_differential","arguments":{"rls_source":"arena 0 len=512 lane=f64x8\nnode $a = ArenaInput f64x8 a=0\nnode $s = ReduceSum f64x1 a=$a\noutput $s","sample_size":512}}}"#;
         let diff_resp = server.handle_line(diff_req);
         assert!(diff_resp.contains("STATUS: DIFFERENTIAL_EQUIVALENCE_PASS"));
+        assert!(diff_resp.contains("DATA_SOURCE: SYNTHETIC_PATTERN"));
 
         let tune_req = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rul_autotune_schedule","arguments":{"rls_source":"arena 0 len=1024 lane=f64x8\nnode $a = ArenaInput f64x8 a=0\nnode $s = ReduceSum f64x1 a=$a\noutput $s","sample_size":1024}}}"#;
         let tune_resp = server.handle_line(tune_req);
         assert!(tune_resp.contains("STATUS: AUTOTUNE_COMPLETE"));
+        assert!(tune_resp.contains("DATA_SOURCE: SYNTHETIC_PATTERN"));
         assert!(tune_resp.contains("OPTIMIZED_RLS"));
 
         let tmp_elf = std::env::temp_dir().join("rul_mcp_test_out.elf");
@@ -1169,5 +1171,6 @@ mod tests {
         let trace_req = r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"rul_trace","arguments":{"rls_source":"arena 0 len=16 lane=f64x8\nnode $a = ArenaInput f64x8 a=0\nnode $s = ReduceSum f64x1 a=$a\noutput $s","sample_size":16}}}"#;
         let trace_resp = server.handle_line(trace_req);
         assert!(trace_resp.contains("STATUS: WHITE_BOX_TRACE_OK"));
+        assert!(trace_resp.contains("DATA_SOURCE: SYNTHETIC_PATTERN"));
     }
 }
