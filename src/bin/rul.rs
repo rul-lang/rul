@@ -329,6 +329,23 @@ fn prepare_aot_arena_file(
     Ok(combined_path)
 }
 
+fn scalars_equivalent(expected: f64, actual: f64) -> bool {
+    if expected.is_nan() && actual.is_nan() {
+        return true;
+    }
+    if expected.is_nan() || actual.is_nan() {
+        return false;
+    }
+    if expected.is_infinite() || actual.is_infinite() {
+        return expected.is_infinite()
+            && actual.is_infinite()
+            && expected.is_sign_positive() == actual.is_sign_positive();
+    }
+    let diff = (expected - actual).abs();
+    let scale = expected.abs().max(actual.abs()).max(1.0);
+    diff <= 1e-9 * scale
+}
+
 fn cmd_run(arg: Option<&str>) -> Result<(), String> {
     let (_rl_path, exe_path, prog) = cmd_build(arg)?;
     let (cols, is_synthetic) = load_or_synthesize_arenas(&prog)?;
@@ -352,6 +369,13 @@ fn cmd_run(arg: Option<&str>) -> Result<(), String> {
         RuntimeValue::ColumnF64(ref c) => c.iter().copied().sum(),
         RuntimeValue::ColumnMask(ref m) => m.iter().filter(|&&b| b).count() as f64,
     };
+
+    if !scalars_equivalent(tier0_scalar, tier2_scalar) || !scalars_equivalent(tier0_scalar, aot_val)
+    {
+        return Err(format!(
+            "[RUL RUN ERROR] differential equivalence failed: Tier0 Oracle={tier0_scalar:.6}, Tier2={tier2_scalar:.6}, Native ELF64={aot_val:.6}"
+        ));
+    }
 
     println!(
         "[RUL RUN OK] Output={tier2_scalar:.6} (Tier0 Oracle={tier0_scalar:.6}, Native ELF64={aot_val:.6} in {aot_us:.1} us)"
@@ -460,7 +484,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_multi_arena_loading_partial_rejection_and_zero_copy_aot_path() {
+    fn test_multi_arena_loading_partial_rejection_and_zero_copy_aot_path() -> Result<(), String> {
         let rls_two = "\
             arena 0 len=4 lane=f64x8
             arena 1 len=4 lane=f64x8
@@ -470,21 +494,16 @@ mod tests {
             node $s = ReduceSum f64x1 a=$p
             output $s
         ";
-        let Ok(prog_two) = assemble_rls(rls_two) else {
-            return;
-        };
+        let prog_two = assemble_rls(rls_two).map_err(|e| e.to_string())?;
 
         let tmp_dir = std::env::temp_dir().join("rul_cli_test_arenas_dir");
         let _ = fs::remove_dir_all(&tmp_dir);
-        assert!(fs::create_dir_all(&tmp_dir).is_ok());
+        fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
 
         // 1. No arena files -> returns synthetic demo columns (`is_synthetic == true`)
-        let synth_res = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir);
-        assert!(synth_res.is_ok());
-        if let Ok((cols, is_synth)) = synth_res {
-            assert!(is_synth);
-            assert_eq!(cols.len(), 2);
-        }
+        let (cols, is_synth) = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir)?;
+        assert!(is_synth);
+        assert_eq!(cols.len(), 2);
 
         // 2. Partial arena files (`arena_0.bin` present, `arena_1.bin` missing) -> hard error
         let col0 = [10.0_f64, 20.0, 30.0, 40.0];
@@ -493,13 +512,14 @@ mod tests {
             bytes0.extend_from_slice(&v.to_le_bytes());
         }
         let f0 = tmp_dir.join("arena_0.bin");
-        assert!(fs::write(&f0, &bytes0).is_ok());
+        fs::write(&f0, &bytes0).map_err(|e| e.to_string())?;
 
         let partial_res = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir);
         assert!(partial_res.is_err());
-        if let Err(msg) = partial_res {
-            assert!(msg.contains("refusing to mix real and synthetic data"));
-        }
+        let Err(msg) = partial_res else {
+            return Err("expected partial arena error".to_owned());
+        };
+        assert!(msg.contains("refusing to mix real and synthetic data"));
 
         // 3. Single-arena real data -> `prepare_aot_arena_file` returns `arena_0.bin` directly (zero-copy)
         let rls_one = "\
@@ -508,17 +528,12 @@ mod tests {
             node $s = ReduceSum f64x1 a=$a
             output $s
         ";
-        let Ok(prog_one) = assemble_rls(rls_one) else {
-            return;
-        };
-        let one_res = load_or_synthesize_arenas_in_dir(&prog_one, &tmp_dir);
-        assert!(one_res.is_ok());
-        if let Ok((cols1, is_synth1)) = one_res {
-            assert!(!is_synth1);
-            assert_eq!(cols1, vec![col0.to_vec()]);
-            let aot_path = prepare_aot_arena_file(&cols1, &tmp_dir, is_synth1);
-            assert_eq!(aot_path.ok(), Some(f0.clone()));
-        }
+        let prog_one = assemble_rls(rls_one).map_err(|e| e.to_string())?;
+        let (cols1, is_synth1) = load_or_synthesize_arenas_in_dir(&prog_one, &tmp_dir)?;
+        assert!(!is_synth1);
+        assert_eq!(cols1, vec![col0.to_vec()]);
+        let aot_path = prepare_aot_arena_file(&cols1, &tmp_dir, is_synth1)?;
+        assert_eq!(aot_path, f0);
 
         // 4. All 2 arena files present -> returns exact user columns (`is_synthetic == false`)
         let col1 = [1.0_f64, 2.0, 3.0, 4.0];
@@ -527,15 +542,26 @@ mod tests {
             bytes1.extend_from_slice(&v.to_le_bytes());
         }
         let f1 = tmp_dir.join("arena_1.bin");
-        assert!(fs::write(&f1, &bytes1).is_ok());
+        fs::write(&f1, &bytes1).map_err(|e| e.to_string())?;
 
-        let full_res = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir);
-        assert!(full_res.is_ok());
-        if let Ok((cols2, is_synth2)) = full_res {
-            assert!(!is_synth2);
-            assert_eq!(cols2, vec![col0.to_vec(), col1.to_vec()]);
-        }
+        let (cols2, is_synth2) = load_or_synthesize_arenas_in_dir(&prog_two, &tmp_dir)?;
+        assert!(!is_synth2);
+        assert_eq!(cols2, vec![col0.to_vec(), col1.to_vec()]);
 
         let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalars_equivalent_ieee754_and_tolerance() {
+        assert!(scalars_equivalent(f64::NAN, f64::NAN));
+        assert!(!scalars_equivalent(f64::NAN, 0.0));
+        assert!(!scalars_equivalent(0.0, f64::NAN));
+        assert!(scalars_equivalent(f64::INFINITY, f64::INFINITY));
+        assert!(scalars_equivalent(f64::NEG_INFINITY, f64::NEG_INFINITY));
+        assert!(!scalars_equivalent(f64::INFINITY, f64::NEG_INFINITY));
+        assert!(!scalars_equivalent(f64::INFINITY, 1.0));
+        assert!(scalars_equivalent(1000.0, 1000.0 + 1e-7));
+        assert!(!scalars_equivalent(0.874_586, 20_726_104.0));
     }
 }

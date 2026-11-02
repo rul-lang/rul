@@ -110,9 +110,41 @@ pub fn compile_to_elf64_bytes(
     let t_cg = Instant::now();
     let live = compute_live_nodes(program);
 
-    // Locate the terminal reduction node (`ReduceSum`, `ReduceMax`, or `ReduceMin`) and optional `AssertContract`.
-    let mut reduce_node: Option<(usize, usize, AotReduction)> = None;
+    // Trace backward from `output_node` through optional `AssertContract` / `RingEnqueue` wrappers
+    // to verify that the terminal computation is a reduction node (`ReduceSum`, `ReduceMax`, or `ReduceMin`).
+    let mut cursor = program.output_node as usize;
     let mut has_assert_contract = false;
+    loop {
+        let frame = program
+            .nodes
+            .get(cursor)
+            .ok_or(AotError::UnsupportedGraph("invalid output node index"))?;
+        match frame.opcode {
+            Opcode::AssertContract => {
+                has_assert_contract = true;
+                cursor = frame.in_a as usize;
+            }
+            Opcode::RingEnqueue => {
+                cursor = frame.in_a as usize;
+            }
+            _ => break,
+        }
+    }
+    let terminal_frame = program
+        .nodes
+        .get(cursor)
+        .ok_or(AotError::UnsupportedGraph("invalid terminal node index"))?;
+    if !matches!(
+        terminal_frame.opcode,
+        Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin
+    ) {
+        return Err(AotError::UnsupportedGraph(
+            "AOT binary requires output_node to be ReduceSum, ReduceMax, or ReduceMin (or wrapped by AssertContract/RingEnqueue)",
+        ));
+    }
+    let terminal_reduce_idx = cursor;
+
+    let mut reduce_node: Option<(usize, usize, AotReduction)> = None;
     let mut domain_start: u64 = 0;
     let mut domain_end: Option<u64> = None;
     let mut filter_mask_node: Option<usize> = None;
@@ -122,14 +154,36 @@ pub fn compile_to_elf64_bytes(
         if !live.get(idx).copied().unwrap_or(false) {
             continue;
         }
+        if idx > terminal_reduce_idx
+            && !matches!(frame.opcode, Opcode::AssertContract | Opcode::RingEnqueue)
+        {
+            return Err(AotError::UnsupportedGraph(
+                "AOT binary does not support post-reduction operations",
+            ));
+        }
         match frame.opcode {
             Opcode::ReduceSum => {
+                if reduce_node.is_some() {
+                    return Err(AotError::UnsupportedGraph(
+                        "AOT binary does not support multiple live reduction nodes",
+                    ));
+                }
                 reduce_node = Some((idx, frame.in_a as usize, AotReduction::Sum));
             }
             Opcode::ReduceMax => {
+                if reduce_node.is_some() {
+                    return Err(AotError::UnsupportedGraph(
+                        "AOT binary does not support multiple live reduction nodes",
+                    ));
+                }
                 reduce_node = Some((idx, frame.in_a as usize, AotReduction::Max));
             }
             Opcode::ReduceMin => {
+                if reduce_node.is_some() {
+                    return Err(AotError::UnsupportedGraph(
+                        "AOT binary does not support multiple live reduction nodes",
+                    ));
+                }
                 reduce_node = Some((idx, frame.in_a as usize, AotReduction::Min));
             }
             Opcode::AssertContract => {
