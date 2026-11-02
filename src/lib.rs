@@ -1269,32 +1269,103 @@ mod tests {
         let _ = std::fs::remove_file(&exe_min);
         let _ = std::fs::remove_file(&data_min);
 
-        // Verify AOT fails closed (`UnsupportedGraph`) when operations follow Reduce* or when multiple Reduce* exist
+        // Verify post-reduction scalar operations (`Sqrt(ReduceSum)`) and multi-reduction scalar DAGs
+        // (`(ReduceSum + ReduceMin) / ReduceMax`) execute in Tier 2 (`0 bytes` intermediate allocation)
+        // and compile to standalone `ELF64` AOT binaries matching Tier 0!
         let rls_post_reduce = "\
-            arena 0 len=16 lane=f64x8
+            arena 0 len=1027 lane=f64x8
             node $a = ArenaInput f64x8 a=0
-            node $s = ReduceSum f64x1 a=$a
+            node $abs = Abs f64x8 a=$a
+            node $s = ReduceSum f64x1 a=$abs
             node $rt = Sqrt f64x1 a=$s
             output $rt
         ";
         let p_post = crate::transpiler::assemble_rls(rls_post_reduce).map_err(|e| e.to_string())?;
-        assert!(matches!(
-            crate::aot::compile_to_elf64_bytes(&p_post),
-            Err(crate::aot::AotError::UnsupportedGraph(_))
-        ));
+        let pr0 = execute_tier0_interpreter(&p_post, &[&col_a]).map_err(|e| e.to_string())?;
+        let pr2 = execute_tier2_fused(&p_post, &[&col_a]).map_err(|e| e.to_string())?;
+        assert_eq!(pr2.telemetry.intermediate_bytes_allocated, 0);
+        let RuntimeValue::Scalar(v_pr0) = pr0.output else {
+            return Err("expected Scalar from Sqrt(ReduceSum)".to_owned());
+        };
+        let RuntimeValue::Scalar(v_pr2) = pr2.output else {
+            return Err("expected Scalar from Tier 2 Sqrt(ReduceSum)".to_owned());
+        };
+        assert!((v_pr0 - v_pr2).abs() < 1e-12);
+        let exe_pr = std::env::temp_dir().join("rul_test_post_reduce_aot_bin");
+        let data_pr = std::env::temp_dir().join("rul_test_post_reduce_aot_data.bin");
+        crate::aot::compile_rl_to_executable(&p_post, &exe_pr).map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_pr, &[&col_a]).map_err(|e| e.to_string())?;
+        let v_pr_aot =
+            crate::aot::run_compiled_executable(&exe_pr, &data_pr).map_err(|e| e.to_string())?;
+        assert!((v_pr_aot - v_pr0).abs() < 1e-12);
+        let _ = std::fs::remove_file(&exe_pr);
+        let _ = std::fs::remove_file(&data_pr);
 
         let rls_multi_reduce = "\
-            arena 0 len=16 lane=f64x8
+            arena 0 len=1027 lane=f64x8
             node $a = ArenaInput f64x8 a=0
-            node $s1 = ReduceSum f64x1 a=$a
-            node $s2 = ReduceMax f64x1 a=$a
-            node $q = Div f64x1 a=$s1 b=$s2
+            node $abs = Abs f64x8 a=$a
+            node $s1 = ReduceSum f64x1 a=$abs
+            node $s2 = ReduceMax f64x1 a=$abs
+            node $s3 = ReduceMin f64x1 a=$abs
+            node $num = Add f64x1 a=$s1 b=$s3
+            node $q = Div f64x1 a=$num b=$s2
             output $q
         ";
         let p_multi =
             crate::transpiler::assemble_rls(rls_multi_reduce).map_err(|e| e.to_string())?;
+        let mr0 = execute_tier0_interpreter(&p_multi, &[&col_a]).map_err(|e| e.to_string())?;
+        let mr2 = execute_tier2_fused(&p_multi, &[&col_a]).map_err(|e| e.to_string())?;
+        assert_eq!(mr2.telemetry.intermediate_bytes_allocated, 0);
+        let RuntimeValue::Scalar(v_mr0) = mr0.output else {
+            return Err("expected Scalar from multi-reduce Tier 0".to_owned());
+        };
+        let RuntimeValue::Scalar(v_mr2) = mr2.output else {
+            return Err("expected Scalar from multi-reduce Tier 2".to_owned());
+        };
+        assert!((v_mr0 - v_mr2).abs() < 1e-12);
+        let exe_mr = std::env::temp_dir().join("rul_test_multi_reduce_aot_bin");
+        let data_mr = std::env::temp_dir().join("rul_test_multi_reduce_aot_data.bin");
+        crate::aot::compile_rl_to_executable(&p_multi, &exe_mr).map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_mr, &[&col_a]).map_err(|e| e.to_string())?;
+        let v_mr_aot =
+            crate::aot::run_compiled_executable(&exe_mr, &data_mr).map_err(|e| e.to_string())?;
+        assert!((v_mr_aot - v_mr0).abs() < 1e-12);
+        let _ = std::fs::remove_file(&exe_mr);
+        let _ = std::fs::remove_file(&data_mr);
+
+        // Verify AOT fails closed (`UnsupportedGraph`) when a Column node depends on a Reduce result
+        // (2-pass graph such as `x - sum(x)`) or when FilterCompact is combined with multiple reductions.
+        let rls_two_pass = "\
+            arena 0 len=16 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $s = ReduceSum f64x1 a=$a
+            node $centered = Sub f64x8 a=$a b=$s
+            node $out = ReduceSum f64x1 a=$centered
+            output $out
+        ";
+        let p_two_pass =
+            crate::transpiler::assemble_rls(rls_two_pass).map_err(|e| e.to_string())?;
         assert!(matches!(
-            crate::aot::compile_to_elf64_bytes(&p_multi),
+            crate::aot::compile_to_elf64_bytes(&p_two_pass),
+            Err(crate::aot::AotError::UnsupportedGraph(_))
+        ));
+
+        let rls_filter_multi = "\
+            arena 0 len=16 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $zero = ConstF64 f64x1 const=0.0
+            node $m = CmpGt maskx8 a=$a b=$zero
+            node $fc = FilterCompact f64x8 a=$m b=$a
+            node $s1 = ReduceSum f64x1 a=$fc
+            node $s2 = ReduceMax f64x1 a=$fc
+            node $out = Add f64x1 a=$s1 b=$s2
+            output $out
+        ";
+        let p_filter_multi =
+            crate::transpiler::assemble_rls(rls_filter_multi).map_err(|e| e.to_string())?;
+        assert!(matches!(
+            crate::aot::compile_to_elf64_bytes(&p_filter_multi),
             Err(crate::aot::AotError::UnsupportedGraph(_))
         ));
 
@@ -1452,17 +1523,68 @@ mod tests {
             execute_tier1_stencil(&prog_cos, &[&vec_q, &vec_d]).map_err(|e| e.to_string())?;
         let cos2 = execute_tier2_fused(&prog_cos, &[&vec_q, &vec_d]).map_err(|e| e.to_string())?;
         assert_eq!(cos0.output, cos1.output);
-        assert_eq!(cos0.output, cos2.output);
-        let RuntimeValue::Scalar(v_cos) = cos0.output else {
-            return Err("expected Scalar from Cosine Similarity".to_owned());
+        assert_eq!(cos2.telemetry.intermediate_bytes_allocated, 0);
+        let RuntimeValue::Scalar(v_cos0) = cos0.output else {
+            return Err("expected Scalar from Cosine Similarity Tier 0".to_owned());
         };
-        assert!((v_cos - expected_cos).abs() < 1e-12);
+        let RuntimeValue::Scalar(v_cos2) = cos2.output else {
+            return Err("expected Scalar from Cosine Similarity Tier 2".to_owned());
+        };
+        assert!((v_cos0 - expected_cos).abs() < 1e-12);
+        assert!((v_cos2 - expected_cos).abs() < 1e-12);
 
-        // In PR-A (single-reduction AOT), multi-reduction + post-reduction scalar graphs fail closed with UnsupportedGraph
-        assert!(matches!(
-            crate::aot::compile_to_elf64_bytes(&prog_cos),
-            Err(crate::aot::AotError::UnsupportedGraph(_))
-        ));
+        let exe_cos = std::env::temp_dir().join("rul_test_cosine_aot_bin");
+        let data_cos = std::env::temp_dir().join("rul_test_cosine_aot_data.bin");
+        let cos_rep =
+            crate::aot::compile_rl_to_executable(&prog_cos, &exe_cos).map_err(|e| e.to_string())?;
+        assert!(cos_rep.avx2_vectorized);
+        crate::aot::write_arena_data_file(&data_cos, &[&vec_q, &vec_d])
+            .map_err(|e| e.to_string())?;
+        let v_cos_aot =
+            crate::aot::run_compiled_executable(&exe_cos, &data_cos).map_err(|e| e.to_string())?;
+        assert!((v_cos_aot - expected_cos).abs() < 1e-12);
+        let _ = std::fs::remove_file(&exe_cos);
+        let _ = std::fs::remove_file(&data_cos);
+
+        // Part 3: Interleaved Reduce + Post-Reduce Scalar order (`Sqrt($sum_qq)` placed before `$sum_dd`)
+        let rls_cosine_interleaved = "\
+            arena 0 len=384 lane=f64x8
+            arena 1 len=384 lane=f64x8
+            node $q = ArenaInput f64x8 a=0
+            node $d = ArenaInput f64x8 a=1
+            node $qq = Mul f64x8 a=$q b=$q
+            node $sum_qq = ReduceSum f64x1 a=$qq
+            node $norm_q = Sqrt f64x1 a=$sum_qq
+            node $dd = Mul f64x8 a=$d b=$d
+            node $sum_dd = ReduceSum f64x1 a=$dd
+            node $norm_d = Sqrt f64x1 a=$sum_dd
+            node $qd = Mul f64x8 a=$q b=$d
+            node $dot = ReduceSum f64x1 a=$qd
+            node $denom = Mul f64x1 a=$norm_q b=$norm_d
+            node $cos = Div f64x1 a=$dot b=$denom
+            output $cos
+        ";
+        let prog_interleaved =
+            crate::transpiler::assemble_rls(rls_cosine_interleaved).map_err(|e| e.to_string())?;
+        let ic2 =
+            execute_tier2_fused(&prog_interleaved, &[&vec_q, &vec_d]).map_err(|e| e.to_string())?;
+        assert_eq!(ic2.telemetry.intermediate_bytes_allocated, 0);
+        let RuntimeValue::Scalar(v_ic2) = ic2.output else {
+            return Err("expected Scalar from interleaved Cosine Tier 2".to_owned());
+        };
+        assert!((v_ic2 - expected_cos).abs() < 1e-12);
+
+        let exe_ic = std::env::temp_dir().join("rul_test_cosine_interleaved_aot_bin");
+        let data_ic = std::env::temp_dir().join("rul_test_cosine_interleaved_aot_data.bin");
+        crate::aot::compile_rl_to_executable(&prog_interleaved, &exe_ic)
+            .map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_ic, &[&vec_q, &vec_d])
+            .map_err(|e| e.to_string())?;
+        let v_ic_aot =
+            crate::aot::run_compiled_executable(&exe_ic, &data_ic).map_err(|e| e.to_string())?;
+        assert!((v_ic_aot - expected_cos).abs() < 1e-12);
+        let _ = std::fs::remove_file(&exe_ic);
+        let _ = std::fs::remove_file(&data_ic);
         Ok(())
     }
 }
