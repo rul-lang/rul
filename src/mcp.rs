@@ -63,7 +63,9 @@ pub fn handle_mcp_request(json_line: &str) -> String {
             let result = concat!(
                 r#"{"protocolVersion":"2024-11-05","#,
                 r#""capabilities":{"tools":{"listChanged":false}},"#,
-                r#""serverInfo":{"name":"rul-mcp","version":"0.3.0"}}"#
+                r#""serverInfo":{"name":"rul-mcp","version":""#,
+                env!("CARGO_PKG_VERSION"),
+                r#""}}"#
             );
             json_rpc_result(&req_id, result)
         }
