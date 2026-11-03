@@ -46,7 +46,7 @@ $$\text{Rul Compiler} = \text{Single-Pass Linear Verifier } O(N) + \text{Copy-an
 
 ### 1. Question Every Requirement
 - *"Must a programming language's primary representation be human-typed text?"* → **No.** The canonical single source of truth in Rul is the flat binary `.rl` graph. Humans and text-based LLMs interact at the boundary via the lossless `.rls` symbolic assembler (`rul build` / `rul decompile`), while the execution core remains 100% binary.
-- *"Must a compiled binary bundle megabytes of runtime and standard library?"* → **No.** A verified `.rl` pipeline compiles into a **569–841 byte** statically-linked Linux `ELF64` executable that maps input arenas via `mmap` and executes native AVX2 instructions with zero external dependencies.
+- *"Must a compiled binary bundle megabytes of runtime and standard library?"* → **No.** A verified `.rl` pipeline compiles into a **628–1037 byte** statically-linked Linux `ELF64` executable that maps input arenas via `mmap` and executes native AVX2 instructions with zero external dependencies.
 
 ### 2. Delete the Part or Process (and Add Back the Essential 10%)
 We removed from the core engine:
