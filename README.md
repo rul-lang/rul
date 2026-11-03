@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/rul-lang/rul/main/install.sh | sh
 # 2. Scaffold a pure Rul project (`rul.toml`, `src/main.rls`, `data/arena_0.bin`)
 rul new my-ai-pipeline && cd my-ai-pipeline
 
-# 3. Verify in O(N), compile a standalone 841-byte Linux ELF64 AVX2 binary, and run
+# 3. Verify in O(N), compile a standalone 880-byte Linux ELF64 AVX2 binary, and run
 rul check
 rul run
 
@@ -159,10 +159,10 @@ Rul eliminates AI technical debt through three structural mechanisms:
 3. **3-Tier Execution Engine, L1 Zone-Map Skipping & Schedule Autotuner ([`src/engine.rs`](./src/engine.rs))**:
    - **Tier 0 (`execute_tier0_interpreter`)**: Reference columnar interpreter & `AssertContract` golden oracle.
    - **Tier 1 (`execute_tier1_stencil`)**: Vectorized columnar kernel stencils.
-   - **Tier 2 (`execute_tier2_fused` & `execute_tier2_with_zonemap`)**: Whole-graph L1-tile register fusion with **0 bytes of intermediate heap allocation** across single- and multi-reduction + post-reduction scalar DAGs, Auto-MultiCore parallelism, and $O(1)$ L1-cache tile skipping (`ArenaZoneMap`).
+   - **Tier 2 (`execute_tier2_fused` & `execute_tier2_with_zonemap`)**: Whole-graph L1-tile register fusion with **0 bytes of intermediate column allocation** ($O(1)$ L1-tile scratchpad independent of column length $N$) across single- and multi-reduction + post-reduction scalar DAGs, Auto-MultiCore parallelism, and $O(1)$ L1-cache tile skipping (`ArenaZoneMap`).
    - **Hardware Schedule Autotuner (`autotune_schedule`)**: Automatically sweeps `ScheduleHint` policies (`AutoL1Tile`, `SimdStream`, `MultiCore`) against Tier 0 and selects the schedule with the highest `HardwareTelemetry.reward_score`.
 4. **Zero-Runtime Direct `x86_64` AVX2 `ELF64` AOT Compiler ([`src/aot.rs`](./src/aot.rs))**:
-   - Compiles verified single- and multi-reduction + post-reduction scalar `.rl` pipelines across the **29-opcode ISA** (`ArenaInput`, `ConstF64`, `ArenaSlice`, `ArenaMutate`, `Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `Abs`, `Sqrt`, `Floor`, `Ceil`, `Ln`, `Exp`, `CmpGt`, `CmpLt`, `CmpEq`, `MaskAnd`, `MaskOr`, `SelectZero`, `FilterCompact`, `ReduceSum`, `ReduceMax`, `ReduceMin`, `Gather`, `RingEnqueue`, `AssertContract`) directly into a standalone **570–950 byte statically-linked Linux `x86_64` `ELF64` native executable** in **1.3–6.5 µs** using 256-bit AVX2 `YMM` vector stencils (`vmovupd`, `vaddpd`, `vsubpd`, `vmulpd`, `vdivpd`, `vminpd`, `vmaxpd`, `vsqrtpd`, `vroundpd`, `vcmpltpd`, `vcmpeqpd`, `vandpd`, `vorpd`, `vzeroupper`) + hardware x87 transcendental stencils (`fyl2x`, `f2xm1`, `fscale`) + multi-Arena zero-copy `mmap`—requiring **zero `llvm`**, **zero `libc`**, and **zero Rul runtime** at execution time.
+   - Compiles verified single- and multi-reduction + post-reduction scalar `.rl` pipelines across the **29-opcode ISA** (`ArenaInput`, `ConstF64`, `ArenaSlice`, `ArenaMutate`, `Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `Abs`, `Sqrt`, `Floor`, `Ceil`, `Ln`, `Exp`, `CmpGt`, `CmpLt`, `CmpEq`, `MaskAnd`, `MaskOr`, `SelectZero`, `FilterCompact`, `ReduceSum`, `ReduceMax`, `ReduceMin`, `Gather`, `RingEnqueue`, `AssertContract`) directly into a standalone **628–1037 byte statically-linked Linux `x86_64` `ELF64` native executable** in **1.3–6.5 µs** using 256-bit AVX2 `YMM` vector stencils (`vmovupd`, `vaddpd`, `vsubpd`, `vmulpd`, `vdivpd`, `vminpd`, `vmaxpd`, `vsqrtpd`, `vroundpd`, `vcmpltpd`, `vcmpeqpd`, `vandpd`, `vorpd`, `vzeroupper`) + hardware x87 transcendental stencils (`fyl2x`, `f2xm1`, `fscale`) + multi-Arena zero-copy `mmap`—requiring **zero `llvm`**, **zero `libc`**, and **zero Rul runtime** at execution time.
 5. **In-Memory Model Context Protocol Server ([`src/mcp.rs`](./src/mcp.rs) & [`src/bin/rul_mcp.rs`](./src/bin/rul_mcp.rs))**:
    - Persistent `stdio` JSON-RPC 2.0 MCP server (`rul-mcp`) exposing 6 tools for AI Agents: `rul_assemble_and_verify`, `rul_test_differential`, `rul_autotune_schedule`, `rul_compile_standalone`, `rul_trace`, and `rul_cas_intrinsics`.
 6. **Content-Addressed Intrinsics (`rul-cas`, [`src/cas.rs`](./src/cas.rs)) & Zero-Panic Rust Embedding API with `#[repr(C)]` Result Pods (`rul-ffi`, [`src/ffi.rs`](./src/ffi.rs))**:

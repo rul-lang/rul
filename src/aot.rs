@@ -876,17 +876,21 @@ fn emit_x86_64_machine_code(
                     code.extend_from_slice(&acc0.to_le_bytes());
                 }
                 AotReduction::Max => {
-                    emit_load_ymm0_rbp(&mut code, acc0);
-                    // vmaxpd ymm0, ymm0, ymmword ptr [rbp + disp_red_in]
+                    // Load input into ymm0 (`src1`) and accumulator `[rbp + acc0]` as `src2`:
+                    // x86 `vmaxpd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::max`).
+                    emit_load_ymm0_rbp(&mut code, disp_red_in);
+                    // vmaxpd ymm0, ymm0, ymmword ptr [rbp + acc0]
                     code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x85]);
-                    code.extend_from_slice(&disp_red_in.to_le_bytes());
+                    code.extend_from_slice(&acc0.to_le_bytes());
                     emit_store_ymm0_rbp(&mut code, acc0);
                 }
                 AotReduction::Min => {
-                    emit_load_ymm0_rbp(&mut code, acc0);
-                    // vminpd ymm0, ymm0, ymmword ptr [rbp + disp_red_in]
+                    // Load input into ymm0 (`src1`) and accumulator `[rbp + acc0]` as `src2`:
+                    // x86 `vminpd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::min`).
+                    emit_load_ymm0_rbp(&mut code, disp_red_in);
+                    // vminpd ymm0, ymm0, ymmword ptr [rbp + acc0]
                     code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x85]);
-                    code.extend_from_slice(&disp_red_in.to_le_bytes());
+                    code.extend_from_slice(&acc0.to_le_bytes());
                     emit_store_ymm0_rbp(&mut code, acc0);
                 }
             }
@@ -1158,17 +1162,21 @@ fn emit_x86_64_machine_code(
                 code.extend_from_slice(&acc0.to_le_bytes());
             }
             AotReduction::Max => {
-                emit_load_xmm0_rbp(&mut code, acc4);
-                // maxsd xmm0, [rbp + disp_red_in]
+                // Load input into xmm0 (`src1`) and accumulator `[rbp + acc4]` as `src2`:
+                // x86 `maxsd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::max`).
+                emit_load_xmm0_rbp(&mut code, disp_red_in);
+                // maxsd xmm0, [rbp + acc4]
                 code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x85]);
-                code.extend_from_slice(&disp_red_in.to_le_bytes());
+                code.extend_from_slice(&acc4.to_le_bytes());
                 emit_store_xmm0_rbp(&mut code, acc4);
             }
             AotReduction::Min => {
-                emit_load_xmm0_rbp(&mut code, acc4);
-                // minsd xmm0, [rbp + disp_red_in]
+                // Load input into xmm0 (`src1`) and accumulator `[rbp + acc4]` as `src2`:
+                // x86 `minsd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::min`).
+                emit_load_xmm0_rbp(&mut code, disp_red_in);
+                // minsd xmm0, [rbp + acc4]
                 code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0x85]);
-                code.extend_from_slice(&disp_red_in.to_le_bytes());
+                code.extend_from_slice(&acc4.to_le_bytes());
                 emit_store_xmm0_rbp(&mut code, acc4);
             }
         }

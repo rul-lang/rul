@@ -1334,6 +1334,52 @@ mod tests {
         let _ = std::fs::remove_file(&exe_mr);
         let _ = std::fs::remove_file(&data_mr);
 
+        // Verify `ReduceMin(Ln(a))` and `ReduceMax(Ln(a))` ignore `NaN` across both AVX2 vector
+        // lanes and scalar cleanup tail (matching `f64::min` / `f64::max` in Tier 0/1/2).
+        let nan_col: Vec<f64> = vec![
+            -3.5, 2.043, -1.0, 5.5, // AVX2 vector 0 (contains NaNs after Ln)
+            10.0, -9.2, 3.1, -0.5, // AVX2 vector 1 (contains NaNs after Ln)
+            -2.0, 4.2, -7.0, // Scalar tail (contains NaNs after Ln)
+        ];
+        let rls_nan_minmax = "\
+            arena 0 len=11 lane=f64x8
+            node $a = ArenaInput f64x8 a=0
+            node $ln = Ln f64x8 a=$a
+            node $min = ReduceMin f64x1 a=$ln
+            node $max = ReduceMax f64x1 a=$ln
+            node $sum = Add f64x1 a=$min b=$max
+            output $sum
+        ";
+        let p_nan_mm =
+            crate::transpiler::assemble_rls(rls_nan_minmax).map_err(|e| e.to_string())?;
+        let nm0 = execute_tier0_interpreter(&p_nan_mm, &[&nan_col]).map_err(|e| e.to_string())?;
+        let nm1 = execute_tier1_stencil(&p_nan_mm, &[&nan_col]).map_err(|e| e.to_string())?;
+        let nm2 = execute_tier2_fused(&p_nan_mm, &[&nan_col]).map_err(|e| e.to_string())?;
+        let RuntimeValue::Scalar(v_nm0) = nm0.output else {
+            return Err("expected Scalar from NaN ReduceMin/ReduceMax Tier 0".to_owned());
+        };
+        let RuntimeValue::Scalar(v_nm1) = nm1.output else {
+            return Err("expected Scalar from NaN ReduceMin/ReduceMax Tier 1".to_owned());
+        };
+        let RuntimeValue::Scalar(v_nm2) = nm2.output else {
+            return Err("expected Scalar from NaN ReduceMin/ReduceMax Tier 2".to_owned());
+        };
+        assert!(v_nm0.is_finite());
+        assert!((v_nm0 - v_nm1).abs() < 1e-12);
+        assert!((v_nm0 - v_nm2).abs() < 1e-12);
+        let exe_nm = std::env::temp_dir().join("rul_test_nan_minmax_aot_bin");
+        let data_nm = std::env::temp_dir().join("rul_test_nan_minmax_aot_data.bin");
+        crate::aot::compile_rl_to_executable(&p_nan_mm, &exe_nm).map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_nm, &[&nan_col]).map_err(|e| e.to_string())?;
+        let v_nm_aot =
+            crate::aot::run_compiled_executable(&exe_nm, &data_nm).map_err(|e| e.to_string())?;
+        assert!(
+            v_nm_aot.is_finite() && (v_nm_aot - v_nm0).abs() < 1e-12,
+            "NaN ReduceMin/ReduceMax AOT mismatch: aot={v_nm_aot}, tier0={v_nm0}"
+        );
+        let _ = std::fs::remove_file(&exe_nm);
+        let _ = std::fs::remove_file(&data_nm);
+
         // Verify AOT fails closed (`UnsupportedGraph`) when a Column node depends on a Reduce result
         // (2-pass graph such as `x - sum(x)`) or when FilterCompact is combined with multiple reductions.
         let rls_two_pass = "\
