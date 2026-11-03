@@ -28,7 +28,7 @@ Building a traditional human language requires a massive multi-stage pipeline: `
 
 Rul deletes 70% of those search passes and replaces them with 4 deterministic mechanical units:
 
-### Pillar 1: The 20-Opcode Periodic Table & 16-Byte Binary `NodeFrame` ([`src/bytecode.rs`](../src/bytecode.rs))
+### Pillar 1: The 29-Opcode Periodic Table & 16-Byte Binary `NodeFrame` ([`src/bytecode.rs`](../src/bytecode.rs))
 
 Instead of English keywords (`while`, `match`, `struct`), `.rl` defines a strict zero-copy binary layout:
 - **`RulHeader` (64 bytes)**: Contains the magic signature `b"RUL\x00\x01\x00\x00\x00"`, 64-bit integrity hash, 64-bit zero-trust `CapabilityMask` (controlling hardware I/O permissions), and section counts.
@@ -49,8 +49,8 @@ This is how Rul achieves Rust-grade memory safety in **~5.8 nanoseconds per inst
 
 1. **Tier 0 (Golden Oracle Interpreter)**: Executes sequentially with zero-copy borrows and verifies `AssertContract` invariants, plus powers `rul trace` (white-box per-node telemetry).
 2. **Tier 1 (Dead-Node-Eliminated Vector Stencil Engine)**: Applies 8-lane unrolled SIMD stencils across live SSA nodes.
-3. **Tier 2 (Whole-Graph L1-Tile Fuser + Auto-MultiCore + ZoneMap)**: Fuses multi-stage pipelines into `1,024`-element (`8 KB`) L1-cache tile loops with **0 bytes of intermediate heap allocation**, parallelizes across CPU cores when `ScheduleHint.policy == MultiCore`, and skips cold tiles in $O(1)$ via `ArenaZoneMap`.
-4. **Direct Linux `x86_64` AVX2 `ELF64` AOT Compiler**: Emits standalone **569–841 byte** native Linux executables in **~6.4 microseconds** using 256-bit AVX2 `YMM` instructions without `LLVM` or `libc`.
+3. **Tier 2 (Whole-Graph L1-Tile Fuser + Auto-MultiCore + ZoneMap)**: Fuses multi-stage pipelines into `1,024`-element (`8 KB`) L1-cache tile loops with **0 bytes of intermediate column allocation** ($O(1)$ L1-tile scratchpad independent of column length $N$), parallelizes across CPU cores when `ScheduleHint.policy == MultiCore`, and skips cold tiles in $O(1)$ via `ArenaZoneMap`.
+4. **Direct Linux `x86_64` AVX2 `ELF64` AOT Compiler**: Emits standalone **628–1037 byte** native Linux executables in **~6.4 microseconds** using 256-bit AVX2 `YMM` instructions without `LLVM` or `libc`.
 
 ### Pillar 4: AI Agent Feedback Loop (`HardwareTelemetry` & `rul-mcp`)
 

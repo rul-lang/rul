@@ -46,7 +46,7 @@ $$\text{Rul Compiler} = \text{Single-Pass Linear Verifier } O(N) + \text{Copy-an
 
 ### 1. Question Every Requirement
 - *"Must a programming language's primary representation be human-typed text?"* → **No.** The canonical single source of truth in Rul is the flat binary `.rl` graph. Humans and text-based LLMs interact at the boundary via the lossless `.rls` symbolic assembler (`rul build` / `rul decompile`), while the execution core remains 100% binary.
-- *"Must a compiled binary bundle megabytes of runtime and standard library?"* → **No.** A verified `.rl` pipeline compiles into a **569–841 byte** statically-linked Linux `ELF64` executable that maps input arenas via `mmap` and executes native AVX2 instructions with zero external dependencies.
+- *"Must a compiled binary bundle megabytes of runtime and standard library?"* → **No.** A verified `.rl` pipeline compiles into a **628–1037 byte** statically-linked Linux `ELF64` executable that maps input arenas via `mmap` and executes native AVX2 instructions with zero external dependencies.
 
 ### 2. Delete the Part or Process (and Add Back the Essential 10%)
 We removed from the core engine:
@@ -69,7 +69,7 @@ And we added back the **3 essential mechanisms** required for mathematical compl
 | :--- | :--- | :--- |
 | **1. `Arena<Shape, Align>`** | 64-byte aligned Columnar Structure-of-Arrays (`SoA`) memory region. | Eliminates per-row heap allocation (`malloc`), maximizes L1/L2 cache line utilization, and requires zero GC. |
 | **2. `AffineToken` + `ReadLease`** | Explicit linear ownership with shared read leases and `u16` version tracking. | Rust-grade aliasing and use-after-consume safety verified in **$O(1)$ per node** without a borrow-checker solver. |
-| **3. `DataflowOp<SIMD>`** | 20-opcode columnar & scalar algebra (`Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `CmpGt`, `CmpLt`, `CmpEq`, `SelectZero`, `ReduceSum`, `ReduceMax`, `FilterCompact`, `Gather`). | Zero pointer aliasing + explicit `ScheduleHint` enables single-pass L1-tile register fusion and 256-bit AVX2 codegen. |
+| **3. `DataflowOp<SIMD>`** | 29-opcode columnar & scalar algebra (`ArenaInput`, `ConstF64`, `ArenaSlice`, `ArenaMutate`, `Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `Abs`, `Sqrt`, `Floor`, `Ceil`, `Ln`, `Exp`, `CmpGt`, `CmpLt`, `CmpEq`, `MaskAnd`, `MaskOr`, `SelectZero`, `FilterCompact`, `ReduceSum`, `ReduceMax`, `ReduceMin`, `Gather`, `RingEnqueue`, `AssertContract`). | Zero pointer aliasing + explicit `ScheduleHint` enables single-pass L1-tile register fusion and 256-bit AVX2 codegen. |
 | **4. `Capability<HW_Ring>`** | 64-bit `CapabilityMask` in `RulHeader` (`CAP_NONE`, `CAP_NET_RING`, `CAP_STORAGE_DMA`, `CAP_GPU_DISPATCH`). | Mathematical zero-trust sandboxing at the instruction set level—no container overhead needed to block unauthorized I/O. |
 | **5. `Proof<Refinement>`** | Shape unification (`TRIVIAL_BY_SHAPE`) + sidecar `ProofEntry` certificates for `ArenaSlice` and `Gather`. | Proves bounds safety in $O(1)$ per node at load time. |
 

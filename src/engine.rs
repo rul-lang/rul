@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::Instant;
 
-use crate::bytecode::{ExecPolicy, NodeFrame, Opcode, RulProgram, ScheduleHint};
+use crate::bytecode::{ElemType, ExecPolicy, NodeFrame, Opcode, RulProgram, ScheduleHint};
 use crate::verifier::{verify_program, VerifyDiagnostic};
 
 /// L1-Cache Tile width (`1,024` `f64` elements = `8 KB`, fitting comfortably inside 32–48 KB L1d).
@@ -785,15 +785,8 @@ pub fn execute_tier2_with_zonemap(
 
     // Check if the live DAG is eligible for Zero-Allocation L1-Cache Tile Fusion.
     if let Some(plan) = build_l1_tile_plan(program, &live) {
-        let scalar_out = execute_l1_tile_plan(program, inputs, &live, &plan, zonemap_a0)?;
+        let scalar_out = execute_l1_tile_plan(program, inputs, &plan, zonemap_a0)?;
         let exec_ns = u64::try_from(t_exec.elapsed().as_nanos()).unwrap_or(u64::MAX);
-
-        if plan.has_assert_contract && !scalar_out.is_finite() {
-            return Err(ExecError::ContractAssertionFailed {
-                node_idx: program.output_node,
-                observed: scalar_out,
-            });
-        }
 
         return Ok(ExecutionReport {
             output: RuntimeValue::Scalar(scalar_out),
@@ -805,22 +798,38 @@ pub fn execute_tier2_with_zonemap(
     execute_tier1_stencil(program, inputs)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReductionKind {
     Sum,
     Max,
     Min,
 }
 
-/// Exact-DAG verified plan for L1-Cache Tile Execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileNodePhase {
+    Dead,
+    Const,
+    Column,
+    Reduce,
+    PostReduceScalar,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct L1TilePlan {
+struct TileReductionSpec {
     reduce_node_idx: usize,
     reduce_input_idx: usize,
-    reduction: ReductionKind,
+    kind: ReductionKind,
+}
+
+/// Exact-DAG verified plan for L1-Cache Tile Execution (supporting single or multiple reductions
+/// plus post-reduction scalar DAG operations in a single zero-allocation pass).
+#[derive(Debug, Clone)]
+struct L1TilePlan {
+    phases: Vec<TileNodePhase>,
+    reductions: Vec<TileReductionSpec>,
+    post_reduce_nodes: Vec<usize>,
     domain_start: usize,
     domain_len: usize,
-    has_assert_contract: bool,
     multicore: bool,
     /// Optional exact-edge fast path for single-column `SelectZero(CmpGt(col, thr), expr)`.
     fast_predicated: Option<ExactPredicatedKernel>,
@@ -843,104 +852,194 @@ struct ExactPredicatedKernel {
 }
 
 fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan> {
-    // Trace backward from output_node through optional AssertContract / RingEnqueue wrappers
-    // to find the terminal ReduceSum, ReduceMax, or ReduceMin node.
-    let mut cursor = program.output_node as usize;
-    let mut has_assert_contract = false;
-
-    loop {
-        let frame = program.nodes.get(cursor)?;
-        match frame.opcode {
-            Opcode::AssertContract => {
-                has_assert_contract = true;
-                cursor = frame.in_a as usize;
-            }
-            Opcode::RingEnqueue => {
-                cursor = frame.in_a as usize;
-            }
-            _ => break,
-        }
+    let out_idx = program.output_node as usize;
+    if !live.get(out_idx).copied().unwrap_or(false) {
+        return None;
+    }
+    let out_frame = program.nodes.get(out_idx)?;
+    if out_frame.type_lane.elem != ElemType::F64 {
+        return None;
     }
 
-    let reduce_frame = program.nodes.get(cursor)?;
-    let reduction = match reduce_frame.opcode {
-        Opcode::ReduceSum => ReductionKind::Sum,
-        Opcode::ReduceMax => ReductionKind::Max,
-        Opcode::ReduceMin => ReductionKind::Min,
-        _ => return None,
-    };
-    let reduce_node_idx = cursor;
-    let reduce_input_idx = reduce_frame.in_a as usize;
-
-    // Verify all live nodes before `reduce_node_idx` are tileable elementwise operators
-    // (no FilterCompact or Gather, and at most one consistent slice window).
-    let mut domain_start = 0usize;
-    let mut domain_len: Option<usize> = None;
+    let mut phases = vec![TileNodePhase::Dead; program.nodes.len()];
+    let mut reductions = Vec::new();
+    let mut post_reduce_nodes = Vec::new();
+    let mut arena_len: Option<usize> = None;
+    let mut slice_window: Option<(usize, usize)> = None;
     let mut multicore = false;
 
     for (idx, frame) in program.nodes.iter().enumerate() {
-        if idx >= reduce_node_idx || !live.get(idx).copied().unwrap_or(false) {
+        if !live.get(idx).copied().unwrap_or(false) {
             continue;
         }
         if frame.schedule.policy == ExecPolicy::MultiCore {
             multicore = true;
         }
-        match frame.opcode {
+        let phase = match frame.opcode {
+            Opcode::ConstF64 => TileNodePhase::Const,
             Opcode::ArenaInput => {
                 let desc = program.arenas.get(frame.in_a as usize)?;
                 let len = desc.element_count as usize;
-                if domain_len.is_none() {
-                    domain_len = Some(len);
+                if let Some(prev_len) = arena_len {
+                    if prev_len != len {
+                        return None;
+                    }
+                } else {
+                    arena_len = Some(len);
                 }
+                TileNodePhase::Column
             }
             Opcode::ArenaSlice => {
+                if phases.get(frame.in_a as usize).copied()? != TileNodePhase::Column {
+                    return None;
+                }
                 let proof = program
                     .proofs
                     .get(usize::from(frame.proof_idx.saturating_sub(1)))?;
-                domain_start = proof.bound_lo as usize;
-                domain_len = Some((proof.bound_hi - proof.bound_lo) as usize);
+                let start = proof.bound_lo as usize;
+                let len = (proof.bound_hi - proof.bound_lo) as usize;
+                if let Some((prev_start, prev_len)) = slice_window {
+                    if prev_start != start || prev_len != len {
+                        return None;
+                    }
+                } else {
+                    slice_window = Some((start, len));
+                }
+                TileNodePhase::Column
             }
-            Opcode::ConstF64
-            | Opcode::ArenaMutate
-            | Opcode::Add
-            | Opcode::Sub
-            | Opcode::Mul
-            | Opcode::Div
-            | Opcode::Min
-            | Opcode::Max
-            | Opcode::Abs
+            Opcode::ArenaMutate => {
+                let pb = phases.get(frame.in_b as usize).copied()?;
+                if !matches!(pb, TileNodePhase::Const | TileNodePhase::Column) {
+                    return None;
+                }
+                TileNodePhase::Column
+            }
+            Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Min | Opcode::Max => {
+                let pa = phases.get(frame.in_a as usize).copied()?;
+                let pb = phases.get(frame.in_b as usize).copied()?;
+                if pa == TileNodePhase::Column || pb == TileNodePhase::Column {
+                    if !matches!(pa, TileNodePhase::Const | TileNodePhase::Column)
+                        || !matches!(pb, TileNodePhase::Const | TileNodePhase::Column)
+                    {
+                        return None;
+                    }
+                    TileNodePhase::Column
+                } else if matches!(
+                    pa,
+                    TileNodePhase::Const | TileNodePhase::Reduce | TileNodePhase::PostReduceScalar
+                ) && matches!(
+                    pb,
+                    TileNodePhase::Const | TileNodePhase::Reduce | TileNodePhase::PostReduceScalar
+                ) {
+                    post_reduce_nodes.push(idx);
+                    TileNodePhase::PostReduceScalar
+                } else {
+                    return None;
+                }
+            }
+            Opcode::Abs
             | Opcode::Sqrt
             | Opcode::Floor
             | Opcode::Ceil
             | Opcode::Ln
-            | Opcode::Exp
-            | Opcode::CmpGt
+            | Opcode::Exp => {
+                let pa = phases.get(frame.in_a as usize).copied()?;
+                match pa {
+                    TileNodePhase::Column => TileNodePhase::Column,
+                    TileNodePhase::Const
+                    | TileNodePhase::Reduce
+                    | TileNodePhase::PostReduceScalar => {
+                        post_reduce_nodes.push(idx);
+                        TileNodePhase::PostReduceScalar
+                    }
+                    TileNodePhase::Dead => return None,
+                }
+            }
+            Opcode::CmpGt
             | Opcode::CmpLt
             | Opcode::CmpEq
             | Opcode::MaskAnd
             | Opcode::MaskOr
-            | Opcode::SelectZero => {}
-            _ => return None,
+            | Opcode::SelectZero => {
+                let pa = phases.get(frame.in_a as usize).copied()?;
+                let pb = phases.get(frame.in_b as usize).copied()?;
+                if (pa != TileNodePhase::Column && pb != TileNodePhase::Column)
+                    || !matches!(pa, TileNodePhase::Const | TileNodePhase::Column)
+                    || !matches!(pb, TileNodePhase::Const | TileNodePhase::Column)
+                {
+                    return None;
+                }
+                TileNodePhase::Column
+            }
+            Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin => {
+                let pa = phases.get(frame.in_a as usize).copied()?;
+                if pa != TileNodePhase::Column {
+                    return None;
+                }
+                let kind = match frame.opcode {
+                    Opcode::ReduceSum => ReductionKind::Sum,
+                    Opcode::ReduceMax => ReductionKind::Max,
+                    _ => ReductionKind::Min,
+                };
+                reductions.push(TileReductionSpec {
+                    reduce_node_idx: idx,
+                    reduce_input_idx: frame.in_a as usize,
+                    kind,
+                });
+                TileNodePhase::Reduce
+            }
+            Opcode::AssertContract | Opcode::RingEnqueue => {
+                let pa = phases.get(frame.in_a as usize).copied()?;
+                if !matches!(
+                    pa,
+                    TileNodePhase::Const | TileNodePhase::Reduce | TileNodePhase::PostReduceScalar
+                ) {
+                    return None;
+                }
+                post_reduce_nodes.push(idx);
+                TileNodePhase::PostReduceScalar
+            }
+            Opcode::FilterCompact | Opcode::Gather => return None,
+        };
+        if let Some(slot) = phases.get_mut(idx) {
+            *slot = phase;
         }
     }
 
-    if reduce_frame.schedule.policy == ExecPolicy::MultiCore {
-        multicore = true;
+    if reductions.is_empty()
+        || !matches!(
+            phases.get(out_idx).copied()?,
+            TileNodePhase::Reduce | TileNodePhase::PostReduceScalar
+        )
+    {
+        return None;
     }
 
-    let fast_predicated = if domain_start == 0 && matches!(reduction, ReductionKind::Sum) {
-        trace_exact_predicated_dag(program, reduce_input_idx)
+    let (domain_start, domain_len) = slice_window.unwrap_or((0, arena_len?));
+
+    let only_wrapper_epilogue = post_reduce_nodes.iter().all(|&i| {
+        matches!(
+            program.nodes.get(i).map(|f| f.opcode),
+            Some(Opcode::AssertContract | Opcode::RingEnqueue)
+        )
+    });
+    let fast_predicated = if reductions.len() == 1 && domain_start == 0 && only_wrapper_epilogue {
+        let first_red = reductions.first()?;
+        if matches!(first_red.kind, ReductionKind::Sum) {
+            trace_exact_predicated_dag(program, first_red.reduce_input_idx)
+        } else {
+            None
+        }
     } else {
         None
     };
 
     Some(L1TilePlan {
-        reduce_node_idx,
-        reduce_input_idx,
-        reduction,
+        phases,
+        reductions,
+        post_reduce_nodes,
         domain_start,
-        domain_len: domain_len?,
-        has_assert_contract,
+        domain_len,
         multicore,
         fast_predicated,
     })
@@ -1031,13 +1130,12 @@ fn trace_exact_predicated_dag(
 fn execute_l1_tile_plan(
     program: &RulProgram,
     inputs: &[&[f64]],
-    live: &[bool],
     plan: &L1TilePlan,
     zonemap_a0: Option<&ArenaZoneMap>,
 ) -> Result<f64, ExecError> {
     // 1. If exact-edge predicated kernel matches, run the specialized 8-lane SIMD kernel
     //    (with optional Zone-Map skipping and MultiCore parallel dispatch).
-    if let Some(fast) = plan.fast_predicated {
+    let reduced_vals = if let Some(fast) = plan.fast_predicated {
         let slice = inputs
             .get(fast.arena_id)
             .copied()
@@ -1045,25 +1143,91 @@ fn execute_l1_tile_plan(
                 u32::try_from(fast.arena_id).unwrap_or(0),
             ))?;
         let zm = if fast.arena_id == 0 { zonemap_a0 } else { None };
-        if plan.multicore && slice.len() >= L1_TILE_LEN * 16 {
-            return Ok(run_fast_predicated_multicore(slice, fast, zm));
+        let val = if plan.multicore && slice.len() >= L1_TILE_LEN * 16 {
+            run_fast_predicated_multicore(slice, fast, zm)
+        } else {
+            run_fast_predicated_range(slice, 0, fast, zm)
+        };
+        vec![val]
+    } else if plan.multicore && plan.domain_len >= L1_TILE_LEN * 16 {
+        // 2. General L1-Cache Tile Evaluator (`[f64; 1024]` stack/L1 buffers, 0 intermediate column bytes)
+        eval_general_tiles_multicore(program, inputs, plan)?
+    } else {
+        eval_general_tiles_range(
+            program,
+            inputs,
+            plan,
+            plan.domain_start,
+            plan.domain_start + plan.domain_len,
+        )?
+    };
+
+    eval_post_reduce_scalars(program, plan, &reduced_vals)
+}
+
+fn eval_post_reduce_scalars(
+    program: &RulProgram,
+    plan: &L1TilePlan,
+    reduced_vals: &[f64],
+) -> Result<f64, ExecError> {
+    let mut scalar_vals = vec![0.0f64; program.nodes.len()];
+    for (idx, frame) in program.nodes.iter().enumerate() {
+        if plan.phases.get(idx).copied() == Some(TileNodePhase::Const) {
+            if let Some(slot) = scalar_vals.get_mut(idx) {
+                *slot = frame.decode_const_f64();
+            }
         }
-        return Ok(run_fast_predicated_range(slice, 0, fast, zm));
+    }
+    for (spec, &val) in plan.reductions.iter().zip(reduced_vals.iter()) {
+        if let Some(slot) = scalar_vals.get_mut(spec.reduce_node_idx) {
+            *slot = val;
+        }
     }
 
-    // 2. General L1-Cache Tile Evaluator (`[f64; 1024]` stack/L1 buffers, 0 heap bytes)
-    //    for arbitrary multi-column, slice, or arithmetic DAGs!
-    if plan.multicore && plan.domain_len >= L1_TILE_LEN * 16 {
-        return eval_general_tiles_multicore(program, inputs, live, plan);
+    for &idx in &plan.post_reduce_nodes {
+        let node_idx = u32::try_from(idx).unwrap_or(0);
+        let frame = program
+            .nodes
+            .get(idx)
+            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+        let a = *scalar_vals
+            .get(frame.in_a as usize)
+            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+        let b = scalar_vals.get(frame.in_b as usize).copied().unwrap_or(0.0);
+        let val = match frame.opcode {
+            Opcode::Add => a + b,
+            Opcode::Sub => a - b,
+            Opcode::Mul => a * b,
+            Opcode::Div => a / b,
+            Opcode::Min => a.min(b),
+            Opcode::Max => a.max(b),
+            Opcode::Abs => a.abs(),
+            Opcode::Sqrt => a.sqrt(),
+            Opcode::Floor => a.floor(),
+            Opcode::Ceil => a.ceil(),
+            Opcode::Ln => a.ln(),
+            Opcode::Exp => a.exp(),
+            Opcode::RingEnqueue => a,
+            Opcode::AssertContract => {
+                if !a.is_finite() {
+                    return Err(ExecError::ContractAssertionFailed {
+                        node_idx,
+                        observed: a,
+                    });
+                }
+                a
+            }
+            _ => return Err(ExecError::InvalidOperandState(node_idx)),
+        };
+        if let Some(slot) = scalar_vals.get_mut(idx) {
+            *slot = val;
+        }
     }
-    eval_general_tiles_range(
-        program,
-        inputs,
-        live,
-        plan,
-        plan.domain_start,
-        plan.domain_start + plan.domain_len,
-    )
+
+    scalar_vals
+        .get(program.output_node as usize)
+        .copied()
+        .ok_or(ExecError::InvalidOperandState(program.output_node))
 }
 
 fn run_fast_predicated_multicore(
@@ -1273,9 +1437,8 @@ fn eval_predicated_slice_f64x8(slice: &[f64], threshold: f64, expr: ExactValueEx
 fn eval_general_tiles_multicore(
     program: &RulProgram,
     inputs: &[&[f64]],
-    live: &[bool],
     plan: &L1TilePlan,
-) -> Result<f64, ExecError> {
+) -> Result<Vec<f64>, ExecError> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 8))
         .unwrap_or(4);
@@ -1289,27 +1452,36 @@ fn eval_general_tiles_multicore(
         let mut start = plan.domain_start;
         while start < domain_end {
             let end = (start + chunk_elems).min(domain_end);
-            handles.push(
-                s.spawn(move || eval_general_tiles_range(program, inputs, live, plan, start, end)),
-            );
+            handles
+                .push(s.spawn(move || eval_general_tiles_range(program, inputs, plan, start, end)));
             start = end;
         }
-        let mut acc = match plan.reduction {
-            ReductionKind::Sum => 0.0f64,
-            ReductionKind::Max => f64::NEG_INFINITY,
-            ReductionKind::Min => f64::INFINITY,
-        };
+        let mut accs: Vec<f64> = plan
+            .reductions
+            .iter()
+            .map(|r| match r.kind {
+                ReductionKind::Sum => 0.0f64,
+                ReductionKind::Max => f64::NEG_INFINITY,
+                ReductionKind::Min => f64::INFINITY,
+            })
+            .collect();
         for h in handles {
-            let part = h
+            let parts = h
                 .join()
                 .map_err(|_panic| ExecError::InvalidOperandState(program.output_node))??;
-            acc = match plan.reduction {
-                ReductionKind::Sum => acc + part,
-                ReductionKind::Max => acc.max(part),
-                ReductionKind::Min => acc.min(part),
-            };
+            for ((acc, spec), &part) in accs
+                .iter_mut()
+                .zip(plan.reductions.iter())
+                .zip(parts.iter())
+            {
+                *acc = match spec.kind {
+                    ReductionKind::Sum => *acc + part,
+                    ReductionKind::Max => acc.max(part),
+                    ReductionKind::Min => acc.min(part),
+                };
+            }
         }
-        Ok(acc)
+        Ok(accs)
     })
 }
 
@@ -1318,19 +1490,18 @@ fn eval_general_tiles_multicore(
 fn eval_general_tiles_range(
     program: &RulProgram,
     inputs: &[&[f64]],
-    live: &[bool],
     plan: &L1TilePlan,
     range_start: usize,
     range_end: usize,
-) -> Result<f64, ExecError> {
-    let node_count = plan.reduce_node_idx;
+) -> Result<Vec<f64>, ExecError> {
+    let node_count = program.nodes.len();
     let mut f64_regs: Vec<[f64; L1_TILE_LEN]> = vec![[0.0; L1_TILE_LEN]; node_count];
     let mut mask_regs: Vec<[bool; L1_TILE_LEN]> = vec![[false; L1_TILE_LEN]; node_count];
     let mut scalars: Vec<f64> = vec![0.0; node_count];
     let mut is_scalar: Vec<bool> = vec![false; node_count];
 
-    for (idx, frame) in program.nodes.iter().enumerate().take(node_count) {
-        if frame.opcode == Opcode::ConstF64 {
+    for (idx, frame) in program.nodes.iter().enumerate() {
+        if plan.phases.get(idx).copied() == Some(TileNodePhase::Const) {
             if let Some(s) = scalars.get_mut(idx) {
                 *s = frame.decode_const_f64();
             }
@@ -1340,19 +1511,23 @@ fn eval_general_tiles_range(
         }
     }
 
-    let mut global_acc = match plan.reduction {
-        ReductionKind::Sum => 0.0f64,
-        ReductionKind::Max => f64::NEG_INFINITY,
-        ReductionKind::Min => f64::INFINITY,
-    };
+    let mut global_accs: Vec<f64> = plan
+        .reductions
+        .iter()
+        .map(|r| match r.kind {
+            ReductionKind::Sum => 0.0f64,
+            ReductionKind::Max => f64::NEG_INFINITY,
+            ReductionKind::Min => f64::INFINITY,
+        })
+        .collect();
 
     let mut tile_start = range_start;
     while tile_start < range_end {
         let tile_end = (tile_start + L1_TILE_LEN).min(range_end);
         let tile_len = tile_end - tile_start;
 
-        for (idx, frame) in program.nodes.iter().enumerate().take(node_count) {
-            if !live.get(idx).copied().unwrap_or(false) {
+        for (idx, frame) in program.nodes.iter().enumerate() {
+            if plan.phases.get(idx).copied() != Some(TileNodePhase::Column) {
                 continue;
             }
             let node_idx = u32::try_from(idx).unwrap_or(0);
@@ -1506,26 +1681,27 @@ fn eval_general_tiles_range(
             }
         }
 
-        let final_tile = f64_regs
-            .get(plan.reduce_input_idx)
-            .and_then(|r| r.get(0..tile_len))
-            .ok_or(ExecError::InvalidOperandState(program.output_node))?;
-
-        match plan.reduction {
-            ReductionKind::Sum => {
-                global_acc += stencil_reduce_sum_f64x8(final_tile);
-            }
-            ReductionKind::Max => {
-                for &x in final_tile {
-                    if x > global_acc {
-                        global_acc = x;
+        for (acc, spec) in global_accs.iter_mut().zip(plan.reductions.iter()) {
+            let final_tile = f64_regs
+                .get(spec.reduce_input_idx)
+                .and_then(|r| r.get(0..tile_len))
+                .ok_or(ExecError::InvalidOperandState(program.output_node))?;
+            match spec.kind {
+                ReductionKind::Sum => {
+                    *acc += stencil_reduce_sum_f64x8(final_tile);
+                }
+                ReductionKind::Max => {
+                    for &x in final_tile {
+                        if x > *acc {
+                            *acc = x;
+                        }
                     }
                 }
-            }
-            ReductionKind::Min => {
-                for &x in final_tile {
-                    if x < global_acc {
-                        global_acc = x;
+                ReductionKind::Min => {
+                    for &x in final_tile {
+                        if x < *acc {
+                            *acc = x;
+                        }
                     }
                 }
             }
@@ -1534,7 +1710,7 @@ fn eval_general_tiles_range(
         tile_start = tile_end;
     }
 
-    Ok(global_acc)
+    Ok(global_accs)
 }
 
 fn eval_tile_unary_math(

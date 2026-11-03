@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::bytecode::{Opcode, RulProgram};
+use crate::bytecode::{ElemType, Opcode, RulProgram};
 use crate::verifier::{verify_program, VerifyDiagnostic};
 
 /// Base virtual address for the standalone `x86_64` `ELF64` executable.
@@ -93,13 +93,33 @@ enum AotReduction {
     Min,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AotNodePhase {
+    Dead,
+    Const,
+    Column,
+    Reduce,
+    PostReduceScalar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AotReductionSpec {
+    reduce_idx: usize,
+    reduce_input_idx: usize,
+    reduction: AotReduction,
+}
+
 /// Compiles a verified [`RulProgram`] into an in-memory Linux `x86_64` `ELF64` executable image.
 ///
 /// The resulting binary has **zero runtime dependencies** (`statically linked`, no `libc`, no VM)
 /// and executes directly on the OS kernel.
 ///
 /// # Errors
-/// Returns [`AotError`] if $O(N)$ verification fails or the graph has no reduction output.
+/// Returns [`AotError`] if $O(N)$ verification fails or the graph structure is unsupported.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass O(N) phase classifier and ELF64 assembler"
+)]
 pub fn compile_to_elf64_bytes(
     program: &RulProgram,
 ) -> Result<(Vec<u8>, AotCompileReport), AotError> {
@@ -110,43 +130,23 @@ pub fn compile_to_elf64_bytes(
     let t_cg = Instant::now();
     let live = compute_live_nodes(program);
 
-    // Trace backward from `output_node` through optional `AssertContract` / `RingEnqueue` wrappers
-    // to verify that the terminal computation is a reduction node (`ReduceSum`, `ReduceMax`, or `ReduceMin`).
-    let mut cursor = program.output_node as usize;
-    let mut has_assert_contract = false;
-    loop {
-        let frame = program
-            .nodes
-            .get(cursor)
-            .ok_or(AotError::UnsupportedGraph("invalid output node index"))?;
-        match frame.opcode {
-            Opcode::AssertContract => {
-                has_assert_contract = true;
-                cursor = frame.in_a as usize;
-            }
-            Opcode::RingEnqueue => {
-                cursor = frame.in_a as usize;
-            }
-            _ => break,
-        }
-    }
-    let terminal_frame = program
+    let out_idx = program.output_node as usize;
+    let out_frame = program
         .nodes
-        .get(cursor)
-        .ok_or(AotError::UnsupportedGraph("invalid terminal node index"))?;
-    if !matches!(
-        terminal_frame.opcode,
-        Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin
-    ) {
+        .get(out_idx)
+        .ok_or(AotError::UnsupportedGraph("invalid output node index"))?;
+    if out_frame.type_lane.elem != ElemType::F64 {
         return Err(AotError::UnsupportedGraph(
-            "AOT binary requires output_node to be ReduceSum, ReduceMax, or ReduceMin (or wrapped by AssertContract/RingEnqueue)",
+            "AOT binary requires F64 scalar or RingStream output",
         ));
     }
-    let terminal_reduce_idx = cursor;
 
-    let mut reduce_node: Option<(usize, usize, AotReduction)> = None;
+    let mut phases = vec![AotNodePhase::Dead; program.nodes.len()];
+    let mut reductions = Vec::new();
+    let mut post_reduce_nodes = Vec::new();
     let mut domain_start: u64 = 0;
     let mut domain_end: Option<u64> = None;
+    let mut slice_bounds: Option<(u32, u32)> = None;
     let mut filter_mask_node: Option<usize> = None;
     let mut has_gather = false;
 
@@ -154,62 +154,214 @@ pub fn compile_to_elf64_bytes(
         if !live.get(idx).copied().unwrap_or(false) {
             continue;
         }
-        if idx > terminal_reduce_idx
-            && !matches!(frame.opcode, Opcode::AssertContract | Opcode::RingEnqueue)
-        {
-            return Err(AotError::UnsupportedGraph(
-                "AOT binary does not support post-reduction operations",
-            ));
-        }
-        match frame.opcode {
-            Opcode::ReduceSum => {
-                if reduce_node.is_some() {
-                    return Err(AotError::UnsupportedGraph(
-                        "AOT binary does not support multiple live reduction nodes",
-                    ));
-                }
-                reduce_node = Some((idx, frame.in_a as usize, AotReduction::Sum));
-            }
-            Opcode::ReduceMax => {
-                if reduce_node.is_some() {
-                    return Err(AotError::UnsupportedGraph(
-                        "AOT binary does not support multiple live reduction nodes",
-                    ));
-                }
-                reduce_node = Some((idx, frame.in_a as usize, AotReduction::Max));
-            }
-            Opcode::ReduceMin => {
-                if reduce_node.is_some() {
-                    return Err(AotError::UnsupportedGraph(
-                        "AOT binary does not support multiple live reduction nodes",
-                    ));
-                }
-                reduce_node = Some((idx, frame.in_a as usize, AotReduction::Min));
-            }
-            Opcode::AssertContract => {
-                has_assert_contract = true;
-            }
+        let phase_a = phases.get(frame.in_a as usize).copied();
+        let phase_b = phases.get(frame.in_b as usize).copied();
+        let phase = match frame.opcode {
+            Opcode::ConstF64 => AotNodePhase::Const,
+            Opcode::ArenaInput => AotNodePhase::Column,
             Opcode::ArenaSlice => {
+                if phase_a != Some(AotNodePhase::Column) {
+                    return Err(AotError::UnsupportedGraph("invalid ArenaSlice input phase"));
+                }
                 let proof = program
                     .proofs
                     .get(usize::from(frame.proof_idx.saturating_sub(1)))
                     .ok_or(AotError::UnsupportedGraph("missing slice ProofEntry"))?;
-                domain_start = u64::from(proof.bound_lo);
-                domain_end = Some(u64::from(proof.bound_hi));
+                if let Some((prev_lo, prev_hi)) = slice_bounds {
+                    if prev_lo != proof.bound_lo || prev_hi != proof.bound_hi {
+                        return Err(AotError::UnsupportedGraph(
+                            "AOT binary does not support multiple ArenaSlice nodes with different bounds",
+                        ));
+                    }
+                } else {
+                    slice_bounds = Some((proof.bound_lo, proof.bound_hi));
+                    domain_start = u64::from(proof.bound_lo);
+                    domain_end = Some(u64::from(proof.bound_hi));
+                }
+                AotNodePhase::Column
+            }
+            Opcode::ArenaMutate => {
+                if phase_a != Some(AotNodePhase::Column)
+                    || !matches!(phase_b, Some(AotNodePhase::Column | AotNodePhase::Const))
+                {
+                    return Err(AotError::UnsupportedGraph(
+                        "invalid ArenaMutate input phase",
+                    ));
+                }
+                AotNodePhase::Column
             }
             Opcode::FilterCompact => {
+                if phase_a != Some(AotNodePhase::Column) || phase_b != Some(AotNodePhase::Column) {
+                    return Err(AotError::UnsupportedGraph(
+                        "invalid FilterCompact input phase",
+                    ));
+                }
+                if filter_mask_node.is_some() {
+                    return Err(AotError::UnsupportedGraph(
+                        "AOT binary does not support multiple FilterCompact nodes",
+                    ));
+                }
                 filter_mask_node = Some(frame.in_a as usize);
+                AotNodePhase::Column
             }
             Opcode::Gather => {
+                if phase_a != Some(AotNodePhase::Column) || phase_b != Some(AotNodePhase::Column) {
+                    return Err(AotError::UnsupportedGraph("invalid Gather input phase"));
+                }
                 has_gather = true;
+                AotNodePhase::Column
             }
-            _ => {}
+            Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin => {
+                if phase_a != Some(AotNodePhase::Column) {
+                    return Err(AotError::UnsupportedGraph(
+                        "reduction input must be a Column node",
+                    ));
+                }
+                let reduction = match frame.opcode {
+                    Opcode::ReduceSum => AotReduction::Sum,
+                    Opcode::ReduceMax => AotReduction::Max,
+                    Opcode::ReduceMin => AotReduction::Min,
+                    _ => AotReduction::Sum,
+                };
+                reductions.push(AotReductionSpec {
+                    reduce_idx: idx,
+                    reduce_input_idx: frame.in_a as usize,
+                    reduction,
+                });
+                AotNodePhase::Reduce
+            }
+            Opcode::Abs
+            | Opcode::Sqrt
+            | Opcode::Floor
+            | Opcode::Ceil
+            | Opcode::Ln
+            | Opcode::Exp => match phase_a {
+                Some(AotNodePhase::Column) => AotNodePhase::Column,
+                Some(
+                    AotNodePhase::Const | AotNodePhase::Reduce | AotNodePhase::PostReduceScalar,
+                ) => {
+                    post_reduce_nodes.push(idx);
+                    AotNodePhase::PostReduceScalar
+                }
+                _ => {
+                    return Err(AotError::UnsupportedGraph(
+                        "invalid input phase for unary math op",
+                    ))
+                }
+            },
+            Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Min | Opcode::Max => {
+                if phase_a == Some(AotNodePhase::Column) || phase_b == Some(AotNodePhase::Column) {
+                    let a_ok = matches!(phase_a, Some(AotNodePhase::Column | AotNodePhase::Const));
+                    let b_ok = matches!(phase_b, Some(AotNodePhase::Column | AotNodePhase::Const));
+                    if !a_ok || !b_ok {
+                        return Err(AotError::UnsupportedGraph(
+                            "column operation depends on reduction output (requires multi-pass execution)",
+                        ));
+                    }
+                    AotNodePhase::Column
+                } else {
+                    let a_ok = matches!(
+                        phase_a,
+                        Some(
+                            AotNodePhase::Const
+                                | AotNodePhase::Reduce
+                                | AotNodePhase::PostReduceScalar
+                        )
+                    );
+                    let b_ok = matches!(
+                        phase_b,
+                        Some(
+                            AotNodePhase::Const
+                                | AotNodePhase::Reduce
+                                | AotNodePhase::PostReduceScalar
+                        )
+                    );
+                    if !a_ok || !b_ok {
+                        return Err(AotError::UnsupportedGraph(
+                            "invalid scalar binary input phase",
+                        ));
+                    }
+                    post_reduce_nodes.push(idx);
+                    AotNodePhase::PostReduceScalar
+                }
+            }
+            Opcode::CmpGt
+            | Opcode::CmpLt
+            | Opcode::CmpEq
+            | Opcode::MaskAnd
+            | Opcode::MaskOr
+            | Opcode::SelectZero => {
+                if phase_a != Some(AotNodePhase::Column) && phase_b != Some(AotNodePhase::Column) {
+                    return Err(AotError::UnsupportedGraph(
+                        "AOT binary supports comparison/mask/select ops only on Column shape",
+                    ));
+                }
+                let a_ok = matches!(phase_a, Some(AotNodePhase::Column | AotNodePhase::Const));
+                let b_ok = matches!(phase_b, Some(AotNodePhase::Column | AotNodePhase::Const));
+                if !a_ok || !b_ok {
+                    return Err(AotError::UnsupportedGraph(
+                        "column comparison/mask/select op depends on reduction output",
+                    ));
+                }
+                AotNodePhase::Column
+            }
+            Opcode::RingEnqueue | Opcode::AssertContract => {
+                if !matches!(
+                    phase_a,
+                    Some(
+                        AotNodePhase::Const | AotNodePhase::Reduce | AotNodePhase::PostReduceScalar
+                    )
+                ) {
+                    return Err(AotError::UnsupportedGraph(
+                        "AssertContract/RingEnqueue requires scalar/reduction input",
+                    ));
+                }
+                post_reduce_nodes.push(idx);
+                AotNodePhase::PostReduceScalar
+            }
+        };
+        if let Some(slot) = phases.get_mut(idx) {
+            *slot = phase;
         }
     }
 
-    let (reduce_idx, reduce_input_idx, reduction) = reduce_node.ok_or(
-        AotError::UnsupportedGraph("AOT binary requires a ReduceSum, ReduceMax, or ReduceMin node"),
-    )?;
+    if reductions.is_empty() {
+        return Err(AotError::UnsupportedGraph(
+            "AOT binary requires at least one ReduceSum, ReduceMax, or ReduceMin node",
+        ));
+    }
+    if (filter_mask_node.is_some() || has_gather) && reductions.len() > 1 {
+        return Err(AotError::UnsupportedGraph(
+            "AOT binary does not support FilterCompact or Gather with multiple reductions",
+        ));
+    }
+    if !matches!(
+        phases.get(out_idx).copied(),
+        Some(AotNodePhase::Reduce | AotNodePhase::PostReduceScalar)
+    ) {
+        return Err(AotError::UnsupportedGraph(
+            "AOT binary requires output_node to be a reduction or post-reduction scalar expression",
+        ));
+    }
+
+    if !has_gather && slice_bounds.is_none() {
+        let mut common_len: Option<u32> = None;
+        for (idx, frame) in program.nodes.iter().enumerate() {
+            if live.get(idx).copied().unwrap_or(false) && frame.opcode == Opcode::ArenaInput {
+                if let Some(arena) = program.arenas.get(frame.in_a as usize) {
+                    if let Some(prev) = common_len {
+                        if prev != arena.element_count {
+                            return Err(AotError::UnsupportedGraph(
+                                "AOT binary requires all unsliced input arenas to have matching element_count",
+                            ));
+                        }
+                    } else {
+                        common_len = Some(arena.element_count);
+                    }
+                }
+            }
+        }
+    }
 
     // Compute byte offsets for each Arena inside the flat arena input file.
     let mut arena_byte_offsets = Vec::with_capacity(program.arenas.len());
@@ -230,10 +382,9 @@ pub fn compile_to_elf64_bytes(
     let code = emit_x86_64_machine_code(
         program,
         &live,
-        reduce_idx,
-        reduce_input_idx,
-        reduction,
-        has_assert_contract,
+        &phases,
+        &reductions,
+        &post_reduce_nodes,
         domain_start,
         final_domain_end,
         filter_mask_node,
@@ -350,10 +501,9 @@ pub fn run_compiled_executable(
 fn emit_x86_64_machine_code(
     program: &RulProgram,
     live: &[bool],
-    reduce_idx: usize,
-    reduce_input_idx: usize,
-    reduction: AotReduction,
-    has_assert_contract: bool,
+    phases: &[AotNodePhase],
+    reductions: &[AotReductionSpec],
+    post_reduce_nodes: &[usize],
     domain_start: u64,
     domain_end: u64,
     filter_mask_node: Option<usize>,
@@ -361,7 +511,8 @@ fn emit_x86_64_machine_code(
     arena_byte_offsets: &[u64],
     total_arena_bytes: u64,
 ) -> Result<Vec<u8>, AotError> {
-    let mut code: Vec<u8> = Vec::with_capacity(768);
+    let mut code: Vec<u8> = Vec::with_capacity(1024);
+    let node_count = program.nodes.len();
 
     // 1. Entry prologue: capture `argc` (`r14`) and `argv[1]` (`r13`), align stack to 32B, allocate frame.
     // mov r14, [rsp]
@@ -374,11 +525,13 @@ fn emit_x86_64_machine_code(
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);
 
     // Stack frame layout below `rbp` (all 32-byte aligned):
-    // [rbp - 64 .. rbp - 8]   : 8 f64 accumulator lanes (`acc[0..8]` = 2 x 256-bit YMM vectors)
-    // [rbp - 72]              : 8-byte stdout staging slot
-    // [rbp - 128 - idx * 32]  : 32-byte (256-bit YMM / 64-bit XMM) SSA slot for each node `idx`
-    let raw_frame = 128usize.saturating_add(program.nodes.len().saturating_mul(32));
-    let frame_bytes = u32::try_from(raw_frame.div_ceil(32) * 32).unwrap_or(8192);
+    // [rbp - 72]                                           : 8-byte stdout staging slot
+    // [rbp - 128 - idx * 32]                               : 32-byte (256-bit YMM / 64-bit XMM) SSA slot for each node `idx`
+    // [rbp - 128 - node_count * 32 - (red_k + 1) * 64 ..]  : 64-byte (8 x f64) accumulator lanes per reduction `red_k`
+    let raw_frame = 128usize
+        .saturating_add(node_count.saturating_mul(32))
+        .saturating_add(reductions.len().saturating_mul(64));
+    let frame_bytes = u32::try_from(raw_frame.div_ceil(32) * 32).unwrap_or(16384);
     // sub rsp, frame_bytes
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_bytes.to_le_bytes());
@@ -465,49 +618,28 @@ fn emit_x86_64_machine_code(
         }
     }
 
-    // 4. Initialize reduction accumulators.
-    match reduction {
-        AotReduction::Sum => {
+    // 4. Initialize reduction accumulators across all `reductions`.
+    // xor r11d, r11d (active element/vector counter for Sum reductions)
+    code.extend_from_slice(&[0x45, 0x31, 0xDB]);
+    for (red_k, spec) in reductions.iter().enumerate() {
+        let init_bits = match spec.reduction {
+            AotReduction::Sum => 0.0_f64.to_bits(),
+            AotReduction::Max => f64::NEG_INFINITY.to_bits(),
+            AotReduction::Min => f64::INFINITY.to_bits(),
+        };
+        if init_bits == 0 {
             // xor eax, eax
             code.extend_from_slice(&[0x31, 0xC0]);
-            for lane in 0..8i32 {
-                let acc_disp = -64 + lane * 8;
-                // mov [rbp + acc_disp], rax
-                code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                code.extend_from_slice(&acc_disp.to_le_bytes());
-            }
-            // xorpd xmm7, xmm7
-            code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xFF]);
-            // xor r11d, r11d (active element/vector counter)
-            code.extend_from_slice(&[0x45, 0x31, 0xDB]);
-        }
-        AotReduction::Max => {
-            let neg_inf = f64::NEG_INFINITY.to_bits();
-            // movabs rax, neg_inf
+        } else {
+            // movabs rax, init_bits
             code.extend_from_slice(&[0x48, 0xB8]);
-            code.extend_from_slice(&neg_inf.to_le_bytes());
-            for lane in 0..4i32 {
-                let acc_disp = -64 + lane * 8;
-                // mov [rbp + acc_disp], rax
-                code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                code.extend_from_slice(&acc_disp.to_le_bytes());
-            }
-            // movq xmm7, rax
-            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xF8]);
+            code.extend_from_slice(&init_bits.to_le_bytes());
         }
-        AotReduction::Min => {
-            let pos_inf = f64::INFINITY.to_bits();
-            // movabs rax, pos_inf
-            code.extend_from_slice(&[0x48, 0xB8]);
-            code.extend_from_slice(&pos_inf.to_le_bytes());
-            for lane in 0..4i32 {
-                let acc_disp = -64 + lane * 8;
-                // mov [rbp + acc_disp], rax
-                code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                code.extend_from_slice(&acc_disp.to_le_bytes());
-            }
-            // movq xmm7, rax
-            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xF8]);
+        for lane in 0..8i32 {
+            let acc_disp = red_acc_disp(node_count, red_k, lane);
+            // mov [rbp + acc_disp], rax
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&acc_disp.to_le_bytes());
         }
     }
 
@@ -520,7 +652,7 @@ fn emit_x86_64_machine_code(
     code.extend_from_slice(&domain_end.to_le_bytes());
 
     // 5a. Primary 256-Bit AVX2 `YMM` Vector Loop (`4 x f64` = `32 bytes` per step,
-    //     alternating between the two 256-bit accumulators `[rbp - 64]` and `[rbp - 32]`).
+    //     alternating between the two 256-bit accumulators `acc[0..4]` and `acc[4..8]`).
     if avx2_vectorized {
         let avx2_loop_top = code.len();
         // lea rax, [rcx + 4]
@@ -532,7 +664,7 @@ fn emit_x86_64_machine_code(
         let ja_avx2_exit_patch_pos = code.len() - 4;
 
         for (idx, frame) in program.nodes.iter().enumerate() {
-            if idx >= reduce_idx || !live.get(idx).copied().unwrap_or(false) {
+            if phases.get(idx).copied() != Some(AotNodePhase::Column) {
                 continue;
             }
             let disp = node_disp(idx);
@@ -540,9 +672,7 @@ fn emit_x86_64_machine_code(
             let disp_b = node_disp(frame.in_b as usize);
 
             match frame.opcode {
-                Opcode::ConstF64 => {
-                    // Already pre-broadcast across all 4 lanes via LICM.
-                }
+                Opcode::ConstF64 => {}
                 Opcode::ArenaInput => {
                     let arena_off = arena_byte_offsets
                         .get(frame.in_a as usize)
@@ -718,38 +848,51 @@ fn emit_x86_64_machine_code(
             }
         }
 
-        // Accumulate `reduce_input_idx` (`ymm0`) into the 256-bit reduction state.
-        let disp_red_in = node_disp(reduce_input_idx);
-        emit_load_ymm0_rbp(&mut code, disp_red_in);
+        // Alternate between even vector step (`rdx = 0`, lanes 0..4)
+        // and odd vector step (`rdx = 32`, lanes 4..8) to preserve exact 8-lane order for Sum.
+        // mov rdx, r11
+        code.extend_from_slice(&[0x4C, 0x89, 0xDA]);
+        // and edx, 1
+        code.extend_from_slice(&[0x83, 0xE2, 0x01]);
+        // shl rdx, 5 (rdx = 0 or 32)
+        code.extend_from_slice(&[0x48, 0xC1, 0xE2, 0x05]);
+        // inc r11
+        code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
 
-        match reduction {
-            AotReduction::Sum => {
-                // Alternate between `[rbp - 64]` (even vector step: lanes 0..4)
-                // and `[rbp - 32]` (odd vector step: lanes 4..8) to preserve exact 8-lane order.
-                // mov rdx, r11
-                code.extend_from_slice(&[0x4C, 0x89, 0xDA]);
-                // and edx, 1
-                code.extend_from_slice(&[0x83, 0xE2, 0x01]);
-                // shl rdx, 5 (rdx = 0 or 32)
-                code.extend_from_slice(&[0x48, 0xC1, 0xE2, 0x05]);
-                // inc r11
-                code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
-                // vaddpd ymm0, ymm0, ymmword ptr [rbp + rdx * 1 - 64]
-                code.extend_from_slice(&[0xC5, 0xFD, 0x58, 0x44, 0x15, 0xC0]);
-                // vmovupd ymmword ptr [rbp + rdx * 1 - 64], ymm0
-                code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x44, 0x15, 0xC0]);
-            }
-            AotReduction::Max => {
-                // vmaxpd ymm0, ymm0, ymmword ptr [rbp - 64]
-                code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x45, 0xC0]);
-                // vmovupd ymmword ptr [rbp - 64], ymm0
-                code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x45, 0xC0]);
-            }
-            AotReduction::Min => {
-                // vminpd ymm0, ymm0, ymmword ptr [rbp - 64]
-                code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x45, 0xC0]);
-                // vmovupd ymmword ptr [rbp - 64], ymm0
-                code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x45, 0xC0]);
+        // Accumulate each reduction's input column into its 256-bit reduction state.
+        for (red_k, spec) in reductions.iter().enumerate() {
+            let disp_red_in = node_disp(spec.reduce_input_idx);
+            let acc0 = red_acc_disp(node_count, red_k, 0);
+            match spec.reduction {
+                AotReduction::Sum => {
+                    // vmovupd ymm0, ymmword ptr [rbp + rdx * 1 + acc0]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x84, 0x15]);
+                    code.extend_from_slice(&acc0.to_le_bytes());
+                    // vaddpd ymm0, ymm0, ymmword ptr [rbp + disp_red_in]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x58, 0x85]);
+                    code.extend_from_slice(&disp_red_in.to_le_bytes());
+                    // vmovupd ymmword ptr [rbp + rdx * 1 + acc0], ymm0
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x84, 0x15]);
+                    code.extend_from_slice(&acc0.to_le_bytes());
+                }
+                AotReduction::Max => {
+                    // Load input into ymm0 (`src1`) and accumulator `[rbp + acc0]` as `src2`:
+                    // x86 `vmaxpd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::max`).
+                    emit_load_ymm0_rbp(&mut code, disp_red_in);
+                    // vmaxpd ymm0, ymm0, ymmword ptr [rbp + acc0]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x85]);
+                    code.extend_from_slice(&acc0.to_le_bytes());
+                    emit_store_ymm0_rbp(&mut code, acc0);
+                }
+                AotReduction::Min => {
+                    // Load input into ymm0 (`src1`) and accumulator `[rbp + acc0]` as `src2`:
+                    // x86 `vminpd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::min`).
+                    emit_load_ymm0_rbp(&mut code, disp_red_in);
+                    // vminpd ymm0, ymm0, ymmword ptr [rbp + acc0]
+                    code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x85]);
+                    code.extend_from_slice(&acc0.to_le_bytes());
+                    emit_store_ymm0_rbp(&mut code, acc0);
+                }
             }
         }
 
@@ -768,10 +911,8 @@ fn emit_x86_64_machine_code(
 
         // Convert `r11` from 4-element vector count to scalar element index (`shl r11, 2`)
         // so any scalar tail elements land in the exact matching `(r11 & 7)` lane.
-        if reduction == AotReduction::Sum {
-            // shl r11, 2
-            code.extend_from_slice(&[0x49, 0xC1, 0xE3, 0x02]);
-        }
+        // shl r11, 2
+        code.extend_from_slice(&[0x49, 0xC1, 0xE3, 0x02]);
     }
 
     // 5b. Scalar Cleanup / Indirect-Gather / FilterCompact Loop (`rcx` .. `rbx`).
@@ -782,9 +923,9 @@ fn emit_x86_64_machine_code(
     code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
     let jae_exit_patch_pos = code.len() - 4;
 
-    // Emit native stencils for each live node up to `reduce_idx`.
+    // Emit native stencils for each live Column node.
     for (idx, frame) in program.nodes.iter().enumerate() {
-        if idx >= reduce_idx || !live.get(idx).copied().unwrap_or(false) {
+        if phases.get(idx).copied() != Some(AotNodePhase::Column) {
             continue;
         }
         let disp = node_disp(idx);
@@ -792,9 +933,7 @@ fn emit_x86_64_machine_code(
         let disp_b = node_disp(frame.in_b as usize);
 
         match frame.opcode {
-            Opcode::ConstF64 => {
-                // Hoisted above the loop via LICM (0 instructions in loop).
-            }
+            Opcode::ConstF64 => {}
             Opcode::ArenaInput => {
                 let arena_off = arena_byte_offsets
                     .get(frame.in_a as usize)
@@ -984,10 +1123,7 @@ fn emit_x86_64_machine_code(
         }
     }
 
-    // 6. Accumulate `reduce_input_idx` into the reduction state.
-    let disp_red_in = node_disp(reduce_input_idx);
-    emit_load_xmm0_rbp(&mut code, disp_red_in);
-
+    // 6. Accumulate each reduction's input into its scalar accumulator lane.
     let mut jz_skip_accum_patch: Option<usize> = None;
     if let Some(mask_idx) = filter_mask_node {
         let disp_mask = node_disp(mask_idx);
@@ -1001,27 +1137,48 @@ fn emit_x86_64_machine_code(
         jz_skip_accum_patch = Some(code.len() - 4);
     }
 
-    match reduction {
-        AotReduction::Sum => {
-            // rdx = r11 & 7; r11 += 1
-            // mov rdx, r11
-            code.extend_from_slice(&[0x4C, 0x89, 0xDA]);
-            // and edx, 7
-            code.extend_from_slice(&[0x83, 0xE2, 0x07]);
-            // inc r11
-            code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
-            // addsd xmm0, [rbp + rdx * 8 - 64]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x44, 0xD5, 0xC0]);
-            // movsd [rbp + rdx * 8 - 64], xmm0
-            code.extend_from_slice(&[0xF2, 0x0F, 0x11, 0x44, 0xD5, 0xC0]);
-        }
-        AotReduction::Max => {
-            // maxsd xmm7, xmm0
-            code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0xF8]);
-        }
-        AotReduction::Min => {
-            // minsd xmm7, xmm0
-            code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0xF8]);
+    // rdx = r11 & 7; r11 += 1
+    // mov rdx, r11
+    code.extend_from_slice(&[0x4C, 0x89, 0xDA]);
+    // and edx, 7
+    code.extend_from_slice(&[0x83, 0xE2, 0x07]);
+    // inc r11
+    code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
+
+    for (red_k, spec) in reductions.iter().enumerate() {
+        let disp_red_in = node_disp(spec.reduce_input_idx);
+        let acc0 = red_acc_disp(node_count, red_k, 0);
+        let acc4 = red_acc_disp(node_count, red_k, 4);
+        match spec.reduction {
+            AotReduction::Sum => {
+                // movsd xmm0, [rbp + rdx * 8 + acc0]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x84, 0xD5]);
+                code.extend_from_slice(&acc0.to_le_bytes());
+                // addsd xmm0, [rbp + disp_red_in]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x85]);
+                code.extend_from_slice(&disp_red_in.to_le_bytes());
+                // movsd [rbp + rdx * 8 + acc0], xmm0
+                code.extend_from_slice(&[0xF2, 0x0F, 0x11, 0x84, 0xD5]);
+                code.extend_from_slice(&acc0.to_le_bytes());
+            }
+            AotReduction::Max => {
+                // Load input into xmm0 (`src1`) and accumulator `[rbp + acc4]` as `src2`:
+                // x86 `maxsd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::max`).
+                emit_load_xmm0_rbp(&mut code, disp_red_in);
+                // maxsd xmm0, [rbp + acc4]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x85]);
+                code.extend_from_slice(&acc4.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, acc4);
+            }
+            AotReduction::Min => {
+                // Load input into xmm0 (`src1`) and accumulator `[rbp + acc4]` as `src2`:
+                // x86 `minsd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::min`).
+                emit_load_xmm0_rbp(&mut code, disp_red_in);
+                // minsd xmm0, [rbp + acc4]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0x85]);
+                code.extend_from_slice(&acc4.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, acc4);
+            }
         }
     }
 
@@ -1042,72 +1199,191 @@ fn emit_x86_64_machine_code(
     let loop_exit_pos = code.len();
     patch_rel32(&mut code, jae_exit_patch_pos, loop_exit_pos)?;
 
-    // 7. Post-loop reduction across accumulator lanes:
-    match reduction {
-        AotReduction::Sum => {
-            // ((acc[0] + acc[1]) + (acc[2] + acc[3])) + (acc[4] + acc[5]) + (acc[6] + acc[7]) -> xmm7
-            // movsd xmm0, [rbp - 64]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x45, 0xC0]);
-            // addsd xmm0, [rbp - 56]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x45, 0xC8]);
-            // movsd xmm1, [rbp - 48]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x4D, 0xD0]);
-            // addsd xmm1, [rbp - 40]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x4D, 0xD8]);
-            // addsd xmm0, xmm1
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC1]);
-            // movsd xmm1, [rbp - 32]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x4D, 0xE0]);
-            // addsd xmm1, [rbp - 24]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x4D, 0xE8]);
-            // addsd xmm0, xmm1
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC1]);
-            // movsd xmm1, [rbp - 16]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x4D, 0xF0]);
-            // addsd xmm1, [rbp - 8]
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x4D, 0xF8]);
-            // addsd xmm0, xmm1
-            code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC1]);
-            // movapd xmm7, xmm0
-            code.extend_from_slice(&[0x66, 0x0F, 0x28, 0xF8]);
-        }
-        AotReduction::Max => {
-            // Merge the 4 AVX2 `vmaxpd` lanes `[rbp - 64 .. rbp - 40]` into `xmm7`
-            for disp8 in [0xC0u8, 0xC8, 0xD0, 0xD8] {
-                // maxsd xmm7, [rbp + disp8]
-                code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x7D, disp8]);
+    // 7. Post-loop reduction across accumulator lanes for each `AotReductionSpec`,
+    //    storing the scalar reduction result into `[rbp + node_disp(spec.reduce_idx)]`.
+    for (red_k, spec) in reductions.iter().enumerate() {
+        match spec.reduction {
+            AotReduction::Sum => {
+                // ((acc[0] + acc[1]) + (acc[2] + acc[3])) + (acc[4] + acc[5]) + (acc[6] + acc[7]) -> xmm0
+                let d0 = red_acc_disp(node_count, red_k, 0);
+                let d1 = red_acc_disp(node_count, red_k, 1);
+                let d2 = red_acc_disp(node_count, red_k, 2);
+                let d3 = red_acc_disp(node_count, red_k, 3);
+                let d4 = red_acc_disp(node_count, red_k, 4);
+                let d5 = red_acc_disp(node_count, red_k, 5);
+                let d6 = red_acc_disp(node_count, red_k, 6);
+                let d7 = red_acc_disp(node_count, red_k, 7);
+
+                emit_load_xmm0_rbp(&mut code, d0);
+                // addsd xmm0, [rbp + d1]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x85]);
+                code.extend_from_slice(&d1.to_le_bytes());
+                // movsd xmm1, [rbp + d2]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&d2.to_le_bytes());
+                // addsd xmm1, [rbp + d3]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x8D]);
+                code.extend_from_slice(&d3.to_le_bytes());
+                // addsd xmm0, xmm1
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC1]);
+                // movsd xmm1, [rbp + d4]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&d4.to_le_bytes());
+                // addsd xmm1, [rbp + d5]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x8D]);
+                code.extend_from_slice(&d5.to_le_bytes());
+                // addsd xmm0, xmm1
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC1]);
+                // movsd xmm1, [rbp + d6]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&d6.to_le_bytes());
+                // addsd xmm1, [rbp + d7]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x8D]);
+                code.extend_from_slice(&d7.to_le_bytes());
+                // addsd xmm0, xmm1
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC1]);
+            }
+            AotReduction::Max => {
+                emit_load_xmm0_rbp(&mut code, red_acc_disp(node_count, red_k, 4));
+                for lane in 0..4i32 {
+                    let dl = red_acc_disp(node_count, red_k, lane);
+                    // maxsd xmm0, [rbp + dl]
+                    code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x85]);
+                    code.extend_from_slice(&dl.to_le_bytes());
+                }
+            }
+            AotReduction::Min => {
+                emit_load_xmm0_rbp(&mut code, red_acc_disp(node_count, red_k, 4));
+                for lane in 0..4i32 {
+                    let dl = red_acc_disp(node_count, red_k, lane);
+                    // minsd xmm0, [rbp + dl]
+                    code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0x85]);
+                    code.extend_from_slice(&dl.to_le_bytes());
+                }
             }
         }
-        AotReduction::Min => {
-            // Merge the 4 AVX2 `vminpd` lanes `[rbp - 64 .. rbp - 40]` into `xmm7`
-            for disp8 in [0xC0u8, 0xC8, 0xD0, 0xD8] {
-                // minsd xmm7, [rbp + disp8]
-                code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0x7D, disp8]);
+        emit_store_xmm0_rbp(&mut code, node_disp(spec.reduce_idx));
+    }
+
+    // 8. Post-loop scalar epilogue: evaluate all `PostReduceScalar` nodes in topological SSA order.
+    for &idx in post_reduce_nodes {
+        let Some(frame) = program.nodes.get(idx) else {
+            continue;
+        };
+        let disp = node_disp(idx);
+        let disp_a = node_disp(frame.in_a as usize);
+        let disp_b = node_disp(frame.in_b as usize);
+
+        match frame.opcode {
+            Opcode::Add => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // addsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x58, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Sub => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // subsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5C, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Mul => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // mulsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x59, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Div => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // divsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5E, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Min => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // minsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5D, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Max => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // maxsd xmm0, [rbp + disp_b]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Abs => {
+                // mov rax, [rbp + disp_a]; btr rax, 63; mov [rbp + disp], rax
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&disp_a.to_le_bytes());
+                code.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]);
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&disp.to_le_bytes());
+            }
+            Opcode::Sqrt => {
+                // sqrtsd xmm0, [rbp + disp_a]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x51, 0x85]);
+                code.extend_from_slice(&disp_a.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Floor => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // roundsd xmm0, xmm0, 0x09
+                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x09]);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Ceil => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // roundsd xmm0, xmm0, 0x0A
+                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0A]);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Ln => {
+                emit_x87_ln_slot(&mut code, disp_a, disp);
+            }
+            Opcode::Exp => {
+                emit_x87_exp_slot(&mut code, disp_a, disp);
+            }
+            Opcode::RingEnqueue => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::AssertContract => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                emit_store_xmm0_rbp(&mut code, disp);
+                // mov rax, [rbp + disp_a]
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&disp_a.to_le_bytes());
+                // movabs rdx, 0x7FF0_0000_0000_0000
+                code.extend_from_slice(&[0x48, 0xBA]);
+                code.extend_from_slice(&0x7FF0_0000_0000_0000_u64.to_le_bytes());
+                // and rax, rdx
+                code.extend_from_slice(&[0x48, 0x21, 0xD0]);
+                // cmp rax, rdx
+                code.extend_from_slice(&[0x48, 0x39, 0xD0]);
+                // jne +12 (skip exit(70))
+                code.extend_from_slice(&[0x75, 0x0C]);
+                emit_sys_exit(&mut code, AOT_EXIT_CONTRACT_FAILED as u32);
+            }
+            _ => {
+                return Err(AotError::UnsupportedGraph(
+                    "unsupported opcode in post-reduction scalar phase",
+                ))
             }
         }
     }
 
-    // Store final scalar `xmm7` to `[rbp - 72]` (`disp8 = 0xB8`):
-    // movsd [rbp - 72], xmm7
-    code.extend_from_slice(&[0xF2, 0x0F, 0x11, 0x7D, 0xB8]);
+    // 9. Store final scalar `output_node` to `[rbp - 72]` (`disp8 = 0xB8`),
+    //    write 8-byte little-endian `f64` to `stdout` (`SYS_write = 1`, `fd = 1`), and `SYS_exit(0)`.
+    emit_load_xmm0_rbp(&mut code, node_disp(program.output_node as usize));
+    // movsd [rbp - 72], xmm0
+    code.extend_from_slice(&[0xF2, 0x0F, 0x11, 0x45, 0xB8]);
 
-    // 8. Optional `AssertContract` check: verify that the IEEE-754 f64 result is finite.
-    if has_assert_contract {
-        // mov rax, [rbp - 72]
-        code.extend_from_slice(&[0x48, 0x8B, 0x45, 0xB8]);
-        // movabs rdx, 0x7FF0_0000_0000_0000
-        code.extend_from_slice(&[0x48, 0xBA]);
-        code.extend_from_slice(&0x7FF0_0000_0000_0000_u64.to_le_bytes());
-        // and rax, rdx
-        code.extend_from_slice(&[0x48, 0x21, 0xD0]);
-        // cmp rax, rdx
-        code.extend_from_slice(&[0x48, 0x39, 0xD0]);
-        // jne +12 (skip exit(70))
-        code.extend_from_slice(&[0x75, 0x0C]);
-        emit_sys_exit(&mut code, AOT_EXIT_CONTRACT_FAILED as u32);
-    }
-
-    // 9. Write the 8-byte little-endian `f64` result to `stdout` (`SYS_write = 1`, `fd = 1`) and `SYS_exit(0)`.
     // mov eax, 1
     code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
     // mov edi, 1
@@ -1126,6 +1402,17 @@ fn emit_x86_64_machine_code(
 fn node_disp(node_idx: usize) -> i32 {
     let idx_i32 = i32::try_from(node_idx).unwrap_or(0);
     (-128i32).saturating_sub(idx_i32.saturating_mul(32))
+}
+
+fn red_acc_disp(node_count: usize, red_k: usize, lane: i32) -> i32 {
+    let base_nodes =
+        (-128i32).saturating_sub(i32::try_from(node_count).unwrap_or(0).saturating_mul(32));
+    let red_base = base_nodes.saturating_sub(
+        i32::try_from(red_k.saturating_add(1))
+            .unwrap_or(1)
+            .saturating_mul(64),
+    );
+    red_base.saturating_add(lane.saturating_mul(8))
 }
 
 fn emit_load_ymm0_rbp(code: &mut Vec<u8>, disp: i32) {

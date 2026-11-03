@@ -159,8 +159,8 @@ The verifier ([`verify_program`](../src/verifier.rs)) scans `nodes[0..node_count
 2. **Tier 1 — Dead-Node-Eliminated Vector Stencil Engine (`execute_tier1_stencil`)**:
    - Computes exact backward liveness from `output_node` and applies 8-lane unrolled vector stencils (`CHUNK = 8` `f64`).
 3. **Tier 2 — Exact-DAG L1-Cache Tile Fuser (`execute_tier2_fused` & `execute_tier2_with_zonemap`)**:
-   - Evaluates arbitrary elementwise-to-reduction DAGs in `1,024`-element (`8 KB`) L1-cache tiles with **0 bytes of intermediate heap allocation**, Auto-MultiCore thread dispatch (`ExecPolicy::MultiCore`), and $O(1)$ cold-tile skipping via `ArenaZoneMap`.
+   - Evaluates arbitrary elementwise-to-reduction and post-reduction scalar DAGs in `1,024`-element (`8 KB`) L1-cache tiles with **0 bytes of intermediate column allocation** ($O(1)$ L1-tile scratchpad independent of column length $N$), Auto-MultiCore thread dispatch (`ExecPolicy::MultiCore`), and $O(1)$ cold-tile skipping via `ArenaZoneMap`.
 4. **Direct Linux `x86_64` AVX2 `ELF64` AOT Compiler (`compile_rl_to_executable`)**:
-   - Emits standalone 569–841 byte statically-linked Linux `ELF64` native binaries in microseconds using 256-bit AVX2 `YMM` vector instructions and 64-bit SSE2 scalar tail cleanup.
+   - Emits standalone 628–1037 byte statically-linked Linux `ELF64` native binaries in microseconds using 256-bit AVX2 `YMM` vector instructions and 64-bit SSE2 scalar tail cleanup.
 5. **White-Box Execution Tracer (`trace_program` & `rul trace`)**:
    - Records deterministic per-node statistics (`min`, `max`, `sum/trues`, `nan_or_inf_count`, and sample head values) for every SSA node `#0..#N-1`.
