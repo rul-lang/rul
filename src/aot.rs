@@ -726,6 +726,7 @@ fn emit_x86_64_machine_code(
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);
 
     // Stack frame layout below `rbp` (all 32-byte aligned):
+    // [rbp - 64 .. rbp - 32]                               : 32-byte (4 x f64) IEEE-754 sign-clear mask (`0x7FFF_FFFF_FFFF_FFFF`) for `Opcode::Abs`
     // [rbp - 72]                                           : 8-byte stdout staging slot
     // [rbp - 128 - idx * 32]                               : 32-byte (256-bit YMM / 64-bit XMM) SSA slot for each node `idx`
     // [rbp - 128 - node_count * 32 - (red_k + 1) * 64 ..]  : 64-byte (8 x f64) accumulator lanes per reduction `red_k`
@@ -767,6 +768,8 @@ fn emit_x86_64_machine_code(
 
         // Verify file size >= `total_arena_bytes` via `SYS_lseek(fd=r15, offset=0, whence=SEEK_END=2)`
         // before `SYS_mmap` so a truncated/short file exits cleanly with code 66 instead of `SIGBUS`.
+        // Note: A residual TOCTOU window remains only if an external process concurrently truncates
+        // the backing file after `SYS_lseek` while the `MAP_PRIVATE` mapping is actively faulted in.
         // mov rdi, r15
         code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
         // xor esi, esi
@@ -825,6 +828,21 @@ fn emit_x86_64_machine_code(
 
     // 3. Loop-Invariant Code Motion (LICM): pre-broadcast all `ConstF64` nodes into all 4 lanes
     //    of their 32-byte YMM slot `[rbp + disp + 0..32]` before the loop!
+    let has_live_abs =
+        program.nodes.iter().enumerate().any(|(idx, frame)| {
+            live.get(idx).copied().unwrap_or(false) && frame.opcode == Opcode::Abs
+        });
+    if has_live_abs {
+        // Pre-broadcast IEEE-754 sign-clear mask `0x7FFF_FFFF_FFFF_FFFF` into `[rbp - 64 .. rbp - 32]`.
+        let abs_mask_bits = 0x7FFF_FFFF_FFFF_FFFF_u64;
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&abs_mask_bits.to_le_bytes());
+        for lane_off in [0i32, 8, 16, 24] {
+            let d = (-64i32).saturating_add(lane_off);
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&d.to_le_bytes());
+        }
+    }
     for (idx, frame) in program.nodes.iter().enumerate() {
         if !live.get(idx).copied().unwrap_or(false) {
             continue;
@@ -1138,26 +1156,18 @@ fn emit_x86_64_machine_code(
                     }
                 }
                 Opcode::Abs => {
-                    if let Some(ra) = node_ymm.get(a).copied().flatten() {
-                        emit_store_ymm_rbp(&mut code, ra, disp_a);
-                    }
+                    let reg_a = if let Some(ra) = node_ymm.get(a).copied().flatten() {
+                        ra
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_a);
+                        0
+                    };
                     free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
-                    // Clear IEEE-754 sign bit (bit 63) across all 4 f64 lanes.
-                    for lane_off in [0i32, 8, 16, 24] {
-                        let sa = disp_a.saturating_add(lane_off);
-                        let sd = disp.saturating_add(lane_off);
-                        // mov rax, [rbp + sa]
-                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                        code.extend_from_slice(&sa.to_le_bytes());
-                        // btr rax, 63
-                        code.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]);
-                        // mov [rbp + sd], rax
-                        code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                        code.extend_from_slice(&sd.to_le_bytes());
-                    }
                     let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
-                    if dst_reg != 0 {
-                        emit_load_ymm_rbp(&mut code, dst_reg, disp);
+                    // vandpd ymm_dst, ymm_reg_a, ymmword ptr [rbp - 64]
+                    emit_vex_ymm_rm_rbp(&mut code, 0x54, dst_reg, reg_a, -64);
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
                     }
                 }
                 Opcode::Ln => {

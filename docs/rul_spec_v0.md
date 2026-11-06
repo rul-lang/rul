@@ -73,7 +73,7 @@ In columnar data pipelines, over 90% of nodes use `proof_idx = 0` (`TRIVIAL_BY_S
 | `0..2` | `rule_kind` | `u16` | `1 = SliceBounds (lo <= hi <= len)`, `2 = GatherIndexInBounds (max_idx <= target_len)` |
 | `2..4` | `target_arena` | `u16` | Target `Arena` ID certified by this proof (strictly bound to operand `origin_arena`) |
 | `4..8` | `bound_lo` | `u32` | Non-negative lower bound |
-| `8..12` | `bound_hi` | `u32` | Upper bound (must be `<= ArenaDescriptor.element_count`) |
+| `8..12` | `bound_hi` | `u32` | Upper bound (must be `<= effective_target_len`, i.e., `n.min(target_arena.element_count)` where `n` is the sliced column length of `in_a`) |
 | `12..16` | `witness_node` | `u32` | Witness index node (`in_b` for `Gather`) |
 
 ### 2.4. 128-Bit `NodeFrame` Instruction Layout (16 bytes)
@@ -145,7 +145,7 @@ The verifier ([`verify_program`](../src/verifier.rs)) scans `nodes[0..node_count
    - `AffineConsume(a, ver)` requires `live_version[a] == ver` AND `Arena[a].mutable == true`, then updates `live_version[a] = live_version[a].checked_add(1)` (failing with `TokenVersionOverflow` on `u16::MAX`).
 3. **Shape Unification & Origin-Bound Refinement Proof Rule**:
    - Elementwise binary ops (`Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `CmpGt`, `CmpLt`, `CmpEq`, `SelectZero`) require matching column shapes (`Column(N) == Column(N)`) or scalar broadcasting (`Scalar` with `Column(N)`).
-   - `ArenaSlice` and `Gather` require a valid 1-based `proof_idx` whose `ProofEntry.target_arena` matches the input operand's `origin_arena` and satisfies `bound_lo <= bound_hi <= target_arena.element_count`.
+   - `ArenaSlice` and `Gather` require a valid 1-based `proof_idx` whose `ProofEntry.target_arena` matches the input operand's `origin_arena` and satisfies `bound_lo <= bound_hi <= effective_target_len`, where `effective_target_len = n.min(target_arena.element_count)` (`n` is the column length of operand `in_a`). When `in_a` is an `ArenaSlice`, `bound_hi` is bounded by the sliced column length rather than only the base arena's `element_count`.
    - `VerifiedSummary.zero_runtime_bounds_checks` is `true` iff the program contains no dynamic `Gather` instructions (`!has_gather`).
 4. **Zero-Trust Hardware Capability Rule**:
    - `RingEnqueue` requires `(header.capability_mask & CAP_NET_RING) != 0`.
