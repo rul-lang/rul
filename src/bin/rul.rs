@@ -35,6 +35,10 @@ use rul::verifier::verify_program;
 
 const RUL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Maximum allowed byte size for an input `.bin` columnar arena data file (`1 GiB`),
+/// allowing 10M+ `f64` element benchmark arenas (`80 MB+`) while bounding memory usage.
+const MAX_ARENA_DATA_BYTES: u64 = 1024 * 1024 * 1024;
+
 const DEFAULT_MAIN_RLS: &str = r#"# Rul Flat Symbolic IR (.rls) — Zero Rust / Zero Cargo
 # Computes: sum_{x > 100.0} (x * x) on a 4,096-element f64 Columnar Arena
 cap 0x0
@@ -89,10 +93,16 @@ fn read_bounded_utf8(path: &Path) -> Result<String, String> {
 fn read_bounded_f64_column(path: &Path, expected_len: usize) -> Result<Vec<f64>, String> {
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let mut raw = Vec::new();
-    let max_limit = MAX_RL_FILE_BYTES;
+    let max_limit = MAX_ARENA_DATA_BYTES;
     file.take(max_limit.saturating_add(1))
         .read_to_end(&mut raw)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > max_limit {
+        return Err(format!(
+            "arena file {} exceeds maximum size limit ({MAX_ARENA_DATA_BYTES} bytes)",
+            path.display()
+        ));
+    }
     let expected_bytes = expected_len.saturating_mul(8);
     if raw.len() < expected_bytes {
         return Err(format!(
@@ -563,5 +573,10 @@ mod tests {
         assert!(!scalars_equivalent(f64::INFINITY, 1.0));
         assert!(scalars_equivalent(1000.0, 1000.0 + 1e-7));
         assert!(!scalars_equivalent(0.874_586, 20_726_104.0));
+    }
+
+    #[test]
+    fn test_p0_bug4_max_arena_data_bytes_1gib_limit() {
+        assert_eq!(MAX_ARENA_DATA_BYTES, 1024 * 1024 * 1024);
     }
 }

@@ -1633,4 +1633,381 @@ mod tests {
         let _ = std::fs::remove_file(&data_ic);
         Ok(())
     }
+
+    #[test]
+    fn test_p0_bug1_aot_gather_on_arena_slice_multi_arena_no_oob() -> Result<(), String> {
+        let rls = "\
+            arena 0 len=16 lane=f64x8
+            arena 1 len=4 lane=f64x4
+            arena 2 len=4 lane=f64x4
+            arena 3 len=16 lane=f64x8
+            proof 1 rule=slice_bounds target=0 lo=8 hi=16 witness=0
+            proof 2 rule=gather_bounds target=0 lo=0 hi=8 witness=1
+            node $a0 = ArenaInput f64x8 a=0
+            node $idx = ArenaInput f64x4 a=1
+            node $w = ArenaInput f64x4 a=2
+            node $slice = ArenaSlice f64x8 proof=1 a=$a0
+            node $gat = Gather f64x4 proof=2 a=$slice b=$idx
+            node $comb = Add f64x4 a=$gat b=$w
+            node $sum = ReduceSum f64x1 a=$comb
+            output $sum
+        ";
+        let prog = crate::transpiler::assemble_rls(rls).map_err(|e| e.to_string())?;
+        let a0: Vec<f64> = vec![
+            10.0, 20.0, 30.0, 40.0, 50.0, 100.0, 70.0, 80.0, // 0..8
+            100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 131.0, // 8..16
+        ];
+        let a1: Vec<f64> = vec![0.0, 2.0, 5.0, 7.0];
+        let a2: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+        // Canary arena 3 directly adjacent to arena 2 in the flat mmap file:
+        let a3: Vec<f64> = vec![999_999.0; 16];
+
+        let rep0 =
+            execute_tier0_interpreter(&prog, &[&a0, &a1, &a2, &a3]).map_err(|e| e.to_string())?;
+        let rep1 =
+            execute_tier1_stencil(&prog, &[&a0, &a1, &a2, &a3]).map_err(|e| e.to_string())?;
+        let rep2 = execute_tier2_fused(&prog, &[&a0, &a1, &a2, &a3]).map_err(|e| e.to_string())?;
+        assert_eq!(rep0.output, RuntimeValue::Scalar(448.0));
+        assert_eq!(rep1.output, RuntimeValue::Scalar(448.0));
+        assert_eq!(rep2.output, RuntimeValue::Scalar(448.0));
+
+        let exe_path = std::env::temp_dir().join("rul_test_p0_bug1_bin");
+        let data_path = std::env::temp_dir().join("rul_test_p0_bug1_data.bin");
+        crate::aot::compile_rl_to_executable(&prog, &exe_path).map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_path, &[&a0, &a1, &a2, &a3])
+            .map_err(|e| e.to_string())?;
+        let v_aot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+        assert!(
+            (v_aot - 448.0).abs() < 1e-12,
+            "expected AOT output 448.0 matching Tier 0 without cross-arena OOB read, got {v_aot}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_p0_verifier_rejects_gather_or_slice_exceeding_sliced_target_len() -> Result<(), String>
+    {
+        let rls_bad_gather = "\
+            arena 0 len=16 lane=f64x8
+            arena 1 len=4 lane=f64x4
+            proof 1 rule=slice_bounds target=0 lo=8 hi=12 witness=0
+            proof 2 rule=gather_bounds target=0 lo=0 hi=8 witness=1
+            node $a0 = ArenaInput f64x8 a=0
+            node $idx = ArenaInput f64x4 a=1
+            node $slice = ArenaSlice f64x4 proof=1 a=$a0
+            node $gat = Gather f64x4 proof=2 a=$slice b=$idx
+            node $sum = ReduceSum f64x1 a=$gat
+            output $sum
+        ";
+        let prog = crate::transpiler::assemble_rls(rls_bad_gather).map_err(|e| e.to_string())?;
+        let ver = verify_program(&prog);
+        assert!(
+            matches!(
+                &ver,
+                Err(diag) if diag.kind == VerifyErrorKind::InvalidRefinementProof {
+                    proof_idx: 2,
+                    bound_hi: 8,
+                    arena_len: 4,
+                }
+            ),
+            "expected verifier to reject Gather bound_hi=8 > sliced target len=4, got {ver:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_p0_bug2_aot_short_file_exits_cleanly_without_sigbus() -> Result<(), String> {
+        let rls = "\
+            arena 0 len=4096 lane=f64x8
+            node $x = ArenaInput f64x8 a=0
+            node $s = ReduceSum f64x1 a=$x
+            output $s
+        ";
+        let prog = crate::transpiler::assemble_rls(rls).map_err(|e| e.to_string())?;
+        let exe_path = std::env::temp_dir().join("rul_test_p0_bug2_short_bin");
+        let data_path = std::env::temp_dir().join("rul_test_p0_bug2_short_data.bin");
+        crate::aot::compile_rl_to_executable(&prog, &exe_path).map_err(|e| e.to_string())?;
+        // Write only 2 elements (16 bytes) instead of 4096 elements (32,768 bytes)
+        crate::aot::write_arena_data_file(&data_path, &[&[1.0_f64, 2.0_f64]])
+            .map_err(|e| e.to_string())?;
+        let res = crate::aot::run_compiled_executable(&exe_path, &data_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+        match res {
+            Err(crate::aot::AotError::ExecutionFailed(msg)) => {
+                assert!(
+                    msg.contains("Some(66)"),
+                    "expected clean exit code Some(66) on short arena file, got: {msg}"
+                );
+                Ok(())
+            }
+            other => Err(format!(
+                "expected ExecutionFailed(Some(66)) on short file, got: {other:?}"
+            )),
+        }
+    }
+
+    #[test]
+    fn test_p0_bug3_aot_gather_fractional_and_neg_half_rejected() -> Result<(), String> {
+        let rls = "\
+            arena 0 len=8 lane=f64x8
+            arena 1 len=4 lane=f64x4
+            proof 1 rule=gather_bounds target=0 lo=0 hi=8 witness=1
+            node $a0 = ArenaInput f64x8 a=0
+            node $idx = ArenaInput f64x4 a=1
+            node $gat = Gather f64x4 proof=1 a=$a0 b=$idx
+            node $sum = ReduceSum f64x1 a=$gat
+            output $sum
+        ";
+        let prog = crate::transpiler::assemble_rls(rls).map_err(|e| e.to_string())?;
+        let a0: Vec<f64> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let exe_path = std::env::temp_dir().join("rul_test_p0_bug3_frac_bin");
+        let data_path = std::env::temp_dir().join("rul_test_p0_bug3_frac_data.bin");
+        crate::aot::compile_rl_to_executable(&prog, &exe_path).map_err(|e| e.to_string())?;
+
+        for bad_indices in [[0.0, 1.5, 2.0, 3.0], [0.0, -0.5, 2.0, 3.0]] {
+            let t0 = execute_tier0_interpreter(&prog, &[&a0, &bad_indices]);
+            assert!(
+                matches!(
+                    t0,
+                    Err(crate::engine::ExecError::GatherIndexOutOfBounds { .. })
+                ),
+                "Tier 0 must reject non-integer/negative index {bad_indices:?}, got {t0:?}"
+            );
+            crate::aot::write_arena_data_file(&data_path, &[&a0, &bad_indices])
+                .map_err(|e| e.to_string())?;
+            let aot_res = crate::aot::run_compiled_executable(&exe_path, &data_path);
+            assert!(
+                matches!(aot_res, Err(crate::aot::AotError::GatherOutOfBounds)),
+                "AOT must reject non-integer/negative index {bad_indices:?} with GatherOutOfBounds, got {aot_res:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_p0_differential_fuzz_random_verified_graphs_all_tiers_and_aot() -> Result<(), String> {
+        let mut seed: u64 = 0x5EED_CAFE_2026_0401;
+        let mut next_u64 = || -> u64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed
+        };
+
+        let elem_count = 36usize; // 36 = 8*4 + 4 (exercises both AVX2 8-lane loop and scalar tail)
+        let col0: Vec<f64> = (0..elem_count).map(|i| (i as f64) * 0.25 + 1.5).collect();
+        let col1: Vec<f64> = (0..elem_count).map(|i| ((i % 7) as f64) + 0.75).collect();
+        let col2: Vec<f64> = (0..elem_count)
+            .map(|i| ((elem_count - i) as f64) * 0.1 + 0.5)
+            .collect();
+
+        let exe_path = std::env::temp_dir().join("rul_test_p0_fuzz_bin");
+        let data_path = std::env::temp_dir().join("rul_test_p0_fuzz_data.bin");
+        crate::aot::write_arena_data_file(&data_path, &[&col0, &col1, &col2])
+            .map_err(|e| e.to_string())?;
+
+        for case_idx in 0..50usize {
+            let mut b = SymbolicGraphBuilder::new(CAP_NONE);
+            let a0 = b.add_arena(elem_count as u32, TypeLane::F64X8, false);
+            let a1 = b.add_arena(elem_count as u32, TypeLane::F64X8, false);
+            let a2 = b.add_arena(elem_count as u32, TypeLane::F64X8, false);
+            let s = ScheduleHint::UNFUSED;
+
+            b.emit_arena_input("$c0", a0, 1, s)
+                .map_err(|e| e.to_string())?;
+            b.emit_arena_input("$c1", a1, 1, s)
+                .map_err(|e| e.to_string())?;
+            b.emit_arena_input("$c2", a2, 1, s)
+                .map_err(|e| e.to_string())?;
+            b.emit_const_f64("$k0", 1.25, s)
+                .map_err(|e| e.to_string())?;
+            b.emit_const_f64("$k1", 0.5, s).map_err(|e| e.to_string())?;
+
+            let mut col_vars = vec!["$c0".to_owned(), "$c1".to_owned(), "$c2".to_owned()];
+            let const_vars = ["$k0", "$k1"];
+            let step_count = 4 + ((next_u64() as usize) % 12);
+
+            for step in 0..step_count {
+                let name = format!("$v{step}");
+                let r = next_u64() % 10;
+                let lhs_idx = (next_u64() as usize) % col_vars.len();
+                let lhs = col_vars.get(lhs_idx).cloned().unwrap_or_default();
+                match r {
+                    0..=5 => {
+                        let op = match r {
+                            0 => Opcode::Add,
+                            1 => Opcode::Sub,
+                            2 => Opcode::Mul,
+                            3 => Opcode::Min,
+                            4 => Opcode::Max,
+                            _ => Opcode::Add,
+                        };
+                        let use_const = (next_u64() % 3) == 0;
+                        let rhs = if use_const {
+                            const_vars
+                                .get((next_u64() as usize) % const_vars.len())
+                                .copied()
+                                .unwrap_or("$k0")
+                                .to_owned()
+                        } else {
+                            let rhs_idx = (next_u64() as usize) % col_vars.len();
+                            col_vars.get(rhs_idx).cloned().unwrap_or_default()
+                        };
+                        b.emit_binary_op(&name, op, TypeLane::F64X8, &lhs, &rhs, s)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    6 => {
+                        b.emit_unary_op(&name, Opcode::Abs, TypeLane::F64X8, &lhs, s)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    7 => {
+                        let abs_name = format!("$abs{step}");
+                        b.emit_unary_op(&abs_name, Opcode::Abs, TypeLane::F64X8, &lhs, s)
+                            .map_err(|e| e.to_string())?;
+                        b.emit_unary_op(&name, Opcode::Sqrt, TypeLane::F64X8, &abs_name, s)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    8 => {
+                        let op = if (next_u64() & 1) == 0 {
+                            Opcode::Floor
+                        } else {
+                            Opcode::Ceil
+                        };
+                        b.emit_unary_op(&name, op, TypeLane::F64X8, &lhs, s)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    _ => {
+                        let m_name = format!("$m{step}");
+                        let cmp_op = match next_u64() % 3 {
+                            0 => Opcode::CmpGt,
+                            1 => Opcode::CmpLt,
+                            _ => Opcode::CmpEq,
+                        };
+                        b.emit_binary_op(&m_name, cmp_op, TypeLane::MASKX8, &lhs, "$k0", s)
+                            .map_err(|e| e.to_string())?;
+                        b.emit_binary_op(
+                            &name,
+                            Opcode::SelectZero,
+                            TypeLane::F64X8,
+                            &m_name,
+                            &lhs,
+                            s,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+                col_vars.push(name);
+            }
+
+            let last_col = col_vars.last().cloned().unwrap_or_default();
+            let red_op = match case_idx % 3 {
+                0 => Opcode::ReduceSum,
+                1 => Opcode::ReduceMax,
+                _ => Opcode::ReduceMin,
+            };
+            b.emit_unary_op("$out", red_op, TypeLane::F64_SCALAR, &last_col, s)
+                .map_err(|e| e.to_string())?;
+            let prog = b.finish("$out").map_err(|e| e.to_string())?;
+
+            let rep0 = execute_tier0_interpreter(&prog, &[&col0, &col1, &col2])
+                .map_err(|e| e.to_string())?;
+            let rep1 =
+                execute_tier1_stencil(&prog, &[&col0, &col1, &col2]).map_err(|e| e.to_string())?;
+            let rep2 =
+                execute_tier2_fused(&prog, &[&col0, &col1, &col2]).map_err(|e| e.to_string())?;
+            let RuntimeValue::Scalar(v0) = rep0.output else {
+                return Err("expected scalar output".to_owned());
+            };
+            let RuntimeValue::Scalar(v1) = rep1.output else {
+                return Err("expected scalar output".to_owned());
+            };
+            let RuntimeValue::Scalar(v2) = rep2.output else {
+                return Err("expected scalar output".to_owned());
+            };
+
+            crate::aot::compile_rl_to_executable(&prog, &exe_path).map_err(|e| e.to_string())?;
+            let vaot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+                .map_err(|e| e.to_string())?;
+
+            let tol = v0.abs().max(1.0) * 1e-11;
+            assert!(
+                (v0 - v1).abs() <= tol && (v0 - v2).abs() <= tol && (v0 - vaot).abs() <= tol,
+                "fuzz case {case_idx} mismatch: Tier0={v0}, Tier1={v1}, Tier2={v2}, AOT={vaot}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_p1_horner50_register_allocated_aot_equivalence() -> Result<(), String> {
+        let elem_count = 1024usize;
+        let col_x: Vec<f64> = (0..elem_count)
+            .map(|i| 0.5 + ((i % 16) as f64) * 0.025)
+            .collect();
+
+        let mut b = SymbolicGraphBuilder::new(CAP_NONE);
+        let a0 = b.add_arena(elem_count as u32, TypeLane::F64X8, false);
+        let s = ScheduleHint {
+            fusion_group: 1,
+            policy: ExecPolicy::SimdStream,
+        };
+        b.emit_arena_input("$x", a0, 1, s)
+            .map_err(|e| e.to_string())?;
+        b.emit_const_f64("$c0", 1.000_001, s)
+            .map_err(|e| e.to_string())?;
+        b.emit_const_f64("$c1", 0.999_999, s)
+            .map_err(|e| e.to_string())?;
+
+        let mut acc_var = "$c0".to_owned();
+        for step in 0..50usize {
+            let mul_name = format!("$m{step}");
+            let add_name = format!("$a{step}");
+            let c_ref = if (step & 1) == 0 { "$c1" } else { "$c0" };
+            b.emit_binary_op(&mul_name, Opcode::Mul, TypeLane::F64X8, &acc_var, "$x", s)
+                .map_err(|e| e.to_string())?;
+            b.emit_binary_op(&add_name, Opcode::Add, TypeLane::F64X8, &mul_name, c_ref, s)
+                .map_err(|e| e.to_string())?;
+            acc_var = add_name;
+        }
+        b.emit_unary_op("$sum", Opcode::ReduceSum, TypeLane::F64_SCALAR, &acc_var, s)
+            .map_err(|e| e.to_string())?;
+        let prog = b.finish("$sum").map_err(|e| e.to_string())?;
+        assert_eq!(prog.nodes.len(), 104);
+
+        let rep0 = execute_tier0_interpreter(&prog, &[&col_x]).map_err(|e| e.to_string())?;
+        let rep2 = execute_tier2_fused(&prog, &[&col_x]).map_err(|e| e.to_string())?;
+        let RuntimeValue::Scalar(v0) = rep0.output else {
+            return Err("expected scalar output".to_owned());
+        };
+        let RuntimeValue::Scalar(v2) = rep2.output else {
+            return Err("expected scalar output".to_owned());
+        };
+
+        let exe_path = std::env::temp_dir().join("rul_test_p1_horner50_bin");
+        let data_path = std::env::temp_dir().join("rul_test_p1_horner50_data.bin");
+        let report =
+            crate::aot::compile_rl_to_executable(&prog, &exe_path).map_err(|e| e.to_string())?;
+        assert!(report.avx2_vectorized);
+        crate::aot::write_arena_data_file(&data_path, &[&col_x]).map_err(|e| e.to_string())?;
+        let vaot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+
+        let tol = v0.abs().max(1.0) * 1e-11;
+        assert!(
+            (v0 - v2).abs() <= tol && (v0 - vaot).abs() <= tol,
+            "Horner-50 mismatch: Tier0={v0}, Tier2={v2}, AOT={vaot}"
+        );
+        Ok(())
+    }
 }

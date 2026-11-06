@@ -109,6 +109,13 @@ struct AotReductionSpec {
     reduction: AotReduction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AotColMeta {
+    origin_arena: Option<usize>,
+    slice_offset: u64,
+    col_len: u64,
+}
+
 /// Compiles a verified [`RulProgram`] into an in-memory Linux `x86_64` `ELF64` executable image.
 ///
 /// The resulting binary has **zero runtime dependencies** (`statically linked`, no `libc`, no VM)
@@ -142,11 +149,16 @@ pub fn compile_to_elf64_bytes(
     }
 
     let mut phases = vec![AotNodePhase::Dead; program.nodes.len()];
+    let mut col_metas = vec![
+        AotColMeta {
+            origin_arena: None,
+            slice_offset: 0,
+            col_len: 0,
+        };
+        program.nodes.len()
+    ];
     let mut reductions = Vec::new();
     let mut post_reduce_nodes = Vec::new();
-    let mut domain_start: u64 = 0;
-    let mut domain_end: Option<u64> = None;
-    let mut slice_bounds: Option<(u32, u32)> = None;
     let mut filter_mask_node: Option<usize> = None;
     let mut has_gather = false;
 
@@ -158,35 +170,70 @@ pub fn compile_to_elf64_bytes(
         let phase_b = phases.get(frame.in_b as usize).copied();
         let phase = match frame.opcode {
             Opcode::ConstF64 => AotNodePhase::Const,
-            Opcode::ArenaInput => AotNodePhase::Column,
+            Opcode::ArenaInput => {
+                let arena_idx = frame.in_a as usize;
+                let arena_len = program
+                    .arenas
+                    .get(arena_idx)
+                    .map_or(0, |a| u64::from(a.element_count));
+                if let Some(m) = col_metas.get_mut(idx) {
+                    *m = AotColMeta {
+                        origin_arena: Some(arena_idx),
+                        slice_offset: 0,
+                        col_len: arena_len,
+                    };
+                }
+                AotNodePhase::Column
+            }
             Opcode::ArenaSlice => {
                 if phase_a != Some(AotNodePhase::Column) {
                     return Err(AotError::UnsupportedGraph("invalid ArenaSlice input phase"));
+                }
+                let src_meta = col_metas
+                    .get(frame.in_a as usize)
+                    .copied()
+                    .unwrap_or(AotColMeta {
+                        origin_arena: None,
+                        slice_offset: 0,
+                        col_len: 0,
+                    });
+                if src_meta.origin_arena.is_none() {
+                    return Err(AotError::UnsupportedGraph(
+                        "AOT ArenaSlice requires direct ArenaInput or ArenaSlice source",
+                    ));
                 }
                 let proof = program
                     .proofs
                     .get(usize::from(frame.proof_idx.saturating_sub(1)))
                     .ok_or(AotError::UnsupportedGraph("missing slice ProofEntry"))?;
-                if let Some((prev_lo, prev_hi)) = slice_bounds {
-                    if prev_lo != proof.bound_lo || prev_hi != proof.bound_hi {
-                        return Err(AotError::UnsupportedGraph(
-                            "AOT binary does not support multiple ArenaSlice nodes with different bounds",
-                        ));
-                    }
-                } else {
-                    slice_bounds = Some((proof.bound_lo, proof.bound_hi));
-                    domain_start = u64::from(proof.bound_lo);
-                    domain_end = Some(u64::from(proof.bound_hi));
+                let slice_len = u64::from(proof.bound_hi.saturating_sub(proof.bound_lo));
+                if let Some(m) = col_metas.get_mut(idx) {
+                    *m = AotColMeta {
+                        origin_arena: src_meta.origin_arena,
+                        slice_offset: src_meta
+                            .slice_offset
+                            .saturating_add(u64::from(proof.bound_lo)),
+                        col_len: slice_len,
+                    };
                 }
                 AotNodePhase::Column
             }
             Opcode::ArenaMutate => {
-                if phase_a != Some(AotNodePhase::Column)
-                    || !matches!(phase_b, Some(AotNodePhase::Column | AotNodePhase::Const))
-                {
+                if !matches!(phase_b, Some(AotNodePhase::Column | AotNodePhase::Const)) {
                     return Err(AotError::UnsupportedGraph(
                         "invalid ArenaMutate input phase",
                     ));
+                }
+                let arena_len = program
+                    .arenas
+                    .get(frame.in_a as usize)
+                    .map_or(0, |a| u64::from(a.element_count));
+                if let Some(m) = col_metas.get_mut(idx) {
+                    *m = AotColMeta {
+                        origin_arena: None,
+                        slice_offset: 0,
+                        col_len: arena_len,
+                    };
                 }
                 AotNodePhase::Column
             }
@@ -202,11 +249,41 @@ pub fn compile_to_elf64_bytes(
                     ));
                 }
                 filter_mask_node = Some(frame.in_a as usize);
+                let val_len = col_metas.get(frame.in_b as usize).map_or(0, |m| m.col_len);
+                if let Some(m) = col_metas.get_mut(idx) {
+                    *m = AotColMeta {
+                        origin_arena: None,
+                        slice_offset: 0,
+                        col_len: val_len,
+                    };
+                }
                 AotNodePhase::Column
             }
             Opcode::Gather => {
                 if phase_a != Some(AotNodePhase::Column) || phase_b != Some(AotNodePhase::Column) {
                     return Err(AotError::UnsupportedGraph("invalid Gather input phase"));
+                }
+                let target_meta =
+                    col_metas
+                        .get(frame.in_a as usize)
+                        .copied()
+                        .unwrap_or(AotColMeta {
+                            origin_arena: None,
+                            slice_offset: 0,
+                            col_len: 0,
+                        });
+                if target_meta.origin_arena.is_none() {
+                    return Err(AotError::UnsupportedGraph(
+                        "AOT Gather requires direct ArenaInput or ArenaSlice target",
+                    ));
+                }
+                let idx_len = col_metas.get(frame.in_b as usize).map_or(0, |m| m.col_len);
+                if let Some(m) = col_metas.get_mut(idx) {
+                    *m = AotColMeta {
+                        origin_arena: None,
+                        slice_offset: 0,
+                        col_len: idx_len,
+                    };
                 }
                 has_gather = true;
                 AotNodePhase::Column
@@ -236,7 +313,17 @@ pub fn compile_to_elf64_bytes(
             | Opcode::Ceil
             | Opcode::Ln
             | Opcode::Exp => match phase_a {
-                Some(AotNodePhase::Column) => AotNodePhase::Column,
+                Some(AotNodePhase::Column) => {
+                    let len_a = col_metas.get(frame.in_a as usize).map_or(0, |m| m.col_len);
+                    if let Some(m) = col_metas.get_mut(idx) {
+                        *m = AotColMeta {
+                            origin_arena: None,
+                            slice_offset: 0,
+                            col_len: len_a,
+                        };
+                    }
+                    AotNodePhase::Column
+                }
                 Some(
                     AotNodePhase::Const | AotNodePhase::Reduce | AotNodePhase::PostReduceScalar,
                 ) => {
@@ -257,6 +344,16 @@ pub fn compile_to_elf64_bytes(
                         return Err(AotError::UnsupportedGraph(
                             "column operation depends on reduction output (requires multi-pass execution)",
                         ));
+                    }
+                    let len_a = col_metas.get(frame.in_a as usize).map_or(0, |m| m.col_len);
+                    let len_b = col_metas.get(frame.in_b as usize).map_or(0, |m| m.col_len);
+                    let col_len = if len_a > 0 { len_a } else { len_b };
+                    if let Some(m) = col_metas.get_mut(idx) {
+                        *m = AotColMeta {
+                            origin_arena: None,
+                            slice_offset: 0,
+                            col_len,
+                        };
                     }
                     AotNodePhase::Column
                 } else {
@@ -303,6 +400,16 @@ pub fn compile_to_elf64_bytes(
                         "column comparison/mask/select op depends on reduction output",
                     ));
                 }
+                let len_a = col_metas.get(frame.in_a as usize).map_or(0, |m| m.col_len);
+                let len_b = col_metas.get(frame.in_b as usize).map_or(0, |m| m.col_len);
+                let col_len = if len_a > 0 { len_a } else { len_b };
+                if let Some(m) = col_metas.get_mut(idx) {
+                    *m = AotColMeta {
+                        origin_arena: None,
+                        slice_offset: 0,
+                        col_len,
+                    };
+                }
                 AotNodePhase::Column
             }
             Opcode::RingEnqueue | Opcode::AssertContract => {
@@ -344,22 +451,85 @@ pub fn compile_to_elf64_bytes(
         ));
     }
 
-    if !has_gather && slice_bounds.is_none() {
-        let mut common_len: Option<u32> = None;
-        for (idx, frame) in program.nodes.iter().enumerate() {
-            if live.get(idx).copied().unwrap_or(false) && frame.opcode == Opcode::ArenaInput {
-                if let Some(arena) = program.arenas.get(frame.in_a as usize) {
-                    if let Some(prev) = common_len {
-                        if prev != arena.element_count {
-                            return Err(AotError::UnsupportedGraph(
-                                "AOT binary requires all unsliced input arenas to have matching element_count",
-                            ));
-                        }
-                    } else {
-                        common_len = Some(arena.element_count);
-                    }
+    // Backward pass to determine which Column nodes are actually evaluated elementwise in the loop
+    // (excluding nodes used solely as random-access `Gather` targets or `ArenaSlice` base inputs).
+    let mut eval_in_loop = vec![false; program.nodes.len()];
+    for spec in &reductions {
+        if let Some(slot) = eval_in_loop.get_mut(spec.reduce_input_idx) {
+            *slot = true;
+        }
+    }
+    if let Some(mask_idx) = filter_mask_node {
+        if let Some(slot) = eval_in_loop.get_mut(mask_idx) {
+            *slot = true;
+        }
+    }
+    for idx in (0..program.nodes.len()).rev() {
+        if !eval_in_loop.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(frame) = program.nodes.get(idx) else {
+            continue;
+        };
+        match frame.opcode {
+            Opcode::ArenaInput | Opcode::ConstF64 | Opcode::ArenaSlice => {}
+            Opcode::Gather | Opcode::ArenaMutate => {
+                if let Some(b) = eval_in_loop.get_mut(frame.in_b as usize) {
+                    *b = true;
                 }
             }
+            Opcode::Abs
+            | Opcode::Sqrt
+            | Opcode::Floor
+            | Opcode::Ceil
+            | Opcode::Ln
+            | Opcode::Exp => {
+                if let Some(a) = eval_in_loop.get_mut(frame.in_a as usize) {
+                    *a = true;
+                }
+            }
+            Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Min
+            | Opcode::Max
+            | Opcode::CmpGt
+            | Opcode::CmpLt
+            | Opcode::CmpEq
+            | Opcode::MaskAnd
+            | Opcode::MaskOr
+            | Opcode::SelectZero
+            | Opcode::FilterCompact => {
+                if let Some(a) = eval_in_loop.get_mut(frame.in_a as usize) {
+                    *a = true;
+                }
+                if let Some(b) = eval_in_loop.get_mut(frame.in_b as usize) {
+                    *b = true;
+                }
+            }
+            Opcode::ReduceSum
+            | Opcode::ReduceMax
+            | Opcode::ReduceMin
+            | Opcode::RingEnqueue
+            | Opcode::AssertContract => {}
+        }
+    }
+
+    let mut loop_col_len: Option<u64> = None;
+    for (idx, &in_loop) in eval_in_loop.iter().enumerate() {
+        if !in_loop || phases.get(idx).copied() != Some(AotNodePhase::Column) {
+            continue;
+        }
+        let c_len = col_metas.get(idx).map_or(0, |m| m.col_len);
+        if let Some(prev) = loop_col_len {
+            if prev != c_len {
+                return Err(AotError::UnsupportedGraph(
+                    "AOT binary requires all loop-evaluated columns to have matching length",
+                ));
+            }
+        } else {
+            loop_col_len = Some(c_len);
         }
     }
 
@@ -370,11 +540,9 @@ pub fn compile_to_elf64_bytes(
         arena_byte_offsets.push(total_arena_bytes);
         total_arena_bytes =
             total_arena_bytes.saturating_add(u64::from(arena.element_count).saturating_mul(8));
-        if domain_end.is_none() {
-            domain_end = Some(u64::from(arena.element_count));
-        }
     }
-    let final_domain_end = domain_end.unwrap_or(1);
+    let domain_start: u64 = 0;
+    let final_domain_end: u64 = loop_col_len.unwrap_or(1);
     let avx2_vectorized = !has_gather
         && filter_mask_node.is_none()
         && final_domain_end.saturating_sub(domain_start) >= 4;
@@ -383,6 +551,8 @@ pub fn compile_to_elf64_bytes(
         program,
         &live,
         &phases,
+        &col_metas,
+        &eval_in_loop,
         &reductions,
         &post_reduce_nodes,
         domain_start,
@@ -467,10 +637,19 @@ pub fn run_compiled_executable(
     exe_path: impl AsRef<Path>,
     data_path: impl AsRef<Path>,
 ) -> Result<f64, AotError> {
-    let output = Command::new(exe_path.as_ref())
-        .arg(data_path.as_ref())
-        .output()
-        .map_err(AotError::Io)?;
+    let exe_ref = exe_path.as_ref();
+    let data_ref = data_path.as_ref();
+    let mut attempt = 0u32;
+    let output = loop {
+        match Command::new(exe_ref).arg(data_ref).output() {
+            Ok(out) => break out,
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 32 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_micros(250));
+            }
+            Err(e) => return Err(AotError::Io(e)),
+        }
+    };
 
     if !output.status.success() {
         match output.status.code() {
@@ -493,6 +672,26 @@ pub fn run_compiled_executable(
     Ok(f64::from_le_bytes(bytes))
 }
 
+// =========================================================================
+// Rul AOT x86_64 Register Contract (`RegisterContract`)
+// =========================================================================
+// - Fixed Frame / Loop Registers:
+//   * `rbp`: 32-byte aligned stack frame base pointer
+//   * `r12`: read-only `mmap` arena file base pointer
+//   * `rcx`: loop element index (`0 .. final_domain_end`)
+//   * `rbx`: `final_domain_end` (`loop_col_len`)
+//   * `r11`: active element/vector step counter for 8-lane deterministic reductions
+// - Scratch Registers (clobberable within any single opcode stencil):
+//   * GPR: `rax`, `rdx`, `r8` (plus `rdi`, `rsi`, `r9`, `r10`, `r13`, `r14`, `r15` in syscalls)
+//   * SIMD: `ymm0`/`xmm0`, `ymm1`/`xmm1`
+// - Primary Reduction Accumulators (in `5a` AVX2 loop when `reductions.len() == 1`):
+//   * `ymm14`: lanes `0..4` (`acc[0..4]`)
+//   * `ymm15`: lanes `4..8` (`acc[4..8]`)
+// - SSA Column Register Pool (in `5a` AVX2 loop):
+//   * `ymm2 .. ymm13` (12 x 256-bit `4 x f64` registers, `free_ymm_mask = 0x3FFC`)
+//   * Allocated in a single linear pass via `last_use[node_idx]`; spilled to `[rbp + disp]`
+//     only if > 12 column values are simultaneously live.
+//   * LICM `ConstF64` nodes remain pre-broadcast in `[rbp + disp]` as memory operands.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -502,6 +701,8 @@ fn emit_x86_64_machine_code(
     program: &RulProgram,
     live: &[bool],
     phases: &[AotNodePhase],
+    col_metas: &[AotColMeta],
+    eval_in_loop: &[bool],
     reductions: &[AotReductionSpec],
     post_reduce_nodes: &[usize],
     domain_start: u64,
@@ -563,6 +764,31 @@ fn emit_x86_64_machine_code(
 
         // Save `fd` in `r15`: mov r15, rax
         code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+
+        // Verify file size >= `total_arena_bytes` via `SYS_lseek(fd=r15, offset=0, whence=SEEK_END=2)`
+        // before `SYS_mmap` so a truncated/short file exits cleanly with code 66 instead of `SIGBUS`.
+        // mov rdi, r15
+        code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+        // xor esi, esi
+        code.extend_from_slice(&[0x31, 0xF6]);
+        // mov edx, 2 (SEEK_END = 2)
+        code.extend_from_slice(&[0xBA, 0x02, 0x00, 0x00, 0x00]);
+        // mov eax, 8 (SYS_lseek = 8)
+        code.extend_from_slice(&[0xB8, 0x08, 0x00, 0x00, 0x00]);
+        // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
+        // test rax, rax
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+        // js +15 (jump to exit(66) on negative error return)
+        code.extend_from_slice(&[0x78, 0x0F]);
+        // movabs rcx, total_arena_bytes
+        code.extend_from_slice(&[0x48, 0xB9]);
+        code.extend_from_slice(&total_arena_bytes.to_le_bytes());
+        // cmp rax, rcx
+        code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+        // jae +12 (skip exit(66))
+        code.extend_from_slice(&[0x73, 0x0C]);
+        emit_sys_exit(&mut code, 66);
 
         // SYS_mmap(NULL, total_arena_bytes, PROT_READ=1, MAP_PRIVATE=2, fd=r15, offset=0)
         // xor edi, edi
@@ -652,8 +878,77 @@ fn emit_x86_64_machine_code(
     code.extend_from_slice(&domain_end.to_le_bytes());
 
     // 5a. Primary 256-Bit AVX2 `YMM` Vector Loop (`4 x f64` = `32 bytes` per step,
-    //     alternating between the two 256-bit accumulators `acc[0..4]` and `acc[4..8]`).
+    //     with single-pass O(N) `last_use` register allocation across `ymm2..ymm13`
+    //     and primary reduction accumulators pinned in `ymm14` & `ymm15`).
     if avx2_vectorized {
+        let mut last_use = vec![0usize; node_count];
+        for (idx, frame) in program.nodes.iter().enumerate() {
+            if !eval_in_loop.get(idx).copied().unwrap_or(false)
+                || phases.get(idx).copied() != Some(AotNodePhase::Column)
+            {
+                continue;
+            }
+            match frame.opcode {
+                Opcode::ArenaInput | Opcode::ConstF64 | Opcode::ArenaSlice => {}
+                Opcode::ArenaMutate => {
+                    if let Some(lu) = last_use.get_mut(frame.in_b as usize) {
+                        *lu = idx;
+                    }
+                }
+                Opcode::Abs
+                | Opcode::Sqrt
+                | Opcode::Floor
+                | Opcode::Ceil
+                | Opcode::Ln
+                | Opcode::Exp => {
+                    if let Some(lu) = last_use.get_mut(frame.in_a as usize) {
+                        *lu = idx;
+                    }
+                }
+                Opcode::Add
+                | Opcode::Sub
+                | Opcode::Mul
+                | Opcode::Div
+                | Opcode::Min
+                | Opcode::Max
+                | Opcode::CmpGt
+                | Opcode::CmpLt
+                | Opcode::CmpEq
+                | Opcode::MaskAnd
+                | Opcode::MaskOr
+                | Opcode::SelectZero
+                | Opcode::FilterCompact => {
+                    if let Some(lu) = last_use.get_mut(frame.in_a as usize) {
+                        *lu = idx;
+                    }
+                    if let Some(lu) = last_use.get_mut(frame.in_b as usize) {
+                        *lu = idx;
+                    }
+                }
+                Opcode::Gather
+                | Opcode::ReduceSum
+                | Opcode::ReduceMax
+                | Opcode::ReduceMin
+                | Opcode::RingEnqueue
+                | Opcode::AssertContract => {}
+            }
+        }
+        for spec in reductions {
+            if let Some(lu) = last_use.get_mut(spec.reduce_input_idx) {
+                *lu = node_count;
+            }
+        }
+
+        // Pin primary reduction accumulator in `ymm14` (`acc[0..4]`) and `ymm15` (`acc[4..8]`)
+        // before entering the AVX2 vector loop when `reductions.len() == 1`.
+        if reductions.len() == 1 {
+            emit_load_ymm_rbp(&mut code, 14, red_acc_disp(node_count, 0, 0));
+            emit_load_ymm_rbp(&mut code, 15, red_acc_disp(node_count, 0, 4));
+        }
+
+        let mut free_ymm_mask: u16 = 0x3FFC; // bits 2..=13 (`ymm2..ymm13`)
+        let mut node_ymm: Vec<Option<u8>> = vec![None; node_count];
+
         let avx2_loop_top = code.len();
         // lea rax, [rcx + 4]
         code.extend_from_slice(&[0x48, 0x8D, 0x41, 0x04]);
@@ -664,20 +959,33 @@ fn emit_x86_64_machine_code(
         let ja_avx2_exit_patch_pos = code.len() - 4;
 
         for (idx, frame) in program.nodes.iter().enumerate() {
-            if phases.get(idx).copied() != Some(AotNodePhase::Column) {
+            if !eval_in_loop.get(idx).copied().unwrap_or(false)
+                || phases.get(idx).copied() != Some(AotNodePhase::Column)
+            {
                 continue;
             }
+            let a = frame.in_a as usize;
+            let b = frame.in_b as usize;
             let disp = node_disp(idx);
-            let disp_a = node_disp(frame.in_a as usize);
-            let disp_b = node_disp(frame.in_b as usize);
+            let disp_a = node_disp(a);
+            let disp_b = node_disp(b);
 
             match frame.opcode {
                 Opcode::ConstF64 => {}
-                Opcode::ArenaInput => {
+                Opcode::ArenaInput | Opcode::ArenaSlice => {
+                    let meta = col_metas.get(idx).copied().unwrap_or(AotColMeta {
+                        origin_arena: None,
+                        slice_offset: 0,
+                        col_len: 0,
+                    });
+                    let orig_arena = meta.origin_arena.unwrap_or(a);
                     let arena_off = arena_byte_offsets
-                        .get(frame.in_a as usize)
+                        .get(orig_arena)
                         .copied()
-                        .unwrap_or(0);
+                        .unwrap_or(0)
+                        .saturating_add(meta.slice_offset.saturating_mul(8));
+
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
                     // mov rax, r12
                     code.extend_from_slice(&[0x4C, 0x89, 0xE0]);
                     if arena_off > 0 {
@@ -686,107 +994,154 @@ fn emit_x86_64_machine_code(
                         code.extend_from_slice(&arena_off.to_le_bytes());
                         code.extend_from_slice(&[0x48, 0x01, 0xD0]);
                     }
-                    // vmovupd ymm0, ymmword ptr [rax + rcx * 8]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x04, 0xC8]);
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::ArenaSlice => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    emit_store_ymm0_rbp(&mut code, disp);
+                    emit_load_ymm_rax_rcx8(&mut code, dst_reg);
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    }
                 }
                 Opcode::ArenaMutate | Opcode::FilterCompact => {
-                    emit_load_ymm0_rbp(&mut code, disp_b);
-                    emit_store_ymm0_rbp(&mut code, disp);
+                    let reg_b = if let Some(rb) = node_ymm.get(b).copied().flatten() {
+                        rb
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_b);
+                        0
+                    };
+                    free_if_dying(b, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, reg_b, disp);
+                    } else if dst_reg != reg_b {
+                        // vmovapd ymm_dst, ymm_reg_b
+                        emit_vex_ymm_rr(&mut code, 0x28, dst_reg, 0, reg_b);
+                    }
                 }
-                Opcode::Add => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vaddpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x58, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, disp);
+                Opcode::Add
+                | Opcode::Sub
+                | Opcode::Mul
+                | Opcode::Div
+                | Opcode::Min
+                | Opcode::Max => {
+                    let vex_op = match frame.opcode {
+                        Opcode::Add => 0x58,
+                        Opcode::Sub => 0x5C,
+                        Opcode::Mul => 0x59,
+                        Opcode::Div => 0x5E,
+                        Opcode::Min => 0x5D,
+                        _ => 0x5F,
+                    };
+                    let reg_a = if let Some(ra) = node_ymm.get(a).copied().flatten() {
+                        ra
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_a);
+                        0
+                    };
+                    let opt_rb = node_ymm.get(b).copied().flatten();
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    if b != a {
+                        free_if_dying(b, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    }
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if let Some(rb) = opt_rb {
+                        emit_vex_ymm_rr(&mut code, vex_op, dst_reg, reg_a, rb);
+                    } else {
+                        emit_vex_ymm_rm_rbp(&mut code, vex_op, dst_reg, reg_a, disp_b);
+                    }
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    }
                 }
-                Opcode::Sub => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vsubpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x5C, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, disp);
+                Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
+                    let (lhs, disp_lhs, rhs, disp_rhs, imm8) = match frame.opcode {
+                        Opcode::CmpGt => (b, disp_b, a, disp_a, 0x01u8),
+                        Opcode::CmpLt => (a, disp_a, b, disp_b, 0x01u8),
+                        _ => (a, disp_a, b, disp_b, 0x00u8),
+                    };
+                    let reg_lhs = if let Some(rl) = node_ymm.get(lhs).copied().flatten() {
+                        rl
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_lhs);
+                        0
+                    };
+                    let reg_rhs = if let Some(rr) = node_ymm.get(rhs).copied().flatten() {
+                        rr
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 1, disp_rhs);
+                        1
+                    };
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    if b != a {
+                        free_if_dying(b, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    }
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    emit_vex_ymm_rr(&mut code, 0xC2, dst_reg, reg_lhs, reg_rhs);
+                    code.push(imm8);
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    }
                 }
-                Opcode::Mul => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vmulpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x59, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, disp);
+                Opcode::SelectZero | Opcode::MaskAnd | Opcode::MaskOr => {
+                    let vex_op = if frame.opcode == Opcode::MaskOr {
+                        0x56
+                    } else {
+                        0x54
+                    };
+                    let reg_a = if let Some(ra) = node_ymm.get(a).copied().flatten() {
+                        ra
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_a);
+                        0
+                    };
+                    let opt_rb = node_ymm.get(b).copied().flatten();
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    if b != a {
+                        free_if_dying(b, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    }
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if let Some(rb) = opt_rb {
+                        emit_vex_ymm_rr(&mut code, vex_op, dst_reg, reg_a, rb);
+                    } else {
+                        emit_vex_ymm_rm_rbp(&mut code, vex_op, dst_reg, reg_a, disp_b);
+                    }
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    }
                 }
-                Opcode::Div => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vdivpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x5E, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, disp);
+                Opcode::Sqrt => {
+                    let opt_ra = node_ymm.get(a).copied().flatten();
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if let Some(ra) = opt_ra {
+                        emit_vex_ymm_rr(&mut code, 0x51, dst_reg, 0, ra);
+                    } else {
+                        emit_vex_ymm_rm_rbp(&mut code, 0x51, dst_reg, 0, disp_a);
+                    }
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    }
                 }
-                Opcode::Min => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vminpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::Max => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vmaxpd ymm0, ymm0, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::CmpGt => {
-                    // Load `b` into ymm0 and `a` into ymm1; `vcmpltpd ymm0, ymm0, ymm1` computes `b < a` (`a > b`).
-                    emit_load_ymm0_rbp(&mut code, disp_b);
-                    // vmovupd ymm1, ymmword ptr [rbp + disp_a]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
-                    code.extend_from_slice(&disp_a.to_le_bytes());
-                    // vcmpltpd ymm0, ymm0, ymm1 (C5 FD C2 C1 01)
-                    code.extend_from_slice(&[0xC5, 0xFD, 0xC2, 0xC1, 0x01]);
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::CmpLt => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vmovupd ymm1, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    // vcmpltpd ymm0, ymm0, ymm1 (C5 FD C2 C1 01)
-                    code.extend_from_slice(&[0xC5, 0xFD, 0xC2, 0xC1, 0x01]);
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::CmpEq => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vmovupd ymm1, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    // vcmpeqpd ymm0, ymm0, ymm1 (C5 FD C2 C1 00)
-                    code.extend_from_slice(&[0xC5, 0xFD, 0xC2, 0xC1, 0x00]);
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::SelectZero | Opcode::MaskAnd => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vmovupd ymm1, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    // vandpd ymm0, ymm0, ymm1 (C5 FD 54 C1)
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x54, 0xC1]);
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::MaskOr => {
-                    emit_load_ymm0_rbp(&mut code, disp_a);
-                    // vmovupd ymm1, ymmword ptr [rbp + disp_b]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x8D]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    // vorpd ymm0, ymm0, ymm1 (C5 FD 56 C1)
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x56, 0xC1]);
-                    emit_store_ymm0_rbp(&mut code, disp);
+                Opcode::Floor | Opcode::Ceil => {
+                    let imm8 = if frame.opcode == Opcode::Floor {
+                        0x09u8
+                    } else {
+                        0x0Au8
+                    };
+                    let opt_ra = node_ymm.get(a).copied().flatten();
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if let Some(ra) = opt_ra {
+                        emit_vex_roundpd_rr(&mut code, dst_reg, ra, imm8);
+                    } else {
+                        emit_vex_roundpd_rm_rbp(&mut code, dst_reg, disp_a, imm8);
+                    }
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    }
                 }
                 Opcode::Abs => {
+                    if let Some(ra) = node_ymm.get(a).copied().flatten() {
+                        emit_store_ymm_rbp(&mut code, ra, disp_a);
+                    }
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
                     // Clear IEEE-754 sign bit (bit 63) across all 4 f64 lanes.
                     for lane_off in [0i32, 8, 16, 24] {
                         let sa = disp_a.saturating_add(lane_off);
@@ -800,28 +1155,16 @@ fn emit_x86_64_machine_code(
                         code.extend_from_slice(&[0x48, 0x89, 0x85]);
                         code.extend_from_slice(&sd.to_le_bytes());
                     }
-                }
-                Opcode::Sqrt => {
-                    // vsqrtpd ymm0, ymmword ptr [rbp + disp_a]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x51, 0x85]);
-                    code.extend_from_slice(&disp_a.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::Floor => {
-                    // vroundpd ymm0, ymmword ptr [rbp + disp_a], 0x09 (round toward -inf)
-                    code.extend_from_slice(&[0xC4, 0xE3, 0x7D, 0x09, 0x85]);
-                    code.extend_from_slice(&disp_a.to_le_bytes());
-                    code.push(0x09);
-                    emit_store_ymm0_rbp(&mut code, disp);
-                }
-                Opcode::Ceil => {
-                    // vroundpd ymm0, ymmword ptr [rbp + disp_a], 0x0A (round toward +inf)
-                    code.extend_from_slice(&[0xC4, 0xE3, 0x7D, 0x09, 0x85]);
-                    code.extend_from_slice(&disp_a.to_le_bytes());
-                    code.push(0x0A);
-                    emit_store_ymm0_rbp(&mut code, disp);
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if dst_reg != 0 {
+                        emit_load_ymm_rbp(&mut code, dst_reg, disp);
+                    }
                 }
                 Opcode::Ln => {
+                    if let Some(ra) = node_ymm.get(a).copied().flatten() {
+                        emit_store_ymm_rbp(&mut code, ra, disp_a);
+                    }
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
                     for lane_off in [0i32, 8, 16, 24] {
                         emit_x87_ln_slot(
                             &mut code,
@@ -829,14 +1172,26 @@ fn emit_x86_64_machine_code(
                             disp.saturating_add(lane_off),
                         );
                     }
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if dst_reg != 0 {
+                        emit_load_ymm_rbp(&mut code, dst_reg, disp);
+                    }
                 }
                 Opcode::Exp => {
+                    if let Some(ra) = node_ymm.get(a).copied().flatten() {
+                        emit_store_ymm_rbp(&mut code, ra, disp_a);
+                    }
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
                     for lane_off in [0i32, 8, 16, 24] {
                         emit_x87_exp_slot(
                             &mut code,
                             disp_a.saturating_add(lane_off),
                             disp.saturating_add(lane_off),
                         );
+                    }
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+                    if dst_reg != 0 {
+                        emit_load_ymm_rbp(&mut code, dst_reg, disp);
                     }
                 }
                 Opcode::Gather
@@ -848,50 +1203,77 @@ fn emit_x86_64_machine_code(
             }
         }
 
-        // Alternate between even vector step (`rdx = 0`, lanes 0..4)
-        // and odd vector step (`rdx = 32`, lanes 4..8) to preserve exact 8-lane order for Sum.
-        // mov rdx, r11
-        code.extend_from_slice(&[0x4C, 0x89, 0xDA]);
-        // and edx, 1
-        code.extend_from_slice(&[0x83, 0xE2, 0x01]);
-        // shl rdx, 5 (rdx = 0 or 32)
-        code.extend_from_slice(&[0x48, 0xC1, 0xE2, 0x05]);
-        // inc r11
-        code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
-
-        // Accumulate each reduction's input column into its 256-bit reduction state.
-        for (red_k, spec) in reductions.iter().enumerate() {
-            let disp_red_in = node_disp(spec.reduce_input_idx);
-            let acc0 = red_acc_disp(node_count, red_k, 0);
+        if let [spec] = reductions {
+            let reg_in = if let Some(r) = node_ymm.get(spec.reduce_input_idx).copied().flatten() {
+                r
+            } else {
+                emit_load_ymm_rbp(&mut code, 0, node_disp(spec.reduce_input_idx));
+                0
+            };
             match spec.reduction {
                 AotReduction::Sum => {
-                    // vmovupd ymm0, ymmword ptr [rbp + rdx * 1 + acc0]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x84, 0x15]);
-                    code.extend_from_slice(&acc0.to_le_bytes());
-                    // vaddpd ymm0, ymm0, ymmword ptr [rbp + disp_red_in]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x58, 0x85]);
-                    code.extend_from_slice(&disp_red_in.to_le_bytes());
-                    // vmovupd ymmword ptr [rbp + rdx * 1 + acc0], ymm0
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x84, 0x15]);
-                    code.extend_from_slice(&acc0.to_le_bytes());
+                    // test r11b, 1
+                    code.extend_from_slice(&[0x41, 0xF6, 0xC3, 0x01]);
+                    // jnz +7 (skip 5-byte vaddpd ymm14 + 2-byte jmp)
+                    code.extend_from_slice(&[0x75, 0x07]);
+                    emit_vex_ymm_rr(&mut code, 0x58, 14, 14, reg_in);
+                    // jmp +5 (skip 5-byte vaddpd ymm15)
+                    code.extend_from_slice(&[0xEB, 0x05]);
+                    emit_vex_ymm_rr(&mut code, 0x58, 15, 15, reg_in);
+                    // inc r11
+                    code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
                 }
                 AotReduction::Max => {
-                    // Load input into ymm0 (`src1`) and accumulator `[rbp + acc0]` as `src2`:
-                    // x86 `vmaxpd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::max`).
-                    emit_load_ymm0_rbp(&mut code, disp_red_in);
-                    // vmaxpd ymm0, ymm0, ymmword ptr [rbp + acc0]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x85]);
-                    code.extend_from_slice(&acc0.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, acc0);
+                    // vmaxpd ymm14, ymm_reg_in, ymm14 (preserves non-NaN accumulator in src2)
+                    emit_vex_ymm_rr(&mut code, 0x5F, 14, reg_in, 14);
+                    // inc r11
+                    code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
                 }
                 AotReduction::Min => {
-                    // Load input into ymm0 (`src1`) and accumulator `[rbp + acc0]` as `src2`:
-                    // x86 `vminpd` returns `src2` on NaN, preserving the non-NaN accumulator (matching `f64::min`).
-                    emit_load_ymm0_rbp(&mut code, disp_red_in);
-                    // vminpd ymm0, ymm0, ymmword ptr [rbp + acc0]
-                    code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x85]);
-                    code.extend_from_slice(&acc0.to_le_bytes());
-                    emit_store_ymm0_rbp(&mut code, acc0);
+                    // vminpd ymm14, ymm_reg_in, ymm14 (preserves non-NaN accumulator in src2)
+                    emit_vex_ymm_rr(&mut code, 0x5D, 14, reg_in, 14);
+                    // inc r11
+                    code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
+                }
+            }
+        } else {
+            // Multi-reduction fallback: flush any register-allocated reduction inputs to stack slots
+            // and accumulate into `[rbp + acc0 + rdx]`.
+            for spec in reductions {
+                if let Some(r) = node_ymm.get(spec.reduce_input_idx).copied().flatten() {
+                    emit_store_ymm_rbp(&mut code, r, node_disp(spec.reduce_input_idx));
+                }
+            }
+            // mov rdx, r11; and edx, 1; shl rdx, 5; inc r11
+            code.extend_from_slice(&[0x4C, 0x89, 0xDA]);
+            code.extend_from_slice(&[0x83, 0xE2, 0x01]);
+            code.extend_from_slice(&[0x48, 0xC1, 0xE2, 0x05]);
+            code.extend_from_slice(&[0x49, 0xFF, 0xC3]);
+
+            for (red_k, spec) in reductions.iter().enumerate() {
+                let disp_red_in = node_disp(spec.reduce_input_idx);
+                let acc0 = red_acc_disp(node_count, red_k, 0);
+                match spec.reduction {
+                    AotReduction::Sum => {
+                        code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x84, 0x15]);
+                        code.extend_from_slice(&acc0.to_le_bytes());
+                        code.extend_from_slice(&[0xC5, 0xFD, 0x58, 0x85]);
+                        code.extend_from_slice(&disp_red_in.to_le_bytes());
+                        code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x84, 0x15]);
+                        code.extend_from_slice(&acc0.to_le_bytes());
+                    }
+                    AotReduction::Max => {
+                        emit_load_ymm0_rbp(&mut code, disp_red_in);
+                        code.extend_from_slice(&[0xC5, 0xFD, 0x5F, 0x85]);
+                        code.extend_from_slice(&acc0.to_le_bytes());
+                        emit_store_ymm0_rbp(&mut code, acc0);
+                    }
+                    AotReduction::Min => {
+                        emit_load_ymm0_rbp(&mut code, disp_red_in);
+                        code.extend_from_slice(&[0xC5, 0xFD, 0x5D, 0x85]);
+                        code.extend_from_slice(&acc0.to_le_bytes());
+                        emit_store_ymm0_rbp(&mut code, acc0);
+                    }
                 }
             }
         }
@@ -905,6 +1287,15 @@ fn emit_x86_64_machine_code(
 
         let avx2_exit_pos = code.len();
         patch_rel32(&mut code, ja_avx2_exit_patch_pos, avx2_exit_pos)?;
+
+        // Flush register-pinned primary reduction accumulators (`ymm14`, `ymm15`) back to stack
+        // slots before `vzeroupper` and scalar cleanup.
+        if reductions.len() == 1 {
+            emit_store_ymm_rbp(&mut code, 14, red_acc_disp(node_count, 0, 0));
+            if reductions.first().map(|s| s.reduction) == Some(AotReduction::Sum) {
+                emit_store_ymm_rbp(&mut code, 15, red_acc_disp(node_count, 0, 4));
+            }
+        }
 
         // Clear upper 128 bits of all YMM registers (`vzeroupper`) before scalar tail/reduction.
         code.extend_from_slice(&[0xC5, 0xF8, 0x77]);
@@ -923,9 +1314,11 @@ fn emit_x86_64_machine_code(
     code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
     let jae_exit_patch_pos = code.len() - 4;
 
-    // Emit native stencils for each live Column node.
+    // Emit native stencils for each loop-evaluated Column node.
     for (idx, frame) in program.nodes.iter().enumerate() {
-        if phases.get(idx).copied() != Some(AotNodePhase::Column) {
+        if !eval_in_loop.get(idx).copied().unwrap_or(false)
+            || phases.get(idx).copied() != Some(AotNodePhase::Column)
+        {
             continue;
         }
         let disp = node_disp(idx);
@@ -934,11 +1327,18 @@ fn emit_x86_64_machine_code(
 
         match frame.opcode {
             Opcode::ConstF64 => {}
-            Opcode::ArenaInput => {
+            Opcode::ArenaInput | Opcode::ArenaSlice => {
+                let meta = col_metas.get(idx).copied().unwrap_or(AotColMeta {
+                    origin_arena: None,
+                    slice_offset: 0,
+                    col_len: 0,
+                });
+                let orig_arena = meta.origin_arena.unwrap_or(frame.in_a as usize);
                 let arena_off = arena_byte_offsets
-                    .get(frame.in_a as usize)
+                    .get(orig_arena)
                     .copied()
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .saturating_add(meta.slice_offset.saturating_mul(8));
                 // mov rax, r12
                 code.extend_from_slice(&[0x4C, 0x89, 0xE0]);
                 if arena_off > 0 {
@@ -949,10 +1349,6 @@ fn emit_x86_64_machine_code(
                 }
                 // movsd xmm0, [rax + rcx * 8]
                 code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x04, 0xC8]);
-                emit_store_xmm0_rbp(&mut code, disp);
-            }
-            Opcode::ArenaSlice => {
-                emit_load_xmm0_rbp(&mut code, disp_a);
                 emit_store_xmm0_rbp(&mut code, disp);
             }
             Opcode::ArenaMutate | Opcode::FilterCompact => {
@@ -1084,16 +1480,41 @@ fn emit_x86_64_machine_code(
                     .proofs
                     .get(usize::from(frame.proof_idx.saturating_sub(1)))
                     .ok_or(AotError::UnsupportedGraph("missing gather ProofEntry"))?;
+                let target_meta =
+                    col_metas
+                        .get(frame.in_a as usize)
+                        .copied()
+                        .unwrap_or(AotColMeta {
+                            origin_arena: None,
+                            slice_offset: 0,
+                            col_len: 0,
+                        });
+                let target_arena_idx = target_meta
+                    .origin_arena
+                    .unwrap_or(usize::from(proof.target_arena));
                 let target_off = arena_byte_offsets
-                    .get(usize::from(proof.target_arena))
+                    .get(target_arena_idx)
                     .copied()
-                    .unwrap_or(0);
-                let bound_hi = u64::from(proof.bound_hi);
+                    .unwrap_or(0)
+                    .saturating_add(target_meta.slice_offset.saturating_mul(8));
+                let bound_hi = u64::from(proof.bound_hi).min(target_meta.col_len);
 
                 // Load index f64 into xmm0: movsd xmm0, [rbp + disp_b]
                 emit_load_xmm0_rbp(&mut code, disp_b);
                 // Convert f64 to signed 64-bit integer in rdx: cvttsd2si rdx, xmm0
                 code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2C, 0xD0]);
+                // Verify exact integer round-trip (`xmm0 == (f64)rdx` and not NaN) to reject
+                // fractional indices (`1.5`), negative fractions (`-0.5`), and NaN/Inf:
+                // xorpd xmm1, xmm1
+                code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xC9]);
+                // cvtsi2sd xmm1, rdx
+                code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0xCA]);
+                // ucomisd xmm0, xmm1
+                code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1]);
+                // jp +17 (NaN parity -> jump to exit(71))
+                code.extend_from_slice(&[0x7A, 0x11]);
+                // jne +15 (fractional/non-integer -> jump to exit(71))
+                code.extend_from_slice(&[0x75, 0x0F]);
                 // Bounds check: cmp rdx, bound_hi (unsigned comparison catches < 0 and >= bound_hi)
                 code.extend_from_slice(&[0x48, 0xB8]);
                 code.extend_from_slice(&bound_hi.to_le_bytes());
@@ -1399,6 +1820,39 @@ fn emit_x86_64_machine_code(
     Ok(code)
 }
 
+fn free_if_dying(
+    src_node: usize,
+    cur_idx: usize,
+    last_use: &[usize],
+    free_ymm_mask: &mut u16,
+    node_ymm: &mut [Option<u8>],
+) {
+    if last_use.get(src_node).copied() == Some(cur_idx) {
+        if let Some(slot) = node_ymm.get_mut(src_node) {
+            if let Some(reg) = *slot {
+                *free_ymm_mask |= 1u16 << reg;
+                *slot = None;
+            }
+        }
+    }
+}
+
+fn alloc_ymm_slot(node_idx: usize, free_ymm_mask: &mut u16, node_ymm: &mut [Option<u8>]) -> u8 {
+    if *free_ymm_mask != 0 {
+        let reg = u8::try_from(free_ymm_mask.trailing_zeros()).unwrap_or(0);
+        *free_ymm_mask &= !(1u16 << reg);
+        if let Some(slot) = node_ymm.get_mut(node_idx) {
+            *slot = Some(reg);
+        }
+        reg
+    } else {
+        if let Some(slot) = node_ymm.get_mut(node_idx) {
+            *slot = None;
+        }
+        0
+    }
+}
+
 fn node_disp(node_idx: usize) -> i32 {
     let idx_i32 = i32::try_from(node_idx).unwrap_or(0);
     (-128i32).saturating_sub(idx_i32.saturating_mul(32))
@@ -1415,16 +1869,80 @@ fn red_acc_disp(node_count: usize, red_k: usize, lane: i32) -> i32 {
     red_base.saturating_add(lane.saturating_mul(8))
 }
 
-fn emit_load_ymm0_rbp(code: &mut Vec<u8>, disp: i32) {
-    // vmovupd ymm0, ymmword ptr [rbp + disp32]
-    code.extend_from_slice(&[0xC5, 0xFD, 0x10, 0x85]);
+fn emit_load_ymm_rax_rcx8(code: &mut Vec<u8>, dst: u8) {
+    // vmovupd ymm_dst, ymmword ptr [rax + rcx * 8]
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let byte1 = r_inv | 0x61; // ~X = 1, ~B = 1, mmmmm = 0x01 (0F)
+    let byte2 = 0x7D; // W = 0, ~vvvv = 1111, L = 1 (256b), pp = 01 (0x66)
+    let modrm = 0x04 | ((dst & 7) << 3);
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0x10, modrm, 0xC8]);
+}
+
+fn emit_load_ymm_rbp(code: &mut Vec<u8>, dst: u8, disp: i32) {
+    // vmovupd ymm_dst, ymmword ptr [rbp + disp32]
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let byte1 = r_inv | 0x61;
+    let byte2 = 0x7D;
+    let modrm = 0x85 | ((dst & 7) << 3);
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0x10, modrm]);
     code.extend_from_slice(&disp.to_le_bytes());
 }
 
-fn emit_store_ymm0_rbp(code: &mut Vec<u8>, disp: i32) {
-    // vmovupd ymmword ptr [rbp + disp32], ymm0
-    code.extend_from_slice(&[0xC5, 0xFD, 0x11, 0x85]);
+fn emit_store_ymm_rbp(code: &mut Vec<u8>, src: u8, disp: i32) {
+    // vmovupd ymmword ptr [rbp + disp32], ymm_src
+    let r_inv = if (src & 8) == 0 { 0x80 } else { 0x00 };
+    let byte1 = r_inv | 0x61;
+    let byte2 = 0x7D;
+    let modrm = 0x85 | ((src & 7) << 3);
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0x11, modrm]);
     code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_vex_ymm_rr(code: &mut Vec<u8>, opcode: u8, dst: u8, src1: u8, src2: u8) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let b_inv = if (src2 & 8) == 0 { 0x20 } else { 0x00 };
+    let byte1 = r_inv | 0x40 | b_inv | 0x01; // mmmmm = 0x01 (0F)
+    let vvvv_inv = (!src1) & 0x0F;
+    let byte2 = (vvvv_inv << 3) | 0x05; // L = 1 (256b), pp = 01 (0x66)
+    let modrm = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
+    code.extend_from_slice(&[0xC4, byte1, byte2, opcode, modrm]);
+}
+
+fn emit_vex_ymm_rm_rbp(code: &mut Vec<u8>, opcode: u8, dst: u8, src1: u8, disp: i32) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let byte1 = r_inv | 0x61; // ~X = 1, ~B = 1 (rbp), mmmmm = 0x01 (0F)
+    let vvvv_inv = (!src1) & 0x0F;
+    let byte2 = (vvvv_inv << 3) | 0x05; // L = 1 (256b), pp = 01 (0x66)
+    let modrm = 0x85 | ((dst & 7) << 3);
+    code.extend_from_slice(&[0xC4, byte1, byte2, opcode, modrm]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_vex_roundpd_rr(code: &mut Vec<u8>, dst: u8, src: u8, imm8: u8) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let b_inv = if (src & 8) == 0 { 0x20 } else { 0x00 };
+    let byte1 = r_inv | 0x40 | b_inv | 0x03; // mmmmm = 0x03 (0F 3A)
+    let byte2 = 0x7D; // ~vvvv = 1111, L = 1, pp = 01 (0x66)
+    let modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0x09, modrm, imm8]);
+}
+
+fn emit_vex_roundpd_rm_rbp(code: &mut Vec<u8>, dst: u8, disp: i32, imm8: u8) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let byte1 = r_inv | 0x63; // ~X = 1, ~B = 1, mmmmm = 0x03 (0F 3A)
+    let byte2 = 0x7D;
+    let modrm = 0x85 | ((dst & 7) << 3);
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0x09, modrm]);
+    code.extend_from_slice(&disp.to_le_bytes());
+    code.push(imm8);
+}
+
+fn emit_load_ymm0_rbp(code: &mut Vec<u8>, disp: i32) {
+    emit_load_ymm_rbp(code, 0, disp);
+}
+
+fn emit_store_ymm0_rbp(code: &mut Vec<u8>, disp: i32) {
+    emit_store_ymm_rbp(code, 0, disp);
 }
 
 fn emit_load_xmm0_rbp(code: &mut Vec<u8>, disp: i32) {

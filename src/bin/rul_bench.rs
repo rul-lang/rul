@@ -21,7 +21,10 @@ use std::hint::black_box;
 use std::io::Read;
 use std::time::Instant;
 
-use rul::aot::{compile_rl_to_executable, compile_to_elf64_bytes, run_compiled_executable};
+use rul::aot::{
+    compile_rl_to_executable, compile_to_elf64_bytes, run_compiled_executable,
+    write_arena_data_file,
+};
 use rul::bytecode::{
     ArenaDescriptor, ExecPolicy, NodeFrame, Opcode, RulProgram, ScheduleHint, TokenOp, TypeLane,
     CAP_NONE,
@@ -157,6 +160,35 @@ fn build_rl_pipeline(
         )
         .map_err(|e| e.to_string())?;
     builder.finish("$contract").map_err(|e| e.to_string())
+}
+
+fn build_horner50_pipeline(elem_count: u32, policy: ExecPolicy) -> Result<RulProgram, String> {
+    let mut b = SymbolicGraphBuilder::new(CAP_NONE);
+    let a0 = b.add_arena(elem_count, TypeLane::F64X8, false);
+    let s = ScheduleHint {
+        fusion_group: 1,
+        policy,
+    };
+    b.emit_arena_input("$x", a0, 1, s)
+        .map_err(|e| e.to_string())?;
+    b.emit_const_f64("$c0", 1.000_001, s)
+        .map_err(|e| e.to_string())?;
+    b.emit_const_f64("$c1", 0.999_999, s)
+        .map_err(|e| e.to_string())?;
+    let mut acc = "$c0".to_owned();
+    for step in 0..50usize {
+        let m = format!("$m{step}");
+        let a = format!("$a{step}");
+        let c = if (step & 1) == 0 { "$c1" } else { "$c0" };
+        b.emit_binary_op(&m, Opcode::Mul, TypeLane::F64X8, &acc, "$x", s)
+            .map_err(|e| e.to_string())?;
+        b.emit_binary_op(&a, Opcode::Add, TypeLane::F64X8, &m, c, s)
+            .map_err(|e| e.to_string())?;
+        acc = a;
+    }
+    b.emit_unary_op("$sum", Opcode::ReduceSum, TypeLane::F64_SCALAR, &acc, s)
+        .map_err(|e| e.to_string())?;
+    b.finish("$sum").map_err(|e| e.to_string())
 }
 
 fn build_large_synthetic_graph(node_count: usize) -> RulProgram {
@@ -540,6 +572,46 @@ fn main() -> Result<(), String> {
     // 5. Run the 10-Pipeline Differential Suite across diverse operations & proof certificates
     let suite_reports = run_10_pipeline_suite(100_000).map_err(|e| e.to_string())?;
     print!("{}", format_suite10_table(&suite_reports));
+
+    // 6. Run BM-HORNER-50 (50-Step Horner Polynomial, 104 SSA Nodes)
+    let horner_elems: u32 = 100_000;
+    let horner_prog = build_horner50_pipeline(horner_elems, ExecPolicy::SimdStream)?;
+    let horner_x: Vec<f64> = (0..horner_elems)
+        .map(|i| 0.5 + (f64::from(i % 16) * 0.025))
+        .collect();
+    let horner_exe = "target/horner50_aot";
+    let horner_data = "target/horner50_data.bin";
+    let horner_aot_rep =
+        compile_rl_to_executable(&horner_prog, horner_exe).map_err(|e| e.to_string())?;
+    write_arena_data_file(horner_data, &[&horner_x]).map_err(|e| e.to_string())?;
+    let (h_t2_val, h_t2_stats) =
+        bench_runs(
+            2,
+            7,
+            (horner_elems as usize) * 8,
+            || match execute_tier2_fused(black_box(&horner_prog), &[black_box(&horner_x)])
+                .map(|r| r.output)
+            {
+                Ok(RuntimeValue::Scalar(v)) => v,
+                _ => f64::NAN,
+            },
+        );
+    let (h_aot_val, h_aot_stats) = bench_runs(2, 7, (horner_elems as usize) * 8, || {
+        run_compiled_executable(horner_exe, horner_data).unwrap_or(f64::NAN)
+    });
+    println!(
+        "\n=== 4. BM-HORNER-50 (50-STEP HORNER POLYNOMIAL, 104 SSA NODES, {horner_elems} ELEMS) ==="
+    );
+    println!(
+        "  AOT ELF64 Size     : {} B (MachineCode={} B, Compile={} ns)",
+        horner_aot_rep.elf_bytes,
+        horner_aot_rep.machine_code_bytes,
+        horner_aot_rep.total_compile_ns
+    );
+    println!(
+        "  Tier 2 Fused (1C)  : {:.2} ms (Val={h_t2_val:.6e}) | AOT Native ELF64 : {:.2} ms (Val={h_aot_val:.6e})",
+        h_t2_stats.median_ms, h_aot_stats.median_ms
+    );
 
     Ok(())
 }
