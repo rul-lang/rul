@@ -393,13 +393,17 @@ fn verify_node_semantics(
                         node_idx,
                         kind: VerifyErrorKind::UnknownArena(u32::from(proof.target_arena)),
                     })?;
-            if proof.bound_hi > target_arena.element_count {
+            let effective_src_len = match src_meta.shape {
+                ValueShape::Column(n) => n.min(target_arena.element_count),
+                _ => target_arena.element_count,
+            };
+            if proof.bound_hi > effective_src_len {
                 return Err(VerifyDiagnostic {
                     node_idx,
                     kind: VerifyErrorKind::InvalidRefinementProof {
                         proof_idx: frame.proof_idx,
                         bound_hi: proof.bound_hi,
-                        arena_len: target_arena.element_count,
+                        arena_len: effective_src_len,
                     },
                 });
             }
@@ -647,13 +651,17 @@ fn verify_node_semantics(
                         node_idx,
                         kind: VerifyErrorKind::UnknownArena(u32::from(proof.target_arena)),
                     })?;
-            if proof.bound_hi > target_arena.element_count {
+            let effective_target_len = match target_meta.shape {
+                ValueShape::Column(n) => n.min(target_arena.element_count),
+                _ => target_arena.element_count,
+            };
+            if proof.bound_hi > effective_target_len {
                 return Err(VerifyDiagnostic {
                     node_idx,
                     kind: VerifyErrorKind::InvalidRefinementProof {
                         proof_idx: frame.proof_idx,
                         bound_hi: proof.bound_hi,
-                        arena_len: target_arena.element_count,
+                        arena_len: effective_target_len,
                     },
                 });
             }

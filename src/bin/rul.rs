@@ -35,6 +35,10 @@ use rul::verifier::verify_program;
 
 const RUL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Maximum allowed byte size for an input `.bin` columnar arena data file (`1 GiB`),
+/// allowing 10M+ `f64` element benchmark arenas (`80 MB+`) while bounding memory usage.
+const MAX_ARENA_DATA_BYTES: u64 = 1024 * 1024 * 1024;
+
 const DEFAULT_MAIN_RLS: &str = r#"# Rul Flat Symbolic IR (.rls) — Zero Rust / Zero Cargo
 # Computes: sum_{x > 100.0} (x * x) on a 4,096-element f64 Columnar Arena
 cap 0x0
@@ -89,10 +93,16 @@ fn read_bounded_utf8(path: &Path) -> Result<String, String> {
 fn read_bounded_f64_column(path: &Path, expected_len: usize) -> Result<Vec<f64>, String> {
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let mut raw = Vec::new();
-    let max_limit = MAX_RL_FILE_BYTES;
+    let max_limit = MAX_ARENA_DATA_BYTES;
     file.take(max_limit.saturating_add(1))
         .read_to_end(&mut raw)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > max_limit {
+        return Err(format!(
+            "arena file {} exceeds maximum size limit ({MAX_ARENA_DATA_BYTES} bytes)",
+            path.display()
+        ));
+    }
     let expected_bytes = expected_len.saturating_mul(8);
     if raw.len() < expected_bytes {
         return Err(format!(
@@ -496,7 +506,8 @@ mod tests {
         ";
         let prog_two = assemble_rls(rls_two).map_err(|e| e.to_string())?;
 
-        let tmp_dir = std::env::temp_dir().join("rul_cli_test_arenas_dir");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rul_cli_test_arenas_dir_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
 
@@ -563,5 +574,35 @@ mod tests {
         assert!(!scalars_equivalent(f64::INFINITY, 1.0));
         assert!(scalars_equivalent(1000.0, 1000.0 + 1e-7));
         assert!(!scalars_equivalent(0.874_586, 20_726_104.0));
+    }
+
+    #[test]
+    fn test_p0_bug4_max_arena_data_bytes_1gib_limit() -> Result<(), String> {
+        assert_eq!(MAX_ARENA_DATA_BYTES, 1024 * 1024 * 1024);
+        // Verify that an arena data file exceeding the 16 MiB `.rl` bytecode limit
+        // (`MAX_RL_FILE_BYTES = 16,777,216` bytes) — here 2,100,000 f64 elements (16,800,000 bytes) —
+        // is cleanly accepted and read back by `read_bounded_f64_column`.
+        let elem_count = 2_100_000usize;
+        let byte_len = elem_count * 8;
+        assert!(byte_len > MAX_RL_FILE_BYTES as usize);
+        let tmp_path = std::env::temp_dir().join(format!(
+            "rul_cli_test_large_arena_{}.bin",
+            std::process::id()
+        ));
+        let mut raw = vec![0u8; byte_len];
+        if let Some(first8) = raw.get_mut(0..8) {
+            first8.copy_from_slice(&42.5_f64.to_le_bytes());
+        }
+        if let Some(last8) = raw.get_mut((byte_len - 8)..byte_len) {
+            last8.copy_from_slice(&99.25_f64.to_le_bytes());
+        }
+        fs::write(&tmp_path, &raw).map_err(|e| e.to_string())?;
+        let col_res = read_bounded_f64_column(&tmp_path, elem_count);
+        let _ = fs::remove_file(&tmp_path);
+        let col = col_res?;
+        assert_eq!(col.len(), elem_count);
+        assert_eq!(col.first().copied(), Some(42.5));
+        assert_eq!(col.last().copied(), Some(99.25));
+        Ok(())
     }
 }
