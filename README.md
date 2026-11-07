@@ -6,40 +6,51 @@
   </picture>
 </p>
 
-# Rul (`.rl`) — The AI-Native 128-Bit Binary Programming Language & Execution Engine
+# Rul (`.rl`) — A 128-Bit Binary Programming Language for AI Agents
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23722094.svg)](https://doi.org/10.5281/zenodo.23722094)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](./LICENSE-APACHE)
-[![Spec: Rul v0.4](https://img.shields.io/badge/Spec-.rl%20v0.4%20(128--bit%20SSA--DAG)-success.svg)](./docs/rul_spec_v0.md)
-[![Whitepaper: v0.1](https://img.shields.io/badge/Whitepaper-Rul%20v0.1%20(Zenodo%20Open%20Archive)-orange.svg)](./docs/WHITEPAPER_RUL_V0_1.md)
+[![Spec: Rul v0.4](https://img.shields.io/badge/Spec-.rl%20v0.4%20(128--bit%20Binary%20IR)-success.svg)](./docs/rul_spec_v0.md)
+[![Roadmap: v1.0](https://img.shields.io/badge/Roadmap-v0.4%20to%20v1.0-informational.svg)](./ROADMAP.md)
+[![Whitepaper: v0.1](https://img.shields.io/badge/Whitepaper-Zenodo%20Open%20Archive-orange.svg)](./docs/WHITEPAPER_RUL_V0_1.md)
 
-> **"A programming language where humans never need to learn the syntax—and even its creator doesn't need to know or type its syntax. Eliminate ASCII source code and compiler search passes with a 128-bit Schedule- and Proof-Carrying Binary Graph (`.rl`)."**
-> — *Tran Trong Tri (Tymon Tran), Creator of Rul*
+## What is Rul in Plain English?
 
-**Rul (`.rl` — Rule-Carrying Unified Linear Graph)** is a new programming language and execution engine designed from first principles **for Autonomous AI Agents** operating on high-throughput **Dataflow, Vector & Columnar Compute Kernels**.
+Languages like C, Go, and Rust were built for humans typing text at a keyboard. When an AI agent writes Rust or C today, it outputs thousands of characters of text, and the compiler (`rustc` or `LLVM`) spends seconds parsing that text, checking memory rules, and searching for loop optimizations.
+
+**Rul (`.rl`)** removes the human text layer. Instead of writing text source files, an AI agent emits a compact list of fixed **16-byte (128-bit) binary instructions**. Every 16-byte instruction carries three pieces of information up front:
+
+1. **The operation** (such as add, compare, filter, or reduce).
+2. **How to run it on the CPU** (a 1-byte schedule hint selecting single-core SIMD or multi-core execution).
+3. **A memory safety tag** (a version number and bounds index proving the memory access is valid).
+
+Because the AI provides the CPU schedule and safety tags inside each instruction, the Rul compiler does not need to guess or run slow optimization passes:
+- **Fast safety checks**: Rul verifies memory ownership, array bounds, termination, and I/O permissions in a single forward pass (**~5.8 nanoseconds per instruction**, or under 60 microseconds for 10,000 instructions).
+- **Microsecond native compilation**: Rul compiles verified `.rl` programs directly into standalone Linux `x86_64` executables (**628 to 1,037 bytes**) in **~6.4 microseconds**, without LLVM or an external linker.
+- **Easy for humans to inspect**: Humans never need to write `.rl` by hand, but can inspect any program at any time using `rul decompile` (readable text view) or `rul trace` (which prints the exact `min`, `max`, `sum`, and `NaN` count at every step).
 
 ---
 
-## ⚡ 30-Second Quickstart & White-Box Trace (`Zero-Cargo` Workflow)
+## 30-Second Quickstart
 
-Install the standalone `rul` binary and create, verify, AOT-compile, run, and white-box trace a pure `.rl` project in 30 seconds—**without `Cargo.toml` or `rustc`**:
+Install the standalone `rul` binary and create, verify, compile, run, and trace a `.rl` program in 30 seconds (no `Cargo.toml` or `rustc` required to run `.rl` projects):
 
 ```bash
-# 1. Install the standalone `rul` toolchain
+# 1. Install the standalone rul toolchain
 curl -fsSL https://raw.githubusercontent.com/rul-lang/rul/main/install.sh | sh
 
-# 2. Scaffold a pure Rul project (`rul.toml`, `src/main.rls`, `data/arena_0.bin`)
+# 2. Create a sample Rul project (rul.toml, src/main.rls, data/arena_0.bin)
 rul new my-ai-pipeline && cd my-ai-pipeline
 
-# 3. Verify in O(N), compile a standalone 880-byte Linux ELF64 AVX2 binary, and run
+# 3. Verify in microseconds, compile a standalone ~880-byte Linux ELF64 binary, and run
 rul check
 rul run
 
-# 4. Run White-Box Execution Trace to inspect min/max/sum/NaN at every SSA node #0..#6
+# 4. Inspect the exact min/max/sum/NaN output at every step (#0..#6)
 rul trace
 ```
 
-**Example Symbolic IR (`src/main.rls` — 7 instructions = `208 bytes` in binary `.rl`)**:
+**Readable Assembly View (`src/main.rls` — 7 instructions = `208 bytes` in binary `.rl`)**:
 ```text
 cap 0x0
 arena 0 len=4096 lane=f64x8 mut=false align=64 ver=1
@@ -53,7 +64,7 @@ node $n6 = AssertContract f64x1 fg=1 pol=simd proof=0 tok=pure a=$n5 b=0
 output $n6
 ```
 
-**Output of `rul trace` (Deterministic White-Box Node Inspector)**:
+**Output of `rul trace` (Step-by-Step Inspector)**:
 ```text
 === RUL (.rl) WHITE-BOX EXECUTION TRACE (7 SSA Nodes) ===
 NODE   OPCODE          LIVE  KIND             LEN          MIN          MAX      SUM/TRUES NAN/INF  SAMPLE[0..4]
@@ -66,171 +77,164 @@ NODE   OPCODE          LIVE  KIND             LEN          MIN          MAX     
 #6     AssertContract  yes   Scalar             1 77999800.0000 77999800.0000  77999800.0000       0  [77999800.000]
 ```
 
-### Breaking the "Impossible Triangle" of Programming Languages
+---
 
-Traditional languages (`C`, `Go`, `Rust`, `Python`) were engineered for human eyes and 10 fingers (~40 bits/sec keyboard bandwidth), forcing a trade-off between **Safety**, **Runtime Speed**, and **Compilation Speed**. By removing human textual syntax from the core execution pipeline, **Rul (`.rl`)** achieves all three simultaneously:
+## How Rul Achieves Safety, Runtime Speed, and Microsecond Compilation Together
 
-1. **Zero Human Syntax & Smaller Than a Tweet (`0% Syntax Errors`)**:
-   - Humans never write `.rl` syntax; AI Agents emit fixed **16-byte (128-bit) `NodeFrame`** binary instructions directly (`Algorithm + ScheduleHint + Proof`).
-   - A complete 10-million-row financial risk pipeline is just **`192 bytes`** in `.rl` (smaller than a single 280-character Tweet) and compiles into a standalone **`817-byte`** Linux `ELF64` native binary (over **3,000x smaller** than a standard Go/Rust binary).
-2. **Compilation & Verification `10,000x+` Faster Than Go (`Microseconds vs. Hundreds of Milliseconds`)**:
-   - Because AI Agents attach explicit schedule hints and safety witnesses to every instruction, the Rul compiler performs **zero parsing, zero type inference, and zero LLVM search passes**:
-   - **Single-Pass $O(N)$ Verification**: **`5.78 ns / instruction`** (`57.8 µs` for 10,000 nodes = **`2.77 GB/s`**).
-   - **Direct In-RAM `x86_64` AVX2 `ELF64` AOT Compilation**: **`6.38 µs` (`0.00638 ms`)** with zero external linker or LLVM dependency.
-3. **Safety Matching or Exceeding Rust—Without Reading the AI's Code**:
-   - **$O(1)$/node Linear Ownership**: Enforces exclusive `AffineConsume` and shared `ReadLease` tokens (0% use-after-consume or aliasing without a slow borrow-checker solver).
-   - **0% Runtime Bounds Checks**: Proven safe at load time via `Arena<Shape>` and sidecar `ProofEntry` witnesses.
-   - **100% Guaranteed Termination & Hardware Sandbox**: Topological SSA-DAG (`in_a < current_node`) prevents infinite loops, and the 64-bit Header `CapabilityMask` mathematically blocks unauthorized network/disk I/O.
-4. **Runtime Faster Than Hand-Written C on Data Pipelines (`51.53 GB/s` Effective Bandwidth)**:
-   - Mandates 64-byte aligned **Columnar SoA Arenas**, fuses multi-stage `Filter + Map + Reduce` pipelines into single-pass SIMD register loops (`0 bytes` intermediate RAM), and skips cold L1-cache tiles in $O(1)$ via `ArenaZoneMap`.
-   - AI Agents can mutate a **single byte (`ScheduleHint`)** based on hardware telemetry feedback (`autotune_schedule`) to scale from single-core SIMD to multi-core + L1 Zone-Map execution automatically.
+Traditional languages force a trade-off between memory safety, runtime speed, and compile time because the compiler has to infer what the human programmer meant. Rul avoids that trade-off through four simple mechanisms:
 
-$$\text{Artifact (}\mathtt{.rl}\text{)} = \text{Algorithm} + \text{Schedule} + \text{Proof}$$
-$$\text{Rul Engine} = \text{Single-Pass } O(N) \text{ Verifier} + O(N) \text{ Vector Fuser / Direct ELF64 AOT Compiler}$$
+1. **No Text Parsing (`0%` Syntax Errors)**:
+   - AI agents emit 16-byte binary instructions directly (or assemble flat `.rls` listings in ~8.8 microseconds).
+   - A 7-step pipeline over 10 million numbers is **`192 bytes`** in `.rl` and compiles into a standalone **`817-byte`** Linux `ELF64` binary.
+2. **Versioned Memory Buffers Instead of a Slow Borrow Checker**:
+   - Every memory buffer (`Arena`) starts at version `1`.
+   - Multiple instructions can read version `1` at the same time (`ReadLease`).
+   - If an instruction modifies a mutable buffer in place (`AffineConsume`), it consumes version `1` and advances the buffer to version `2`. Any later instruction that still tries to read or write version `1` is rejected immediately.
+   - This gives AI-generated code Rust-grade protection against use-after-free and aliasing bugs in a single linear scan (`5.78 ns/instruction`).
+3. **Compile-Time Bounds Proofs and Hardware Capability Bits**:
+   - Operations on matching array lengths need zero runtime bounds checks. Sub-slices (`ArenaSlice`) and indirect lookups (`Gather`) reference a 16-byte `ProofEntry` table checked at load time.
+   - The 64-byte file header includes a `CapabilityMask` bitfield. When set to `0x0` (`CAP_NONE`), instructions that perform external I/O are rejected before the program can run.
+4. **Cache-Friendly Columnar Memory and Single-Byte Schedule Tuning**:
+   - Data is stored in 64-byte-aligned columnar arrays (`Structure-of-Arrays`) so CPU vector registers only load the fields they actually use.
+   - Changing a single byte (`ScheduleHint`) switches execution from single-core SIMD (`pol=simd`) to all CPU cores (`pol=multicore`) without rewriting the algorithm.
 
 ---
 
-## Production Benchmark & Ablation Study (`10,000,000` `f64` Records = `80 MB` SoA)
+## Benchmark (`10,000,000` `f64` Elements = `80 MB` Array)
+
+Workload: Filter elements `> 1000.0`, square matching values, and sum to a scalar.
 
 | Implementation | Execution Mode | Median Latency | Effective Logical Bandwidth | Speedup vs. C 8-Acc (1-Core) | Speedup vs. Legacy AoS |
 | :--- | :--- | ---: | ---: | ---: | ---: |
-| `[A]` Legacy Imperative AoS + `Vec::collect()` | 1-Core AoS + Heap | `70.66 ms` | `1.13 GB/s` | `0.10x` | `1.00x` |
+| `[A]` Imperative AoS + `Vec::collect()` | 1-Core AoS + Heap | `70.66 ms` | `1.13 GB/s` | `0.10x` | `1.00x` |
 | `[B]` Idiomatic Rust SoA (`filter().map().sum()`) | 1-Core SoA Iterator | `19.12 ms` | `4.18 GB/s` | `0.38x` | `3.70x` |
-| `[C]` Hand-Written C/Rust 8-Acc SoA | **1-Core 8-Lane Unrolled** | `7.32 ms` | `10.92 GB/s` | **`1.00x` (Baseline)** | `9.65x` |
-| **`[D]` Rul (`.rl`) Tier 2 Fused SIMD** | **1-Core L1-Tile SIMD (`SimdStream`)** | **`5.91 ms`** | **`13.53 GB/s`** | **`1.24x` (Apples-to-Apples 1-Core)** | **`11.95x`** |
-| **`[E]` Rul (`.rl`) Tier 2 Auto-MultiCore** | **All Cores (`MultiCore` 1-Byte Hint)** | **`3.19 ms`** | **`25.04 GB/s`** | **`2.29x` (Schedule Mutation)** | **`22.12x`** |
-| **`[F]` Rul (`.rl`) Tier 2 MultiCore + ZoneMap** | **All Cores + $O(1)$ Tile Skipping** | **`1.55 ms`** | **`51.53 GB/s`** | **`4.72x` (Logical Scan Speedup)** | **`45.51x`** |
+| `[C]` Hand-Written C/Rust 8-Accumulator SoA | **1-Core 8-Lane Unrolled** | `7.32 ms` | `10.92 GB/s` | **`1.00x` (Baseline)** | `9.65x` |
+| **`[D]` Rul (`.rl`) Tier 2 Fused SIMD** | **1-Core L1-Tile SIMD (`SimdStream`)** | **`5.91 ms`** | **`13.53 GB/s`** | **`1.24x` (1-Core vs. 1-Core)** | **`11.95x`** |
+| **`[E]` Rul (`.rl`) Tier 2 MultiCore** | **All Cores (`MultiCore` 1-Byte Hint)** | **`3.19 ms`** | **`25.04 GB/s`** | **`2.29x` (Schedule Mutation)** | **`22.12x`** |
+| **`[F]` Rul (`.rl`) Tier 2 MultiCore + ZoneMap** | **All Cores + `O(1)` Tile Skipping** | **`1.55 ms`** | **`51.53 GB/s`** | **`4.72x` (With Block Min/Max)** | **`45.51x`** |
 
-> **Methodology & Ablation Transparency**:
-> - **`[C]` vs. `[D]` (`1.24x`)** is the strict **1-Core vs. 1-Core** comparison on the exact same `80 MB` SoA array.
-> - **`[E]` (`2.29x`)** demonstrates Rul's **1-byte `ScheduleHint` mutation**: changing `pol=simd` (`0x11`) to `pol=multicore` (`0x12`) parallelizes L1 tiles across CPU cores with zero code changes and zero data-race risk (proven by `ReadLease` tokens).
-> - **`[F]` (`4.72x` / `51.53 GB/s` logical bandwidth)** demonstrates **Columnar Zone-Map Pruning (`ArenaZoneMap`)** on clustered/partitioned datasets: the engine skips cold 1,024-element L1 tiles in $O(1)$ without loading them from DRAM, achieving effective logical throughput above raw single-pass DRAM bandwidth.
+Notes on the numbers above:
+- **`[C]` vs. `[D]` (`1.24x`)** is the strict single-core comparison on the exact same `80 MB` array.
+- **`[E]` (`2.29x`)** changes only the 1-byte `ScheduleHint` from `pol=simd` (`0x11`) to `pol=multicore` (`0x12`), parallelizing 1,024-element L1 tiles across cores.
+- **`[F]` (`4.72x` / `51.53 GB/s` logical bandwidth)** adds block min/max metadata (`ArenaZoneMap`) on partitioned data so cold 1,024-element tiles that cannot match the filter are skipped in `O(1)` without reading them from RAM.
 
----
-
-## 🛡️ Maintainability & Zero Technical Debt at Scale (Why `.rl` Is Not a Black Box)
-
-A common question from systems architects is: *"If humans don't write `.rl` syntax, doesn't a large codebase become an unmaintainable black box where AI technical debt compounds?"*
-
-Rul eliminates AI technical debt through three structural mechanisms:
-
-1. **Humans Own the Logical Outline; `.rl` Kernels Are Disposable Artifacts**:
-   - In a production system, human architects maintain only the **Logical Outline** (~5% of traditional codebase size):
-     - **Data Schemas (`ArenaDescriptor`)**: Columnar types, lengths, alignment, and mutability.
-     - **Security Boundaries (`CapabilityMask`)**: Hardware I/O permissions (`CAP_NONE = 0x0` for pure compute).
-     - **Domain Contracts (`AssertContract` & Differential Oracles)**: Mathematical invariants on outputs.
-   - Because `.rl` verifies in **~5.8 nanoseconds/node** and compiles to native `ELF64` in **~6.4 microseconds**, you **never patch or accumulate technical debt inside old AI-generated code**. When requirements change, the AI Agent regenerates the `.rl` module from the updated Logical Outline and proves it in microseconds.
-2. **Orthogonal Separation of `Algorithm + Schedule + Proof` (`0%` Performance Spaghetti)**:
-   - In `C`/`Rust`, optimizing a hot path (manual SIMD intrinsics, L1 cache tiling, multi-threading, bounds-check elision) destroys readability and creates massive maintenance debt.
-   - In Rul, the **Algorithm** (`in_a`, `in_b`, `opcode`), **Hardware Schedule** (`schedule_hint`), and **Safety Proof** (`proof_idx`, `token_op`) occupy separate bitfields inside each 128-bit `NodeFrame`. Autotuning hardware performance (`rul autotune`) mutates **only Byte 2 (`schedule_hint`)**—leaving the business logic 100% untouched.
-3. **100% Deterministic White-Box Auditability (`rul inspect`, `rul decompile`, `rul trace`)**:
-   - Every `.rl` binary is a topological SSA-DAG (`in_a < current_node`) with **zero hidden global state, zero exceptions, and zero side-effecting loops**.
-   - At any time, engineers can run `rul decompile` (lossless `.rls` view), `rul inspect` (128-bit frame table), or `rul trace` (which prints exact `min`, `max`, `sum`, `NaN/Inf` counts, and sample values at **every intermediate SSA node `#0..#N-1`**). If node `#4` produces an unexpected value, you pinpoint it in 1 second without reading a single line of AI-written boilerplate.
+On deep arithmetic pipelines (`BM-HORNER-50`, a 50-step Horner polynomial with 104 SSA nodes over 10,000,000 `f64` elements), the linear-scan `YMM` register allocator in `src/aot.rs` compiles a `3,872-byte` `ELF64` binary in `~20.4 us` and executes in **`106.58 ms`**, matching hand-written 8-accumulator C/Rust (`107.96 ms`).
 
 ---
 
-## Why Rul (`.rl`) for AI Agents?
+## Why `.rl` Does Not Become an Unmaintainable Black Box
 
-| Architectural Dimension | C (`clang -O3`) | Go (`gc`) | Rust (`rustc + LLVM`) | **Rul (`.rl` — AI-Native)** |
+A common question is: *"If humans do not write `.rl` code, how do teams debug or maintain a system over time?"*
+
+1. **Humans Define the Boundaries; AI Agents Regenerate the Binary**:
+   - Human engineers define the input/output schemas (`ArenaDescriptor`), hardware permissions (`CapabilityMask`), and output assertions (`AssertContract`).
+   - Because verifying and compiling a `.rl` module takes microseconds, you never patch old AI-generated code. When requirements change, the AI regenerates the `.rl` module and verifies it from scratch.
+2. **Scheduling is Separate from Logic**:
+   - In C or Rust, adding SIMD intrinsics, cache tiling, and multi-threading tangles hardware tuning with business logic.
+   - In Rul, the operation (`opcode`, `in_a`, `in_b`), the CPU schedule (`schedule_hint`), and the safety tags (`proof_idx`, `token_op`) sit in separate fields of each 16-byte instruction. Running `rul autotune` updates only the schedule byte.
+3. **Built-In Step-by-Step Inspection (`rul trace`, `rul decompile`, `rul inspect`)**:
+   - At any time, engineers can run `rul decompile` to view the readable `.rls` listing or `rul trace` to inspect `min`, `max`, `sum`, `NaN/Inf` counts, and sample values at every instruction node `#0..#N-1`.
+
+---
+
+## Where Rul is Today (`v0.4.0`) and Roadmap to `v1.0`
+
+We intentionally restricted `v0.1` through `v0.4.0` to **array and vector dataflow pipelines** (`29 opcodes`) to prove the 16-byte binary instruction format, single-pass `O(N)` verifier, and zero-LLVM native `ELF64` compiler on real hardware first.
+
+We are now executing a four-milestone roadmap (see **[`ROADMAP.md`](./ROADMAP.md)**) to expand Rul from a columnar compute engine into a **general-purpose systems language capable of replacing Rust and Go for AI-generated software**:
+
+1. **Milestone 1 (`v0.5`): General-Purpose Control Flow, Functions, and Data Types**
+   - Expand the 16-byte instruction set to support general integers/bytes (`i64`, `i32`, `u8`), structs, UTF-8 strings, hash maps, conditional branches (`SelectBranch`), bounded loops with explicit termination fuel/variant proofs (`RegionLoop`), and modular function calls (`Call`).
+2. **Milestone 2 (`v0.6`–`v0.7`): General Heap Ownership and Struct Lifetimes in `O(N)` Time**
+   - Extend versioned memory tokens (`TokenOp`) and `ProofEntry` witnesses to verify region heap allocations, struct field borrows, and zero-copy slice lifetimes in a single pass.
+3. **Milestone 3 (`v0.8`–`v0.9`): Go-Style Deterministic Concurrency and Capability-Gated OS I/O**
+   - Add lightweight tasks and typed channels (where sending a buffer transfers its ownership token so data races are impossible without a garbage collector), plus fine-grained `CapabilityMask` checks for file, network socket, and subprocess system calls.
+4. **Milestone 4 (`v1.0`): Multi-Architecture Native Backends (`x86_64`, `ARM64`, `WASI`) and Formal Proofs**
+   - Emit standalone native binaries across `x86_64`, `AArch64` (`ARM64`), and WebAssembly (`WASI`) without LLVM, backed by Kani model-checking proofs and continuous differential fuzzing.
+
+---
+
+## Comparison: C vs. Go vs. Rust vs. Rul (`.rl`)
+
+| Dimension | C (`clang -O3`) | Go (`gc`) | Rust (`rustc + LLVM`) | **Rul (`.rl`)** |
 | :--- | :--- | :--- | :--- | :--- |
-| **Primary Author** | Human programmer | Human engineering teams | Human systems engineers | **100% Autonomous AI Agents** |
-| **Canonical Artifact** | Text (`.c`, `.h`) | Text (`.go`) | Text (`.rs`) | **Flat Binary `.rl` (16-Byte / 128-Bit Frames)** |
-| **Lex / Parse Overhead** | High | Medium | Very High (Macros, AST) | **0 ms (`mmap` zero-copy, 0% syntax errors)** |
-| **Memory Safety** | None (UB / UAF) | Garbage Collector (Latency spikes) | Borrow Checker (Constraint solver) | **Explicit `AffineToken` + `ReadLease` ($O(1)$/node)** |
-| **Bounds Checking** | Unchecked (Buffer overflow) | Runtime branch per access | Runtime branch (unless elided) | **0% Runtime Checks (`Arena<Shape>` + `ProofEntry`)** |
-| **Default Memory Layout** | AoS (`struct[]`) + heap | GC heap pointers | AoS (`Vec<Struct>`) | **100% 64B-Aligned Columnar SoA (`Arena`)** |
-| **Verify + Compile Time** | Seconds | Sub-second to seconds | Seconds to minutes | **`< 0.5 ms` Verify + `< 1 ms` Direct `ELF64` AOT** |
-| **Sandbox Security** | Full OS process | Full OS process | Full OS process (`unsafe` crates) | **Zero-Trust 64-Bit `CapabilityMask` in Header** |
-| **Feedback to AI Agent** | Text compiler errors | Text compiler errors | ASCII error spans | **Binary Diagnostic Frame + `HardwareTelemetry` Vector** |
+| **Primary Author** | Human programmer | Human engineering teams | Human systems engineers | **AI Agents (with human-auditable tools)** |
+| **Artifact Format** | Text (`.c`, `.h`) | Text (`.go`) | Text (`.rs`) | **Flat Binary `.rl` (16-Byte Instructions)** |
+| **Parse Overhead** | High | Medium | Very High (Macros, AST) | **0 ms (Direct binary load)** |
+| **Memory Safety** | None (Manual pointers) | Garbage Collector | Borrow Checker (Constraint solver) | **Versioned `TokenOp` (`O(1)` check per node)** |
+| **Bounds Checking** | Unchecked | Runtime branch per access | Runtime branch (unless elided) | **Load-time `Shape` + `ProofEntry` table** |
+| **Verify + Compile Time** | Seconds | Sub-second to seconds | Seconds to minutes | **`~5.8 ns/node` Verify + `~6.4 us` `ELF64` AOT** |
+| **Sandbox Security** | Full OS process | Full OS process | Full OS process (`unsafe` crates) | **64-Bit `CapabilityMask` in File Header** |
 
 ---
 
-## Core Architecture (6 Pillars)
+## Repository Architecture
 
-1. **128-Bit Fixed `NodeFrame` Binary Layout ([`src/bytecode.rs`](./src/bytecode.rs)) & Flat Symbolic IR ([`src/transpiler.rs`](./src/transpiler.rs))**:
-   - **64-byte `RulHeader`** (`magic = b"RUL\x00\x01\x00\x00\x00"`, integrity hash, 64-bit hardware `capability_mask`).
-   - **16-byte `ArenaDescriptor` Table** (64-byte aligned Columnar SoA memory regions).
-   - **16-byte `ProofEntry` Sidecar Table** (compile-time refinement witnesses for `ArenaSlice` and indirect `Gather`).
-   - **16-byte `NodeFrame` DAG**: `[ opcode (u8) | type_lane (u8) | schedule_hint (u8) | proof_idx (u8) | token_op (u32) | in_a (u32) | in_b (u32) ]`.
-   - **Zero-`rustc` `.rls` Assembler (`assemble_rls` / `program_to_rls`)**: Assembles flat symbolic `.rls` text into `.rl` binary graphs in **~8.8 µs** with 100% lossless round-trip.
-2. **Single-Pass $O(N)$ Linear Static Verifier ([`src/verifier.rs`](./src/verifier.rs))**:
-   - Scans the instruction array once from `0..node_count` at **~6.1 nanoseconds/node** (`~61 µs` for 10,000 nodes = **2.63 GB/s** verification throughput).
-   - Mathematically rejects cycles/non-termination (`in_a < idx`), memory aliasing or use-after-consume (`AffineConsume` / `ReadLease`), out-of-bounds memory access (`Shape` / `ProofEntry`), and unauthorized I/O (`CapabilityMask`).
-3. **3-Tier Execution Engine, L1 Zone-Map Skipping & Schedule Autotuner ([`src/engine.rs`](./src/engine.rs))**:
-   - **Tier 0 (`execute_tier0_interpreter`)**: Reference columnar interpreter & `AssertContract` golden oracle.
-   - **Tier 1 (`execute_tier1_stencil`)**: Vectorized columnar kernel stencils.
-   - **Tier 2 (`execute_tier2_fused` & `execute_tier2_with_zonemap`)**: Whole-graph L1-tile register fusion with **0 bytes of intermediate column allocation** ($O(1)$ L1-tile scratchpad independent of column length $N$) across single- and multi-reduction + post-reduction scalar DAGs, Auto-MultiCore parallelism, and $O(1)$ L1-cache tile skipping (`ArenaZoneMap`).
-   - **Hardware Schedule Autotuner (`autotune_schedule`)**: Automatically sweeps `ScheduleHint` policies (`AutoL1Tile`, `SimdStream`, `MultiCore`) against Tier 0 and selects the schedule with the highest `HardwareTelemetry.reward_score`.
-4. **Zero-Runtime Direct `x86_64` AVX2 `ELF64` AOT Compiler ([`src/aot.rs`](./src/aot.rs))**:
-   - Compiles verified single- and multi-reduction + post-reduction scalar `.rl` pipelines across the **29-opcode ISA** (`ArenaInput`, `ConstF64`, `ArenaSlice`, `ArenaMutate`, `Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `Abs`, `Sqrt`, `Floor`, `Ceil`, `Ln`, `Exp`, `CmpGt`, `CmpLt`, `CmpEq`, `MaskAnd`, `MaskOr`, `SelectZero`, `FilterCompact`, `ReduceSum`, `ReduceMax`, `ReduceMin`, `Gather`, `RingEnqueue`, `AssertContract`) directly into a standalone **628–1037 byte statically-linked Linux `x86_64` `ELF64` native executable** in **1.3–6.5 µs** using 256-bit AVX2 `YMM` vector stencils (`vmovupd`, `vaddpd`, `vsubpd`, `vmulpd`, `vdivpd`, `vminpd`, `vmaxpd`, `vsqrtpd`, `vroundpd`, `vcmpltpd`, `vcmpeqpd`, `vandpd`, `vorpd`, `vzeroupper`) + hardware x87 transcendental stencils (`fyl2x`, `f2xm1`, `fscale`) + multi-Arena zero-copy `mmap`—requiring **zero `llvm`**, **zero `libc`**, and **zero Rul runtime** at execution time.
-5. **In-Memory Model Context Protocol Server ([`src/mcp.rs`](./src/mcp.rs) & [`src/bin/rul_mcp.rs`](./src/bin/rul_mcp.rs))**:
-   - Persistent `stdio` JSON-RPC 2.0 MCP server (`rul-mcp`) exposing 6 tools for AI Agents: `rul_assemble_and_verify`, `rul_test_differential`, `rul_autotune_schedule`, `rul_compile_standalone`, `rul_trace`, and `rul_cas_intrinsics`.
-6. **Content-Addressed Intrinsics (`rul-cas`, [`src/cas.rs`](./src/cas.rs)) & Zero-Panic Rust Embedding API with `#[repr(C)]` Result Pods (`rul-ffi`, [`src/ffi.rs`](./src/ffi.rs))**:
-   - 64-bit FNV-1a content-addressed store (`RulCasStore`) and multi-type (`I64`, `U8`) columnar intrinsics (`std::sort_i64_asc`, `std::hash_join_sum_i64`, `std::group_by_bucket_sum_i64`, `std::simd_scan_byte_u8`, `std::fnv1a_hash_u8`).
-   - Zero-panic Rust embedding API returning fixed-layout `#[repr(C)]` status pods (`rul_embed_verify_bytes`, `rul_embed_exec_tier2_1col`, `rul_embed_autotune_1col`, `rul_embed_compile_elf64_to_buffer`) under strict `#![forbid(unsafe_code)]`.
+1. **16-Byte Binary Format ([`src/bytecode.rs`](./src/bytecode.rs)) & Symbolic Assembler ([`src/transpiler.rs`](./src/transpiler.rs))**:
+   - 64-byte `RulHeader`, 16-byte `ArenaDescriptor` table, 16-byte `ProofEntry` table, and 16-byte `NodeFrame` instructions across 29 opcodes.
+   - Lossless `.rls` <-> `.rl` assembler and decompiler (`assemble_rls`, `program_to_rls`).
+2. **Single-Pass `O(N)` Static Verifier ([`src/verifier.rs`](./src/verifier.rs))**:
+   - Checks acyclic instruction ordering (`in_a < idx`), memory version transitions (`AffineConsume` / `ReadLease`), slice/gather bounds (`ProofEntry`), and `CapabilityMask` permissions in one pass.
+3. **3-Tier Execution Engine & Autotuner ([`src/engine.rs`](./src/engine.rs))**:
+   - **Tier 0 (`execute_tier0_interpreter`)**: Reference interpreter and golden oracle.
+   - **Tier 1 (`execute_tier1_stencil`)**: 8-lane vectorized column kernels.
+   - **Tier 2 (`execute_tier2_fused` & `execute_tier2_with_zonemap`)**: L1-cache tile fusion (`1,024` elements/tile), multi-core execution, and `ArenaZoneMap` tile skipping.
+   - **White-Box Tracer (`trace_program`)**: Computes per-node `min`, `max`, `sum`, `NaN/Inf` counts, and sample values.
+4. **Direct Linux `x86_64` AVX2 `ELF64` Compiler ([`src/aot.rs`](./src/aot.rs))**:
+   - Emits standalone Linux `x86_64` `ELF64` binaries in microseconds using 256-bit AVX2 `YMM` instructions (with linear-scan register allocation across `ymm2..ymm13`), x87 transcendental stencils, and zero-copy `mmap`, with zero `LLVM` or `libc` dependencies.
+5. **Model Context Protocol Server ([`src/mcp.rs`](./src/mcp.rs) & [`src/bin/rul_mcp.rs`](./src/bin/rul_mcp.rs))**:
+   - In-memory `stdio` JSON-RPC 2.0 MCP server (`rul-mcp`) providing 6 tools for AI agents: `rul_assemble_and_verify`, `rul_test_differential`, `rul_autotune_schedule`, `rul_compile_standalone`, `rul_trace`, and `rul_cas_intrinsics`.
+6. **Content-Addressed Intrinsics ([`src/cas.rs`](./src/cas.rs)) & Embedding API ([`src/ffi.rs`](./src/ffi.rs))**:
+   - 64-bit FNV-1a content-addressed store (`RulCasStore`) with `I64`/`U8` kernels (`sort`, `hash_join`, `group_by`, `simd_scan_byte`, `fnv1a_hash`) and zero-panic `#[repr(C)]` embedding functions under `#![forbid(unsafe_code)]`.
 
 ---
 
-## Install & Standalone `rul` Toolchain (`Zero-Cargo` Project Workflow)
+## Toolchain Commands
 
-### 1. Install the `rul` Toolchain Globally
 ```bash
+# Install from prebuilt release tarball or source
 curl -fsSL https://raw.githubusercontent.com/rul-lang/rul/main/install.sh | sh
-# Or via cargo:
-cargo install --git https://github.com/rul-lang/rul --bins --force
-```
 
-### 2. Create & Run a Pure Rul (`.rl`) Project Anywhere (No `Cargo.toml` / No `rustc`)
-```bash
-# Scaffold a pure Rul project (rul.toml + src/main.rls + data/arena_0.bin)
+# Or build and install with Cargo
+cargo install --git https://github.com/rul-lang/rul --bins --force
+
+# CLI workflow
 rul new my-ai-pipeline
 cd my-ai-pipeline
+rul check      # Run single-pass O(N) static verifier
+rul build      # Assemble .rls -> build/main.rl and emit standalone ELF64 binary
+rul run        # Execute Tier 2 + ELF64 AOT with differential verification
+rul trace      # Print per-node min/max/sum/NaN inspection table
+rul autotune   # Sweep ScheduleHint policies and pick fastest schedule
 
-# Run the single-pass O(N) static verifier (< 50 us)
-rul check
-
-# Pack .rls -> build/main.rl (208 B) and compile standalone Linux x86_64 AVX2 ELF64 binary (< 10 us)
-rul build
-
-# Execute via Tier 2 Fused SIMD + Standalone ELF64 AOT + print HardwareTelemetry
-rul run
-
-# Sweep hardware ScheduleHint policies (AutoL1Tile, SimdStream, MultiCore)
-rul autotune
-```
-
-### 3. Run the Full Benchmark & 10-Pipeline Differential Suite (`rul-bench`)
-```bash
+# Run the full 10-pipeline differential and AOT benchmark suite
 rul-bench
-```
 
-### 4. Run the In-Memory MCP Server (`rul-mcp`) for AI Agents
-```bash
+# Run the MCP server for AI agents
 rul-mcp
-```
 
-### 5. Run the Verification, Differential, AVX2 AOT, MCP, CAS & FFI Test Suite
-```bash
+# Run all unit, verifier, differential, and AOT tests
 cargo test
 ```
 
 ---
 
-## Documentation & Specifications
+## Documentation
 
-- **[`docs/WHITEPAPER_RUL_V0_1.md`](./docs/WHITEPAPER_RUL_V0_1.md)**: Academic Whitepaper & Empirical Evaluation (English).
-- **[`docs/rul_spec_v0.md`](./docs/rul_spec_v0.md)**: Official `.rl` v0.1 Binary Layout, 128-Bit Frame & $O(N)$ Verifier Specification.
-- **[`docs/new_language_for_AI.md`](./docs/new_language_for_AI.md)**: First-Principles Manifesto & Architectural Breakdown.
-- **[`docs/about_rul.md`](./docs/about_rul.md)**: Overview of Rul vs. Traditional Languages (C, Go, Rust).
-- **[`docs/prior_art/`](./docs/prior_art/)**: Cryptographic SHA-256 Prior Art Manifest & OpenTimestamps Blockchain Proofs.
+- **[`ROADMAP.md`](./ROADMAP.md)**: Four-Milestone Roadmap from `v0.4` Columnar Engine to `v1.0` General-Purpose Systems Language.
+- **[`docs/rul_spec_v0.md`](./docs/rul_spec_v0.md)**: Official `.rl` v0.4 Binary Layout, 128-Bit Instruction Frame & `O(N)` Verifier Specification.
+- **[`docs/about_rul.md`](./docs/about_rul.md)**: Plain-English Overview of How Rul Works.
+- **[`docs/new_language_for_AI.md`](./docs/new_language_for_AI.md)**: First-Principles Design Notes & Architectural Breakdown.
+- **[`docs/WHITEPAPER_RUL_V0_1.md`](./docs/WHITEPAPER_RUL_V0_1.md)**: Technical Whitepaper & Empirical Evaluation (Zenodo Archive).
+- **[`docs/prior_art/`](./docs/prior_art/)**: Cryptographic SHA-256 Prior Art Manifest & OpenTimestamps Proofs.
 
 ---
 
 ## License, Citation & Trademark
 
-- **Source Code & Specification License**: Dual-licensed under either the **[MIT License](./LICENSE-MIT)** or the **[Apache License, Version 2.0](./LICENSE-APACHE)** at your option (matching the Rust ecosystem and Linux Foundation IP standards).
-- **Attribution**: All redistributions must preserve the creator attribution in [`NOTICE`](./NOTICE).
-- **Trademark Policy**: The **"Rul"** name, logo, and canonical `RL_MAGIC` conformance mark are governed by [`TRADEMARK.md`](./TRADEMARK.md).
-- **Academic Citation**: Please cite this work using [`CITATION.cff`](./CITATION.cff).
+- **License**: Dual-licensed under either the **[MIT License](./LICENSE-MIT)** or the **[Apache License, Version 2.0](./LICENSE-APACHE)** at your option.
+- **Attribution**: Redistributions must preserve the attribution notice in [`NOTICE`](./NOTICE).
+- **Trademark Policy**: The **"Rul"** name, logo, and `RL_MAGIC` conformance mark are governed by [`TRADEMARK.md`](./TRADEMARK.md).
+- **Citation**: See [`CITATION.cff`](./CITATION.cff).
 
-**Original Creator & Lead Architect**: Tran Trong Tri (Tymon Tran) — `<tymon3568@gmail.com>`
+**Creator & Lead Architect**: Tran Trong Tri (Tymon Tran) — `<tymon3568@gmail.com>`

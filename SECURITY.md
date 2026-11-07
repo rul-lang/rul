@@ -6,8 +6,8 @@ Security updates and verifier soundness fixes are applied to the latest minor re
 
 | Version | Supported |
 | :--- | :--- |
-| `0.4.x` (`main`) | :white_check_mark: Yes |
-| `< 0.4.0` | :x: Upgrade to `>= 0.4.0` |
+| `0.4.x` (`main`) | Yes |
+| `< 0.4.0` | No (Upgrade to `>= 0.4.0`) |
 
 ---
 
