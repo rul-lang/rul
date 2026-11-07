@@ -27,5 +27,62 @@ All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Ti
   - Vectorized `Opcode::Abs` in the AVX2 loop into a single 256-bit `vandpd` instruction against a pre-broadcast `0x7FFF_FFFF_FFFF_FFFF` sign-clear mask at `[rbp - 64]`.
   - **Measured Speedup (`BM-HORNER-50`, 50-step Horner polynomial, 104 SSA nodes, 10,000,000 `f64` elements = 80 MB SoA)**:
     - AOT loop instructions per 4-lane vector iteration dropped from **303 (`vmovupd` stack round-trips)** to **103 (`vmulpd`/`vaddpd` register-to-register)**.
-    - Standalone `ELF64` binary size for `BM-HORNER-50` shrank from **5,312 B (`main`)** to **3,872 B** (compile latency `~20.4 µs`).
-    - Execution time on 10,000,000 elements dropped from **396 ms (`main`)** to **106.58 ms (`3.72x`..`3.96x` speedup)**, matching `[A] Hand-Written C/Rust 8-Acc Horner-50` (**107.96 ms**, **`1.01x`**) and `gcc -O3 -mavx2 -mno-fma` (**94 ms**), while beating `[B] Rul Tier 2 Fused` (**644.96 ms**) by **`6.05x`**.
+    - Standalone `ELF64` binary size for `BM-HORNER-50` shrank from **5,312 B (`main`)** to **3,872 B** (compile latency `~20.4 us`).
+    - Execution time on 10,000,000 elements dropped from **396 ms (`main`)** to **106.58 ms (`3.72x`..`3.96x` speedup)**, matching `[A] Hand-Written C/Rust 8-Acc Horner-50` (**107.96 ms**, **`1.01x`**) and `gcc -O3 -mavx2 -mno-fma` (**94 ms**).
+
+---
+
+## [0.4.0] — 2026-11-03
+
+### Added
+- **29-Opcode ISA (`src/bytecode.rs`, `src/verifier.rs`, `src/transpiler.rs`, `src/engine.rs`, `src/aot.rs`)**:
+  - Added unary math opcodes: `Abs` (`0x1A`), `Sqrt` (`0x1B`), `Floor` (`0x1C`), `Ceil` (`0x1D`), `Ln` (`0x1E`), and `Exp` (`0x1F`), including hardware x87 transcendental stencils (`fyl2x`, `f2xm1`, `fscale`) in `src/aot.rs`.
+  - Added binary boolean mask logic opcodes: `MaskAnd` (`0x25`) and `MaskOr` (`0x26`).
+  - Added horizontal minimum reduction opcode: `ReduceMin` (`0x24`).
+- **Multi-Reduction and Post-Reduction Scalar DAGs (`src/engine.rs`, `src/aot.rs`)**:
+  - Extended Tier 2 fused execution and standalone `ELF64` AOT compilation to evaluate multiple reductions in a single pass and compute arbitrary scalar DAG expressions after reduction.
+- **Community Governance Documents**:
+  - Added `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, and `SECURITY.md`.
+
+---
+
+## [0.3.1] — 2026-11-02
+
+### Fixed
+- Eliminated redundant arena file writes during `rul run` AOT execution.
+- Added explicit disclosure when `rul-mcp` tools (`rul_trace`, `rul_test_differential`, `rul_autotune_schedule`) evaluate synthetic fallback inputs.
+- Synchronized crate version and `rul-mcp` protocol server metadata.
+
+---
+
+## [0.3.0] — 2026-11-01
+
+### Added
+- **Expanded 20-Opcode ISA**: Added `Div` (`0x13`), `Min` (`0x16`), `Max` (`0x17`), `CmpLt` (`0x18`), and `CmpEq` (`0x19`) across all execution tiers and `x86_64` AVX2 `ELF64` AOT codegen.
+- **White-Box Execution Tracer (`rul trace` & `rul_trace` MCP tool)**:
+  - Implemented `trace_program` and `format_trace_table` in `src/engine.rs` to inspect per-node `min`, `max`, `sum`, `nan_or_inf_count`, and sample head values across all SSA nodes.
+
+### Fixed
+- Replaced `wrapping_add(1)` on `AffineConsume` version transitions with `checked_add(1)` returning `VerifyErrorKind::TokenVersionOverflow` on `u16::MAX`.
+- Hardened `Opcode::Gather` to reject fractional floating-point indices (`raw_idx.fract() != 0.0`).
+- Updated `VerifiedSummary.zero_runtime_bounds_checks` to reflect `!has_gather`.
+
+---
+
+## [0.2.0] — 2026-10-29
+
+### Added
+- Standalone `rul` CLI toolchain (`new`, `check`, `build`, `run`, `autotune`, `inspect`, `decompile`) and `install.sh` installer.
+- Lossless `.rls` <-> `.rl` symbolic assembler and decompiler (`src/transpiler.rs`).
+- In-memory JSON-RPC 2.0 MCP server (`src/mcp.rs`, `src/bin/rul_mcp.rs`).
+- Content-Addressed Store (`RulCasStore`) with `I64`/`U8` verified intrinsics (`src/cas.rs`) and zero-panic `#[repr(C)]` embedding API (`src/ffi.rs`).
+
+---
+
+## [0.1.0] — 2026-10-28
+
+### Added
+- Initial `.rl` binary specification (`RulHeader`, `ArenaDescriptor`, `ProofEntry`, and 16-byte `NodeFrame`).
+- Single-pass `O(N)` linear static verifier (`src/verifier.rs`).
+- 3-tier execution engine (`Tier 0` interpreter, `Tier 1` vector stencils, `Tier 2` L1-cache tile fuser with `ArenaZoneMap` skipping) and direct Linux `x86_64` `ELF64` AOT compiler (`src/aot.rs`).
+- 10-pipeline differential verification suite (`src/suite10.rs`) and Zenodo archival registration (`DOI: 10.5281/zenodo.23722094`).

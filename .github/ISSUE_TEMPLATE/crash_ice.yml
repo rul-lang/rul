@@ -1,4 +1,4 @@
-name: "💥 Crash / Internal Error (ICE) / Soundness Defect"
+name: "Crash / Internal Error (ICE) / Soundness Defect"
 description: "Report a panic, segmentation fault, illegal instruction, or verifier soundness escape."
 title: "[ICE]: "
 labels: ["bug", "crash-ice", "needs-triage"]

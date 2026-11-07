@@ -1,4 +1,4 @@
-name: "🐛 Bug Report / Miscompilation"
+name: "Bug Report / Miscompilation"
 description: "Report a reproducible defect in the Rul verifier, execution engine, transpiler, or tooling."
 title: "[Bug]: "
 labels: ["bug", "needs-triage"]

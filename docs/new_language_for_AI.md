@@ -1,105 +1,80 @@
-# First-Principles Manifesto: Why AI Agents Need a 128-Bit Binary Graph (`.rl`) Instead of Textual Source Code
+# First-Principles Design Notes: Why AI Agents Need a 128-Bit Binary Language (`.rl`)
 
-> **Core Thesis**: Stop forcing Autonomous AI Agents to type 1970s human ASCII syntax (`fn main() { let x = 5; }`). Eliminate textual source code and compiler heuristic search passes in the compute core, replacing them with a memory-mapped, **128-bit Schedule- and Proof-Carrying Binary Graph (`.rl`)**.
-
----
-
-## Step 1: First-Principles Physics & Information Theory Breakdown
-
-### 1. Deconstructing Runtime Performance: Why Standard Code Wastes 90%+ of Silicon Capacity
-
-Physics is the law; everything else is a recommendation.
-On a single scalar CPU core executing pre-vectorized arithmetic on a flat array, hand-tuned `C` is already within `1.1x–1.3x` of the physical silicon ceiling. No programming language can magically multiply single-core scalar clock speed by 100x without violating physics.
-
-**However**, why do real-world data pipelines written in standard imperative `C`, `Go`, or `Rust` routinely run **10x–45x slower** than the physical capability of modern hardware?
-
-1. **The Von Neumann Memory Wall (Cache Pollution)**: Standard object-oriented / imperative code organizes records as **Arrays of Structs (`AoS`, e.g., `Vec<Transaction>`)**. When filtering on a single 8-byte `amount` field inside a 64-byte struct, 87.5% of every L1/L2 cache line fetched from DRAM is wasted, and intermediate `Vec::collect()` allocations thrash memory bandwidth.
-2. **Pointer Aliasing & Branch Misprediction**: Conditional `if` branches inside sequential loops stall modern out-of-order CPU pipelines, while potential pointer aliasing prevents compilers from safely fusing multi-stage loops.
-3. **Single-Core Default & Full-Scan Waste**: Traditional loops scan 100% of memory on a single thread unless an engineer manually rewrites the code with multi-threading and block-level min/max zone maps.
-
-👉 **Physical Conclusion #1**: To approach silicon limits on data-intensive workloads (**Columnar Analytics, Risk Engines, Feature Engineering, Stream Filtering**), a language must enforce **64-byte aligned Columnar Structure-of-Arrays (`SoA`) Arenas**, **Branchless SIMD Predication (`CmpGt`/`SelectZero`)**, **Whole-Graph L1-Cache Tile Fusion**, and **$O(1)$ Zone-Map Block Skipping (`ArenaZoneMap`)** by construction.
+> **Core Idea**: Stop forcing AI agents to output 1970s human text syntax (`fn main() { let x = 5; }`) and waiting seconds for a compiler to parse and optimize it. Replace text source files with a memory-mapped **128-bit (16-byte) binary instruction graph (`.rl`)** where each instruction carries its operation, CPU schedule hint, and safety witness up front.
 
 ---
 
-### 2. Why Does `Rust + LLVM` Compile Slowly While `C/Go` Lack Zero-Cost Proofs?
+## 1. Physical Bottlenecks of Human-Centric Languages
 
-Look at the information-theoretic bottleneck of human programming:
-- Humans type at **~40 bits/second** through 10 fingers and hold only $7 \pm 2$ items in working memory.
-- Because humans cannot manually annotate every instruction with its exact memory lifetime proof, array bounds certificate, and L1-tile fusion schedule, **Rust forces the compiler (`rustc + LLVM`) to infer and search**:
-  1. Lexing and parsing UTF-8 text into ASTs and expanding macros.
-  2. Running non-linear constraint solvers for Type Inference, Trait Coherence, and the Borrow Checker.
-  3. Monomorphizing generics and lowering to LLVM IR (stripping high-level columnar semantics), then forcing **LLVM to run 100+ heuristic optimization passes** to guess whether loops can be fused or vectorized.
-- Conversely, an AI Agent does not have fingers. Once an AI Agent has synthesized an algorithm, forcing it to emit 2,000 ASCII tokens of boilerplate syntax is pure **Serialization Tax**—and waiting 5 to 60 seconds for `rustc + LLVM` breaks the agent's real-time closed-loop reasoning.
+### Why Standard Imperative Code Wastes CPU Capacity on Data Workloads
 
-👉 **Physical Conclusion #2 — The Core Equation of Rul**:
-When the AI Agent embeds the **Algorithm**, **Hardware Schedule**, and **Safety Proof** directly inside each 128-bit binary instruction frame, the compiler performs **zero inference and zero heuristic search**:
+On a single CPU core running pre-vectorized math on a flat array, hand-tuned C is already close to the hardware limit. However, standard imperative code written in C, Go, or Rust often runs 10x to 45x slower than the hardware can support for three reasons:
 
-$$\text{Artifact (}\mathtt{.rl}\text{)} = \text{Algorithm} + \text{Schedule} + \text{Proof}$$
-$$\text{Rul Compiler} = \text{Single-Pass Linear Verifier } O(N) + \text{Copy-and-Patch Vector Stencil / ELF64 AOT } O(N)$$
+1. **Cache Line Waste (`Array-of-Structs`)**: Standard code groups records as arrays of structs (`Vec<Transaction>`). When filtering on a single 8-byte `amount` field inside a 64-byte struct, 87.5% of every CPU cache line fetched from RAM goes unused, and temporary allocations between loop stages waste memory bandwidth.
+2. **Branch Misprediction and Pointer Aliasing**: Conditional `if` branches inside tight loops stall CPU pipelines, and potential pointer aliasing prevents compilers from safely fusing adjacent loops.
+3. **Single-Core Full Scans by Default**: Standard loops scan 100% of memory on one thread unless an engineer manually rewrites the code with multi-threading and block-level min/max indexes.
 
+To reach hardware limits by default, Rul enforces **64-byte-aligned columnar memory (`Structure-of-Arrays`)**, **branchless SIMD predication (`CmpGt` / `SelectZero`)**, **L1-cache tile fusion**, and **`O(1)` cold-tile skipping (`ArenaZoneMap`)**.
+
+---
+
+### Why `Rust + LLVM` Compiles Slowly While `C` Lacks Load-Time Proofs
+
+Human programmers type at roughly 40 bits per second and hold only a handful of variables in working memory. Because humans cannot manually attach a memory lifetime proof, array bounds certificate, and cache-tile schedule to every instruction, Rust forces the compiler (`rustc + LLVM`) to infer and search:
+1. Lexing and parsing UTF-8 text into syntax trees and expanding macros.
+2. Running constraint solvers for type inference, trait resolution, and the borrow checker.
+3. Lowering to LLVM IR and running 100+ heuristic optimization passes to guess whether loops can be fused or vectorized.
+
+An AI agent does not have those biological limits. When an AI agent embeds the **operation**, **hardware schedule hint**, and **safety witness** directly inside each 16-byte binary instruction frame, the compiler performs zero type inference and zero heuristic search:
 - **Searching for proofs and schedules (`rustc + LLVM`)**: Seconds to minutes.
-- **Verifying attached proofs and applying stencils (`Rul .rl`)**: **`~5.8 ns / node`** (`~58 µs` for 10,000 nodes) + **`~6.4 µs`** to emit a standalone Linux `x86_64` AVX2 `ELF64` binary!
+- **Verifying attached witnesses and emitting machine code (`Rul .rl`)**: **`~5.8 ns / instruction`** to verify + **`~6.4 us`** to emit a standalone Linux `x86_64` AVX2 `ELF64` executable.
 
 ---
 
-## Step 2: Applying "The 5-Step Engineering Algorithm" to Language Design
+## 2. Five Core Primitives of Rul
 
-### 1. Question Every Requirement
-- *"Must a programming language's primary representation be human-typed text?"* → **No.** The canonical single source of truth in Rul is the flat binary `.rl` graph. Humans and text-based LLMs interact at the boundary via the lossless `.rls` symbolic assembler (`rul build` / `rul decompile`), while the execution core remains 100% binary.
-- *"Must a compiled binary bundle megabytes of runtime and standard library?"* → **No.** A verified `.rl` pipeline compiles into a **628–1037 byte** statically-linked Linux `ELF64` executable that maps input arenas via `mmap` and executes native AVX2 instructions with zero external dependencies.
+We removed text lexers, AST parsers, garbage collection, exceptions, and LLVM from the core engine, and built Rul around five primitives:
 
-### 2. Delete the Part or Process (and Add Back the Essential 10%)
-We removed from the core engine:
-- ❌ **No Lexer or Parser in the Core Engine** (`0%` syntax error surface).
-- ❌ **No ASCII Variable or Function Names in `.rl`** (replaced by $O(1)$ `u32` topological indices and 64-bit `CasHash` content hashes).
-- ❌ **No `NULL`, Exceptions, Garbage Collector, or Per-Object Heap `malloc/free`**.
-- ❌ **No Dynamic Dispatch (`vtable`) or Unbounded `while(true)` Loops**.
-- ❌ **No LLVM Dependency**.
-
-And we added back the **3 essential mechanisms** required for mathematical completeness and human auditability:
-1. **Shared `ReadLease` Alongside Exclusive `AffineConsume`**: Allows multiple parallel nodes to read the same `Arena` without sequential token threading; only mutation consumes the `AffineToken` and increments the version.
-2. **`Bounds-Safe by Construction` + Origin-Bound `ProofEntry` Sidecar Table**: Over 90% of columnar operations require `proof_idx = 0` (`TRIVIAL_BY_SHAPE`); `ArenaSlice` and `Gather` attach an explicit `ProofEntry` bound to the operand's `origin_arena`.
-3. **Orthogonal Separation of `Safety Verification` (`O(N)` Static Verifier) and `Intent Verification` (`AssertContract` + `rul trace` White-Box Inspector)**.
-
----
-
-### 3. Simplify Around 5 Core Primitives
-
-| Primitive | Mathematical & Physical Essence | Why It Solves the 80/20 Bottleneck |
+| Primitive | What It Is | Problem It Solves |
 | :--- | :--- | :--- |
-| **1. `Arena<Shape, Align>`** | 64-byte aligned Columnar Structure-of-Arrays (`SoA`) memory region. | Eliminates per-row heap allocation (`malloc`), maximizes L1/L2 cache line utilization, and requires zero GC. |
-| **2. `AffineToken` + `ReadLease`** | Explicit linear ownership with shared read leases and `u16` version tracking. | Rust-grade aliasing and use-after-consume safety verified in **$O(1)$ per node** without a borrow-checker solver. |
-| **3. `DataflowOp<SIMD>`** | 29-opcode columnar & scalar algebra (`ArenaInput`, `ConstF64`, `ArenaSlice`, `ArenaMutate`, `Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `Abs`, `Sqrt`, `Floor`, `Ceil`, `Ln`, `Exp`, `CmpGt`, `CmpLt`, `CmpEq`, `MaskAnd`, `MaskOr`, `SelectZero`, `FilterCompact`, `ReduceSum`, `ReduceMax`, `ReduceMin`, `Gather`, `RingEnqueue`, `AssertContract`). | Zero pointer aliasing + explicit `ScheduleHint` enables single-pass L1-tile register fusion and 256-bit AVX2 codegen. |
-| **4. `Capability<HW_Ring>`** | 64-bit `CapabilityMask` in `RulHeader` (`CAP_NONE`, `CAP_NET_RING`, `CAP_STORAGE_DMA`, `CAP_GPU_DISPATCH`). | Mathematical zero-trust sandboxing at the instruction set level—no container overhead needed to block unauthorized I/O. |
-| **5. `Proof<Refinement>`** | Shape unification (`TRIVIAL_BY_SHAPE`) + sidecar `ProofEntry` certificates for `ArenaSlice` and `Gather`. | Proves bounds safety in $O(1)$ per node at load time. |
+| **1. `Arena<Shape, Align>`** | 64-byte-aligned memory buffer (`ArenaDescriptor`). | Eliminates per-item heap allocation, maximizes CPU cache utilization, and requires no garbage collector. |
+| **2. `TokenOp` (`ReadLease` / `AffineConsume`)** | Explicit 32-bit memory ownership and version tag on every instruction. | Prevents use-after-free and read/write aliasing in `O(1)` per instruction without a slow borrow-checker solver. |
+| **3. `DataflowOp<SIMD>`** | 29-opcode instruction set covering inputs, slices, in-place mutation, arithmetic, transcendental math, masks, reductions, gathers, and contracts. | Enables single-pass L1-tile fusion and direct 256-bit AVX2 machine code generation. |
+| **4. `CapabilityMask`** | 64-bit hardware permission bitmask in `RulHeader`. | Blocks unauthorized network, disk, or device I/O at load time before a binary can run. |
+| **5. `ProofEntry`** | 16-byte sidecar table certifying slice and gather index bounds. | Proves array bounds safety at load time in `O(1)` per instruction. |
 
 ---
 
-## Step 3: 128-Bit `NodeFrame` Architecture & Compilation Pipeline
+## 3. Compilation Pipeline Comparison
 
 ```text
 [Traditional Human Language: Rust / C]
-AI emits ~1,500 ASCII tokens (.rs / .c)
-  ──► Lexer & Parser build AST
-  ──► Type Inference + Borrow Checker + Monomorphization
-  ──► Lower to LLVM IR (loses high-level columnar/zone-map semantics)
-  ──► LLVM runs 100+ heuristic optimization passes
-  ──► Linker emits multi-megabyte binary (Seconds to minutes)
+AI outputs ~1,500 text tokens (.rs / .c)
+  --> Lexer & Parser build syntax tree
+  --> Type Inference + Borrow Checker + Monomorphization
+  --> Lower to LLVM IR
+  --> LLVM runs 100+ heuristic optimization passes
+  --> Linker emits multi-megabyte binary (Seconds to minutes)
 
 [AI-Native Binary Language: Rul (.rl)]
-AI emits 128-bit Instruction Frames (.rl / .rls: Algorithm + Schedule + Proof)
-  ──► Zero-copy load (`192 bytes` for a 7-node pipeline)
-  ──► Single-Pass O(N) Linear Verifier checks SSA + AffineToken + Shape/Proof + Capability (~5.8 ns/node)
-  ──► Tier 2 L1-Tile Fuser / Direct x86_64 AVX2 ELF64 AOT Compiler emits native code (~6.4 µs)
+AI outputs 16-byte instruction frames (.rl / .rls: Operation + Schedule + Witness)
+  --> Direct binary load (192 bytes for a 7-node pipeline)
+  --> Single-pass O(N) Verifier checks ordering + memory versions + bounds + permissions (~5.8 ns/node)
+  --> Tier 2 L1-Tile Fuser or Direct x86_64 AVX2 ELF64 Compiler emits native code (~6.4 us)
 ```
 
 ---
 
-## Step 4: Honest Boundaries & Where Rul Fits in Production Architecture
+## 4. From Verified Compute Core (`v0.4`) to General-Purpose Systems Language (`v1.0`)
 
-1. **Host Orchestration vs. Verified Compute Kernel**:
-   - General-purpose host languages (`Rust`, `Go`, `Python`, `TypeScript`) handle asynchronous network sockets, UI, database connections, and stateful orchestration.
-   - **Rul (`.rl`)** is the **Verified Binary Compute Kernel & Dataflow IR** invoked via the zero-panic Rust embedding API with `#[repr(C)]` result pods ([`src/ffi.rs`](../src/ffi.rs)), MCP ([`src/mcp.rs`](../src/mcp.rs)), or standalone `ELF64` binaries ([`src/aot.rs`](../src/aot.rs)) whenever an AI Agent synthesizes high-throughput analytical, filtering, scoring, or feature-engineering logic.
-2. **Maintainability Without Black-Box Technical Debt**:
-   - Humans maintain only the **Logical Outline** (`ArenaDescriptor` schemas, `CapabilityMask` permissions, and `AssertContract` invariants).
-   - `.rl` modules are disposable, microsecond-regenerated artifacts whose every intermediate SSA node can be deterministically audited at any time via `rul inspect`, `rul decompile`, and `rul trace`.
+Rul is designed to replace Rust and Go for AI-generated systems software by delivering memory safety, native C-level execution speed, and microsecond compilation at the same time.
+
+We staged the engineering in two phases (see **[`ROADMAP.md`](../ROADMAP.md)**):
+
+1. **Phase 1 (`v0.1` to `v0.4` — Completed Foundation)**:
+   - Proved the 16-byte `NodeFrame` binary format, single-pass `O(N)` verifier (`5.78 ns/node`), white-box execution tracer (`rul trace`), and zero-LLVM `x86_64` `ELF64` native compiler (`6.38 us`) on high-throughput data and vector workloads, while also providing zero-panic embedding (`src/ffi.rs`) and MCP tools (`src/mcp.rs`) for existing hosts.
+2. **Phase 2 (`v0.5` to `v1.0` — Four-Milestone General-Purpose Roadmap)**:
+   - **Milestone 1 (Control Flow, Functions & Data Types)**: Expand the 16-byte instruction set to general integers/bytes (`i64`, `i32`, `u8`), structs, UTF-8 strings, hash maps, conditional branches (`SelectBranch`), bounded loops with mandatory termination fuel/variant proofs (`RegionLoop`), and modular function calls (`Call`).
+   - **Milestone 2 (General Ownership & Lifetimes in `O(N)`)**: Extend versioned `TokenOp` and `ProofEntry` checks to region heap allocations, struct field borrows, and slice lifetimes in a single forward pass.
+   - **Milestone 3 (Go-Style Concurrency & Capability-Gated I/O)**: Add lightweight tasks and typed channels (where sending a buffer transfers its ownership token so data races are impossible without a garbage collector), plus `CapabilityMask` enforcement for file, socket, and subprocess system calls.
+   - **Milestone 4 (Multi-Arch Zero-LLVM Backends & Formal Proofs)**: Emit standalone native binaries across `x86_64`, `AArch64` (`ARM64`), and WebAssembly (`WASI`) without LLVM, backed by Kani model-checking proofs and continuous differential fuzzing.
