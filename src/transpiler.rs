@@ -166,6 +166,27 @@ impl SymbolicGraphBuilder {
         )
     }
 
+    /// Emits a ternary [`Opcode::Fma`] node (`in_a_sym * in_b_sym + in_c_sym`).
+    ///
+    /// # Errors
+    /// Returns [`TranspileError`] if any input symbol is unknown or `label` is duplicated.
+    pub fn emit_fma_op(
+        &mut self,
+        label: &str,
+        type_lane: TypeLane,
+        in_a_sym: &str,
+        in_b_sym: &str,
+        in_c_sym: &str,
+        schedule: ScheduleHint,
+    ) -> Result<u32, TranspileError> {
+        let in_a = self.resolve(in_a_sym)?;
+        let in_b = self.resolve(in_b_sym)?;
+        let in_c = self.resolve(in_c_sym)?;
+        let b16 = u16::try_from(in_b).unwrap_or(u16::MAX);
+        let c16 = u16::try_from(in_c).unwrap_or(u16::MAX);
+        self.register_symbol(label, NodeFrame::fma(type_lane, in_a, b16, c16, schedule))
+    }
+
     /// Emits a unary reduction or assertion node referencing `in_a_sym`.
     ///
     /// # Errors
@@ -350,6 +371,9 @@ pub fn disassemble_rl(program: &RulProgram) -> String {
     for (idx, frame) in program.nodes.iter().enumerate() {
         let inputs = if frame.opcode == Opcode::ConstF64 {
             format!("const={:.4}", frame.decode_const_f64())
+        } else if frame.opcode == Opcode::Fma {
+            let (b, c) = frame.decode_fma_bc();
+            format!("in_a={}, in_b={b}, in_c={c}", frame.in_a)
         } else {
             format!("in_a={}, in_b={}", frame.in_a, frame.in_b)
         };
@@ -452,6 +476,16 @@ pub fn program_to_rls(program: &RulProgram) -> String {
             let _ = writeln!(
                 out,
                 "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} const={val:?}",
+                frame.schedule.fusion_group, frame.proof_idx
+            );
+        } else if frame.opcode == Opcode::Fma {
+            let (b, c) = frame.decode_fma_bc();
+            let a_ref = format_node_ref(frame.opcode, true, frame.in_a);
+            let b_ref = format_node_ref(frame.opcode, false, b);
+            let c_ref = format_node_ref(frame.opcode, false, c);
+            let _ = writeln!(
+                out,
+                "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={a_ref} b={b_ref} c={c_ref}",
                 frame.schedule.fusion_group, frame.proof_idx
             );
         } else if matches!(frame.opcode, Opcode::ArenaInput | Opcode::ArenaMutate) {
@@ -766,6 +800,7 @@ fn parse_node_line<'a>(
     let mut const_val: Option<f64> = None;
     let mut raw_a: Option<&str> = None;
     let mut raw_b: Option<&str> = None;
+    let mut raw_c: Option<&str> = None;
 
     for kv in parts {
         let Some((k, v)) = kv.split_once('=') else {
@@ -804,6 +839,9 @@ fn parse_node_line<'a>(
             }
             "b" => {
                 raw_b = Some(v);
+            }
+            "c" => {
+                raw_c = Some(v);
             }
             _ => {
                 return Err(RlsError::LineParse {
@@ -845,7 +883,23 @@ fn parse_node_line<'a>(
             0
         };
 
-        let in_b = if let Some(b_str) = raw_b {
+        let in_b = if opcode == Opcode::Fma {
+            if let Some(c_str) = raw_c {
+                let b_idx = if let Some(b_str) = raw_b {
+                    resolve_sym_or_u32(line_no, b_str, symbols)?
+                } else {
+                    0
+                };
+                let c_idx = resolve_sym_or_u32(line_no, c_str, symbols)?;
+                let b16 = u16::try_from(b_idx).unwrap_or(u16::MAX);
+                let c16 = u16::try_from(c_idx).unwrap_or(u16::MAX);
+                NodeFrame::encode_fma_bc(b16, c16)
+            } else if let Some(b_str) = raw_b {
+                resolve_sym_or_u32(line_no, b_str, symbols)?
+            } else {
+                0
+            }
+        } else if let Some(b_str) = raw_b {
             resolve_sym_or_u32(line_no, b_str, symbols)?
         } else {
             0
@@ -994,6 +1048,7 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::ReduceMin => "ReduceMin",
         Opcode::MaskAnd => "MaskAnd",
         Opcode::MaskOr => "MaskOr",
+        Opcode::Fma => "Fma",
         Opcode::RingEnqueue => "RingEnqueue",
         Opcode::AssertContract => "AssertContract",
     }
@@ -1028,6 +1083,7 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "ReduceMin" => Opcode::ReduceMin,
         "MaskAnd" => Opcode::MaskAnd,
         "MaskOr" => Opcode::MaskOr,
+        "Fma" => Opcode::Fma,
         "RingEnqueue" => Opcode::RingEnqueue,
         "AssertContract" => Opcode::AssertContract,
         _ => {

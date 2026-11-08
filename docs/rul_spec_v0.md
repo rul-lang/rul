@@ -89,7 +89,7 @@ Byte:  0          1            2            3            4..7 (32-bit)
 Byte:  8..11 (32-bit)                       12..15 (32-bit)
 ```
 
-1. **`opcode (u8)` — 29-Opcode Instruction Set (`v0.4`)**:
+1. **`opcode (u8)` — 30-Opcode Instruction Set (`v0.4`)**:
    - `0x01` `ArenaInput`: Load columnar slice from `ArenaDescriptor[in_a]`.
    - `0x02` `ConstF64`: 64-bit IEEE-754 floating-point constant (`bits = in_a | (in_b << 32)`).
    - `0x03` `ArenaSlice`: Zero-copy sub-slice of `in_a` certified by `proof_idx`.
@@ -117,6 +117,7 @@ Byte:  8..11 (32-bit)                       12..15 (32-bit)
    - `0x24` `ReduceMin`: Horizontal minimum reduction of column `in_a` to a scalar `f64`.
    - `0x25` `MaskAnd`: Branchless boolean mask conjunction (`mask[i] = a[i] && b[i]`).
    - `0x26` `MaskOr`: Branchless boolean mask disjunction (`mask[i] = a[i] || b[i]`).
+   - `0x27` `Fma`: Single-rounded IEEE-754 fused multiply-add (`out[i] = fma(a[i], b[i], c[i]) = a[i] * b[i] + c[i]`, with `in_b` packing `(b_idx: u16) | ((c_idx: u16) << 16)`).
    - `0x30` `RingEnqueue`: Enqueue output to a hardware ring buffer (requires `CAP_NET_RING` in `RulHeader.capability_mask`).
    - `0x40` `AssertContract`: Runtime contract assertion verifying finite, non-NaN scalar output.
 2. **`type_lane (u8)`**:
