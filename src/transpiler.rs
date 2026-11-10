@@ -20,6 +20,13 @@ pub enum TranspileError {
     UnknownSymbol(String),
     /// Duplicate symbolic label definition.
     DuplicateSymbol(String),
+    /// `Opcode::Fma` operand `b` or `c` node index exceeds the 16-bit packed limit (`65,535`).
+    FmaOperandIndexOverflow {
+        /// Symbolic label or operand token.
+        symbol: String,
+        /// Resolved 32-bit node index (`> 65,535`).
+        node_idx: u32,
+    },
 }
 
 impl fmt::Display for TranspileError {
@@ -27,6 +34,10 @@ impl fmt::Display for TranspileError {
         match self {
             Self::UnknownSymbol(sym) => write!(f, "unknown symbolic label: {sym}"),
             Self::DuplicateSymbol(sym) => write!(f, "duplicate symbolic label: {sym}"),
+            Self::FmaOperandIndexOverflow { symbol, node_idx } => write!(
+                f,
+                "Fma operand '{symbol}' resolved to node index {node_idx}, exceeding u16::MAX (65535)"
+            ),
         }
     }
 }
@@ -182,8 +193,14 @@ impl SymbolicGraphBuilder {
         let in_a = self.resolve(in_a_sym)?;
         let in_b = self.resolve(in_b_sym)?;
         let in_c = self.resolve(in_c_sym)?;
-        let b16 = u16::try_from(in_b).unwrap_or(u16::MAX);
-        let c16 = u16::try_from(in_c).unwrap_or(u16::MAX);
+        let b16 = u16::try_from(in_b).map_err(|_e| TranspileError::FmaOperandIndexOverflow {
+            symbol: in_b_sym.to_owned(),
+            node_idx: in_b,
+        })?;
+        let c16 = u16::try_from(in_c).map_err(|_e| TranspileError::FmaOperandIndexOverflow {
+            symbol: in_c_sym.to_owned(),
+            node_idx: in_c,
+        })?;
         self.register_symbol(label, NodeFrame::fma(type_lane, in_a, b16, c16, schedule))
     }
 
@@ -884,21 +901,35 @@ fn parse_node_line<'a>(
         };
 
         let in_b = if opcode == Opcode::Fma {
-            if let Some(c_str) = raw_c {
-                let b_idx = if let Some(b_str) = raw_b {
-                    resolve_sym_or_u32(line_no, b_str, symbols)?
-                } else {
-                    0
-                };
-                let c_idx = resolve_sym_or_u32(line_no, c_str, symbols)?;
-                let b16 = u16::try_from(b_idx).unwrap_or(u16::MAX);
-                let c16 = u16::try_from(c_idx).unwrap_or(u16::MAX);
-                NodeFrame::encode_fma_bc(b16, c16)
-            } else if let Some(b_str) = raw_b {
-                resolve_sym_or_u32(line_no, b_str, symbols)?
-            } else {
-                0
+            if raw_a.is_none() {
+                return Err(RlsError::LineParse {
+                    line: line_no,
+                    message: "Fma requires a=<node>, b=<node>, and c=<node>".to_owned(),
+                });
             }
+            let b_str = raw_b.ok_or_else(|| RlsError::LineParse {
+                line: line_no,
+                message: "Fma requires a=<node>, b=<node>, and c=<node>".to_owned(),
+            })?;
+            let c_str = raw_c.ok_or_else(|| RlsError::LineParse {
+                line: line_no,
+                message: "Fma requires a=<node>, b=<node>, and c=<node>".to_owned(),
+            })?;
+            let b_idx = resolve_sym_or_u32(line_no, b_str, symbols)?;
+            let c_idx = resolve_sym_or_u32(line_no, c_str, symbols)?;
+            let b16 = u16::try_from(b_idx).map_err(|_e| {
+                RlsError::Symbol(TranspileError::FmaOperandIndexOverflow {
+                    symbol: b_str.to_owned(),
+                    node_idx: b_idx,
+                })
+            })?;
+            let c16 = u16::try_from(c_idx).map_err(|_e| {
+                RlsError::Symbol(TranspileError::FmaOperandIndexOverflow {
+                    symbol: c_str.to_owned(),
+                    node_idx: c_idx,
+                })
+            })?;
+            NodeFrame::encode_fma_bc(b16, c16)
         } else if let Some(b_str) = raw_b {
             resolve_sym_or_u32(line_no, b_str, symbols)?
         } else {

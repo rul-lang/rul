@@ -2239,7 +2239,10 @@ const MATH_EXP_C9: usize = 31;
 const MATH_EXP_C10: usize = 32;
 const MATH_EXP_C11: usize = 33;
 const MATH_EXP_C12: usize = 34;
-const MATH_TOTAL_SLOTS: usize = 35;
+const MATH_DBL_MIN: usize = 35;
+const MATH_TWO54: usize = 36;
+const MATH_FIFTY_FOUR: usize = 37;
+const MATH_TOTAL_SLOTS: usize = 38;
 
 const MATH_CONST_TABLE: &[(usize, u64)] = &[
     (MATH_ZERO, 0x0000_0000_0000_0000),
@@ -2263,8 +2266,8 @@ const MATH_CONST_TABLE: &[(usize, u64)] = &[
     (MATH_LG5, 0x3FC7_4664_96CB_03DE),
     (MATH_LG6, 0x3FC3_9A09_D078_C69F),
     (MATH_LG7, 0x3FC2_F112_DF3E_5244),
-    (MATH_EXP_CLAMP_LO, (-708.3964185322641_f64).to_bits()),
-    (MATH_EXP_CLAMP_HI, 709.782712893384_f64.to_bits()),
+    (MATH_EXP_CLAMP_LO, 0xC087_4910_D52D_3052),
+    (MATH_EXP_CLAMP_HI, 0x4086_2E42_FEFA_39EF),
     (MATH_EXP_C3, (1.0_f64 / 6.0_f64).to_bits()),
     (MATH_EXP_C4, (1.0_f64 / 24.0_f64).to_bits()),
     (MATH_EXP_C5, (1.0_f64 / 120.0_f64).to_bits()),
@@ -2275,6 +2278,9 @@ const MATH_CONST_TABLE: &[(usize, u64)] = &[
     (MATH_EXP_C10, (1.0_f64 / 3_628_800.0_f64).to_bits()),
     (MATH_EXP_C11, (1.0_f64 / 39_916_800.0_f64).to_bits()),
     (MATH_EXP_C12, (1.0_f64 / 479_001_600.0_f64).to_bits()),
+    (MATH_DBL_MIN, 0x0010_0000_0000_0000),
+    (MATH_TWO54, 0x4350_0000_0000_0000),
+    (MATH_FIFTY_FOUR, 0x404B_0000_0000_0000),
 ];
 
 fn math_slot_disp(node_count: usize, red_count: usize, slot_idx: usize) -> i32 {
@@ -2300,6 +2306,19 @@ fn emit_avx2_ln_ymm(code: &mut Vec<u8>, node_count: usize, red_count: usize, scr
     emit_store_ymm_rbp(code, 3, mslot(MATH_SCRATCH_YMM3));
     emit_store_ymm_rbp(code, 0, scratch_disp);
 
+    // 0. Normalize subnormal inputs (`0 < x < 2^-1022`) by scaling `x * 2^54` and subtracting `54.0` from `e0`:
+    // vcmppd ymm3, ymm0, [MATH_DBL_MIN], 0x01 (_CMP_LT_OS)
+    emit_vex_ymm_rm_rbp(code, 0xC2, 3, 0, mslot(MATH_DBL_MIN));
+    code.push(0x01);
+    // vmulpd ymm2, ymm0, [MATH_TWO54]
+    emit_vex_ymm_rm_rbp(code, 0x59, 2, 0, mslot(MATH_TWO54));
+    // vandpd ymm2, ymm3, ymm2
+    emit_vex_ymm_rr(code, 0x54, 2, 3, 2);
+    // vandnpd ymm0, ymm3, ymm0
+    emit_vex_ymm_rr(code, 0x55, 0, 3, 0);
+    // vorpd ymm0, ymm0, ymm2
+    emit_vex_ymm_rr(code, 0x56, 0, 0, 2);
+
     // 1. Extract unbiased exponent `e0 = ((bits >> 52) & 0x7FF) - 1022` as f64 in `ymm1`:
     // vandpd ymm1, ymm0, [MATH_EXP_MASK]
     emit_vex_ymm_rm_rbp(code, 0x54, 1, 0, mslot(MATH_EXP_MASK));
@@ -2309,6 +2328,10 @@ fn emit_avx2_ln_ymm(code: &mut Vec<u8>, node_count: usize, red_count: usize, scr
     emit_vex_ymm_rm_rbp(code, 0x56, 1, 1, mslot(MATH_TWO52_BITS));
     // vsubpd ymm1, ymm1, [MATH_TWO52_PLUS_1022]
     emit_vex_ymm_rm_rbp(code, 0x5C, 1, 1, mslot(MATH_TWO52_PLUS_1022));
+    // vandpd ymm3, ymm3, [MATH_FIFTY_FOUR]
+    emit_vex_ymm_rm_rbp(code, 0x54, 3, 3, mslot(MATH_FIFTY_FOUR));
+    // vsubpd ymm1, ymm1, ymm3 (`e0 -= 54.0` for subnormal lanes)
+    emit_vex_ymm_rr(code, 0x5C, 1, 1, 3);
 
     // 2. Extract mantissa `m in [0.5, 1.0)` in `ymm2`:
     // vandpd ymm2, ymm0, [MATH_MANT_MASK]
@@ -2396,7 +2419,7 @@ fn emit_avx2_exp_ymm(code: &mut Vec<u8>, node_count: usize, red_count: usize, sc
     emit_store_ymm_rbp(code, 3, mslot(MATH_SCRATCH_YMM3));
     emit_store_ymm_rbp(code, 0, scratch_disp);
 
-    // 1. Clamp `x` into `[-708.3964185322641, 709.782712893384]` so `k` stays in `[-1022, 1023]`:
+    // 1. Clamp `x` into `[-745.1332191019412, 709.78271289338397]` so `k` stays in `[-1075, 1024]`:
     emit_vex_ymm_rm_rbp(code, 0x5F, 0, 0, mslot(MATH_EXP_CLAMP_LO)); // vmaxpd
     emit_vex_ymm_rm_rbp(code, 0x5D, 0, 0, mslot(MATH_EXP_CLAMP_HI)); // vminpd
 
@@ -2408,9 +2431,15 @@ fn emit_avx2_exp_ymm(code: &mut Vec<u8>, node_count: usize, red_count: usize, sc
     emit_vex_ymm_rm_rbp(code, 0x59, 2, 1, mslot(MATH_LN2_LO));
     emit_vex_ymm_rr(code, 0x5C, 0, 0, 2);
 
-    // 3. Construct `2^k` in `ymm1` via `((k + (2^52 + 1023.0)) << 52)`:
+    // 3. Split `k = k1 + k2` (`k1 = floor(k * 0.5)` in `ymm3`, `k2 = k - k1` in `ymm1`) so both
+    //    `2^k1` and `2^k2` stay normal in `[-538, 512]`, avoiding `2^1024` overflow and supporting gradual underflow:
+    emit_vex_ymm_rm_rbp(code, 0x59, 3, 1, mslot(MATH_HALF_EXP));
+    emit_vex_roundpd_rr(code, 3, 3, 0x09); // floor(k * 0.5)
+    emit_vex_ymm_rr(code, 0x5C, 1, 1, 3); // k2 = k - k1
+    emit_vex_ymm_rm_rbp(code, 0x58, 3, 3, mslot(MATH_TWO52_PLUS_1023));
+    emit_vex_vpsllq_ymm(code, 3, 3, 52); // ymm3 = 2^k1
     emit_vex_ymm_rm_rbp(code, 0x58, 1, 1, mslot(MATH_TWO52_PLUS_1023));
-    emit_vex_vpsllq_ymm(code, 1, 1, 52);
+    emit_vex_vpsllq_ymm(code, 1, 1, 52); // ymm1 = 2^k2
 
     // 4. Horner evaluation of `exp(r)` (`|r| <= ln(2)/2`) in `ymm2` using `r` in `ymm0`:
     emit_load_ymm_rbp(code, 2, mslot(MATH_EXP_C12));
@@ -2430,12 +2459,14 @@ fn emit_avx2_exp_ymm(code: &mut Vec<u8>, node_count: usize, red_count: usize, sc
     ] {
         emit_vex_fma_ymm_rm_rbp(code, 0xA8, 2, 0, mslot(c_slot));
     }
-    // vmulpd ymm0, ymm2, ymm1 (`ymm0 = exp(r) * 2^k`)
-    emit_vex_ymm_rr(code, 0x59, 0, 2, 1);
+    // vmulpd ymm0, ymm2, ymm3 (`ymm0 = exp(r) * 2^k1`)
+    emit_vex_ymm_rr(code, 0x59, 0, 2, 3);
+    // vmulpd ymm0, ymm0, ymm1 (`ymm0 = (exp(r) * 2^k1) * 2^k2`)
+    emit_vex_ymm_rr(code, 0x59, 0, 0, 1);
 
     // 5. IEEE-754 special cases using saved input `x` in `[rbp + scratch_disp]`:
     emit_load_ymm_rbp(code, 1, scratch_disp);
-    // 5a. `x < -708.3964185322641` (including `-Inf`) -> `+0.0`:
+    // 5a. `x < -745.1332191019412` (including `-Inf`) -> `+0.0`:
     emit_vex_ymm_rm_rbp(code, 0xC2, 2, 1, mslot(MATH_EXP_CLAMP_LO));
     code.push(0x01); // _CMP_LT_OS
     emit_vex_ymm_rr(code, 0x55, 0, 2, 0); // vandnpd ymm0, ymm2, ymm0
