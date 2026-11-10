@@ -2,7 +2,21 @@
 
 All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Tier execution engine, and `ELF64` AOT compiler are documented in this file.
 
-## [Unreleased] — Phase P0 (Safety & Correctness) & Phase P1 (AOT `YMM` Register Allocation)
+## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation) & Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`)
+
+### Added (Phase P1b — 30-Opcode ISA: `Opcode::Fma` & Vectorized 256-Bit AVX2 `Ln`/`Exp`)
+- **Explicit `Opcode::Fma = 0x27` (`src/bytecode.rs`, `src/verifier.rs`, `src/transpiler.rs`, `src/engine.rs`, `src/aot.rs`)**:
+  - Added single-rounded IEEE-754 fused multiply-add (`out[i] = fma(a[i], b[i], c[i]) = a[i] * b[i] + c[i]`) as the 30th opcode in the 128-bit `NodeFrame` ISA, packing ternary operands `(b: u16, c: u16)` into `in_b: u32` (`NodeFrame::encode_fma_bc` / `NodeFrame::decode_fma_bc`) while preserving the fixed 16-byte frame layout.
+  - Added `.rls` $\leftrightarrow$ `.rl` assembly/decompilation/disassembly support (`node $dst = Fma f64x8 a=$a b=$b c=$c`, `SymbolicGraphBuilder::emit_fma_op`).
+  - Lowered `Opcode::Fma` in `src/aot.rs` to 256-bit AVX2 FMA3 (`vfmadd213pd` / `vfmadd231pd`) in the `5a` vector loop and 64-bit FMA3 (`vfmadd213sd`) in the `5b` scalar tail and `8` post-reduction scalar epilogue.
+  - **Measured Speedup (`BM-HORNER-50`, 50-step Horner polynomial, 10,000,000 `f64` elements = 80 MB SoA)**:
+    - Explicit `Opcode::Fma` cuts the graph from 104 SSA nodes (`Mul+Add`) to 54 SSA nodes (`Fma`), shrinking the standalone `ELF64` binary from **3,872 B** to **2,877 B** (`2,757 B` machine code, compiled in **`10.07 us`**).
+    - Execution time on 10,000,000 elements drops to **40.34 ms median (`34.74 ms` min, `1.98 GB/s`)** — **`3.33x` faster** than `[A] Hand-Written C/Rust 8-Acc Horner-50` (**134.24 ms**), **`2.70x` faster** than `Mul+Add` AOT (**108.75 ms**), and **`9.81x` faster** than the pre-P1 stack-slot AOT baseline (**396 ms**).
+- **Vectorized 256-Bit AVX2 `Opcode::Ln` and `Opcode::Exp` (`src/aot.rs`)**:
+  - Replaced the 4-way scalar `x87` (`fyl2x` / `f2xm1`) calls inside the 256-bit AVX2 loop (`5a`) with branchless 4-lane AVX2 + FMA3 polynomial evaluation (`emit_avx2_ln_ymm` using `2^54` subnormal normalization, `fdlibm` rational reduction `s = (m - 1) / (m + 1)` + `Lg1..Lg7`, and Cody-Waite `LN2_HI`/`LN2_LO`; `emit_avx2_exp_ymm` using Cody-Waite range reduction, split `2^k1 * 2^k2` scaling for `k = 1024` and gradual subnormal underflow, and degree-12 FMA3 Horner evaluation) with full IEEE-754 special-case masking (`Ln`: `0 -> -Inf`, `< 0 -> NaN`, `+Inf -> +Inf`, `NaN -> NaN`; `Exp`: `< -745.1332 -> 0.0`, `> 709.7827 -> +Inf`, `NaN -> NaN`).
+  - Math constant slots (`38 x 32 B = 1,216 B`) are allocated and pre-broadcast only when `needs_vec_math` is true (`has_live_ln || has_live_exp`), incurring zero frame or code size overhead for non-transcendental programs.
+  - **Measured Speedup (`BM-TRANSCENDENTAL-LN-EXP`, `sum(exp(ln(x) * 0.5))` on 1,000,000 `f64` elements = 8 MB SoA)**:
+    - Standalone `ELF64` binary (`2,962 B`, `2,842 B` machine code) executes in **4.44..8.17 ms median across runs (`1.22x..2.26x` faster than `Rust/glibc` scalar `x.ln() + exp()` at `6.95..12.87 ms`, including standalone `ELF64` subprocess spawn and `mmap` overhead)** while matching `libm` output to `< 1e-13` relative error (`2.202161542e6`) across normal and subnormal domains.
 
 ### Breaking / Tightened Verifier Semantics
 - **`src/verifier.rs` (`ArenaSlice` & `Gather` Effective Target Bound Check)**:

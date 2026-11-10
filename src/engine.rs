@@ -276,6 +276,18 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
                     *b = true;
                 }
             }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                if let Some(a) = live.get_mut(frame.in_a as usize) {
+                    *a = true;
+                }
+                if let Some(b) = live.get_mut(in_b as usize) {
+                    *b = true;
+                }
+                if let Some(c) = live.get_mut(in_c as usize) {
+                    *c = true;
+                }
+            }
         }
     }
     live
@@ -386,6 +398,19 @@ fn eval_node_tier0<'a>(
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             eval_arith_tier0(frame.opcode, left, right, node_idx, intermediate_bytes)
+        }
+        Opcode::Fma => {
+            let (in_b, in_c) = frame.decode_fma_bc();
+            let va = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let vb = values
+                .get(in_b as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let vc = values
+                .get(in_c as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            eval_fma_tier0(va, vb, vc, node_idx, intermediate_bytes)
         }
         Opcode::Abs | Opcode::Sqrt | Opcode::Floor | Opcode::Ceil | Opcode::Ln | Opcode::Exp => {
             let src = values
@@ -648,6 +673,51 @@ fn eval_arith_tier0<'a>(
         (EvalValue::Scalar(a), EvalValue::Scalar(b)) => Ok(EvalValue::Scalar(apply(*a, *b))),
         _ => Err(ExecError::InvalidOperandState(node_idx)),
     }
+}
+
+fn eval_fma_tier0<'a>(
+    va: &EvalValue<'a>,
+    vb: &EvalValue<'a>,
+    vc: &EvalValue<'a>,
+    node_idx: u32,
+    intermediate_bytes: &mut usize,
+) -> Result<EvalValue<'a>, ExecError> {
+    if let (EvalValue::Scalar(a), EvalValue::Scalar(b), EvalValue::Scalar(c)) = (va, vb, vc) {
+        return Ok(EvalValue::Scalar(a.mul_add(*b, *c)));
+    }
+    let col_len = match (va, vb, vc) {
+        (EvalValue::ColumnF64(col), _, _)
+        | (_, EvalValue::ColumnF64(col), _)
+        | (_, _, EvalValue::ColumnF64(col)) => col.len(),
+        _ => return Err(ExecError::InvalidOperandState(node_idx)),
+    };
+    *intermediate_bytes = intermediate_bytes.saturating_add(col_len * 8);
+    let mut out = Vec::with_capacity(col_len);
+    for i in 0..col_len {
+        let a = match va {
+            EvalValue::ColumnF64(col) => {
+                *col.get(i).ok_or(ExecError::InvalidOperandState(node_idx))?
+            }
+            EvalValue::Scalar(s) => *s,
+            _ => return Err(ExecError::InvalidOperandState(node_idx)),
+        };
+        let b = match vb {
+            EvalValue::ColumnF64(col) => {
+                *col.get(i).ok_or(ExecError::InvalidOperandState(node_idx))?
+            }
+            EvalValue::Scalar(s) => *s,
+            _ => return Err(ExecError::InvalidOperandState(node_idx)),
+        };
+        let c = match vc {
+            EvalValue::ColumnF64(col) => {
+                *col.get(i).ok_or(ExecError::InvalidOperandState(node_idx))?
+            }
+            EvalValue::Scalar(s) => *s,
+            _ => return Err(ExecError::InvalidOperandState(node_idx)),
+        };
+        out.push(a.mul_add(b, c));
+    }
+    Ok(EvalValue::ColumnF64(Cow::Owned(out)))
 }
 
 fn eval_unary_math_tier0<'a>(
@@ -937,6 +1007,38 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
                     return None;
                 }
             }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                let pa = phases.get(frame.in_a as usize).copied()?;
+                let pb = phases.get(in_b as usize).copied()?;
+                let pc = phases.get(in_c as usize).copied()?;
+                if pa == TileNodePhase::Column
+                    || pb == TileNodePhase::Column
+                    || pc == TileNodePhase::Column
+                {
+                    if !matches!(pa, TileNodePhase::Const | TileNodePhase::Column)
+                        || !matches!(pb, TileNodePhase::Const | TileNodePhase::Column)
+                        || !matches!(pc, TileNodePhase::Const | TileNodePhase::Column)
+                    {
+                        return None;
+                    }
+                    TileNodePhase::Column
+                } else if matches!(
+                    pa,
+                    TileNodePhase::Const | TileNodePhase::Reduce | TileNodePhase::PostReduceScalar
+                ) && matches!(
+                    pb,
+                    TileNodePhase::Const | TileNodePhase::Reduce | TileNodePhase::PostReduceScalar
+                ) && matches!(
+                    pc,
+                    TileNodePhase::Const | TileNodePhase::Reduce | TileNodePhase::PostReduceScalar
+                ) {
+                    post_reduce_nodes.push(idx);
+                    TileNodePhase::PostReduceScalar
+                } else {
+                    return None;
+                }
+            }
             Opcode::Abs
             | Opcode::Sqrt
             | Opcode::Floor
@@ -1201,6 +1303,16 @@ fn eval_post_reduce_scalars(
             Opcode::Div => a / b,
             Opcode::Min => a.min(b),
             Opcode::Max => a.max(b),
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                let b_val = *scalar_vals
+                    .get(in_b as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let c_val = *scalar_vals
+                    .get(in_c as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                a.mul_add(b_val, c_val)
+            }
             Opcode::Abs => a.abs(),
             Opcode::Sqrt => a.sqrt(),
             Opcode::Floor => a.floor(),
@@ -1597,6 +1709,20 @@ fn eval_general_tiles_range(
                     )
                     .ok_or(ExecError::InvalidOperandState(node_idx))?;
                 }
+                Opcode::Fma => {
+                    let (in_b, in_c) = frame.decode_fma_bc();
+                    eval_tile_fma(
+                        idx,
+                        frame.in_a as usize,
+                        in_b as usize,
+                        in_c as usize,
+                        tile_len,
+                        &mut f64_regs,
+                        &scalars,
+                        &is_scalar,
+                    )
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                }
                 Opcode::Abs
                 | Opcode::Sqrt
                 | Opcode::Floor
@@ -1845,6 +1971,41 @@ fn eval_tile_arith(
             let val = apply(*scalars.get(a_idx)?, *scalars.get(b_idx)?);
             dst.fill(val);
         }
+    }
+    Some(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal L1-tile ternary FMA evaluator"
+)]
+fn eval_tile_fma(
+    dst_idx: usize,
+    a_idx: usize,
+    b_idx: usize,
+    c_idx: usize,
+    tile_len: usize,
+    f64_regs: &mut [[f64; L1_TILE_LEN]],
+    scalars: &[f64],
+    is_scalar: &[bool],
+) -> Option<()> {
+    if a_idx >= dst_idx || b_idx >= dst_idx || c_idx >= dst_idx {
+        return None;
+    }
+    let a_sc = *is_scalar.get(a_idx)?;
+    let b_sc = *is_scalar.get(b_idx)?;
+    let c_sc = *is_scalar.get(c_idx)?;
+    let sa = *scalars.get(a_idx)?;
+    let sb = *scalars.get(b_idx)?;
+    let sc = *scalars.get(c_idx)?;
+    let (left, right) = f64_regs.split_at_mut(dst_idx);
+    let dst = right.first_mut()?.get_mut(0..tile_len)?;
+
+    for (i, d) in dst.iter_mut().enumerate() {
+        let va = if a_sc { sa } else { *left.get(a_idx)?.get(i)? };
+        let vb = if b_sc { sb } else { *left.get(b_idx)?.get(i)? };
+        let vc = if c_sc { sc } else { *left.get(c_idx)?.get(i)? };
+        *d = va.mul_add(vb, vc);
     }
     Some(())
 }

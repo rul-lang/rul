@@ -382,6 +382,72 @@ pub fn compile_to_elf64_bytes(
                     AotNodePhase::PostReduceScalar
                 }
             }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                let phase_b = phases.get(in_b as usize).copied();
+                let phase_c = phases.get(in_c as usize).copied();
+                if phase_a == Some(AotNodePhase::Column)
+                    || phase_b == Some(AotNodePhase::Column)
+                    || phase_c == Some(AotNodePhase::Column)
+                {
+                    let a_ok = matches!(phase_a, Some(AotNodePhase::Column | AotNodePhase::Const));
+                    let b_ok = matches!(phase_b, Some(AotNodePhase::Column | AotNodePhase::Const));
+                    let c_ok = matches!(phase_c, Some(AotNodePhase::Column | AotNodePhase::Const));
+                    if !a_ok || !b_ok || !c_ok {
+                        return Err(AotError::UnsupportedGraph(
+                            "column Fma op depends on reduction output",
+                        ));
+                    }
+                    let len_a = col_metas.get(frame.in_a as usize).map_or(0, |m| m.col_len);
+                    let len_b = col_metas.get(in_b as usize).map_or(0, |m| m.col_len);
+                    let len_c = col_metas.get(in_c as usize).map_or(0, |m| m.col_len);
+                    let col_len = if len_a > 0 {
+                        len_a
+                    } else if len_b > 0 {
+                        len_b
+                    } else {
+                        len_c
+                    };
+                    if let Some(m) = col_metas.get_mut(idx) {
+                        *m = AotColMeta {
+                            origin_arena: None,
+                            slice_offset: 0,
+                            col_len,
+                        };
+                    }
+                    AotNodePhase::Column
+                } else {
+                    let a_ok = matches!(
+                        phase_a,
+                        Some(
+                            AotNodePhase::Const
+                                | AotNodePhase::Reduce
+                                | AotNodePhase::PostReduceScalar
+                        )
+                    );
+                    let b_ok = matches!(
+                        phase_b,
+                        Some(
+                            AotNodePhase::Const
+                                | AotNodePhase::Reduce
+                                | AotNodePhase::PostReduceScalar
+                        )
+                    );
+                    let c_ok = matches!(
+                        phase_c,
+                        Some(
+                            AotNodePhase::Const
+                                | AotNodePhase::Reduce
+                                | AotNodePhase::PostReduceScalar
+                        )
+                    );
+                    if !a_ok || !b_ok || !c_ok {
+                        return Err(AotError::UnsupportedGraph("invalid scalar Fma input phase"));
+                    }
+                    post_reduce_nodes.push(idx);
+                    AotNodePhase::PostReduceScalar
+                }
+            }
             Opcode::CmpGt
             | Opcode::CmpLt
             | Opcode::CmpEq
@@ -506,6 +572,18 @@ pub fn compile_to_elf64_bytes(
                 }
                 if let Some(b) = eval_in_loop.get_mut(frame.in_b as usize) {
                     *b = true;
+                }
+            }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                if let Some(a) = eval_in_loop.get_mut(frame.in_a as usize) {
+                    *a = true;
+                }
+                if let Some(b) = eval_in_loop.get_mut(in_b as usize) {
+                    *b = true;
+                }
+                if let Some(c) = eval_in_loop.get_mut(in_c as usize) {
+                    *c = true;
                 }
             }
             Opcode::ReduceSum
@@ -730,9 +808,27 @@ fn emit_x86_64_machine_code(
     // [rbp - 72]                                           : 8-byte stdout staging slot
     // [rbp - 128 - idx * 32]                               : 32-byte (256-bit YMM / 64-bit XMM) SSA slot for each node `idx`
     // [rbp - 128 - node_count * 32 - (red_k + 1) * 64 ..]  : 64-byte (8 x f64) accumulator lanes per reduction `red_k`
+    // [below reduction accumulators]                       : 32-byte AVX2 transcendental math constant & scratch slots (allocated only when `needs_vec_math`)
+    let has_live_ln = program.nodes.iter().enumerate().any(|(idx, frame)| {
+        eval_in_loop.get(idx).copied().unwrap_or(false)
+            && phases.get(idx).copied() == Some(AotNodePhase::Column)
+            && frame.opcode == Opcode::Ln
+    });
+    let has_live_exp = program.nodes.iter().enumerate().any(|(idx, frame)| {
+        eval_in_loop.get(idx).copied().unwrap_or(false)
+            && phases.get(idx).copied() == Some(AotNodePhase::Column)
+            && frame.opcode == Opcode::Exp
+    });
+    let needs_vec_math = avx2_vectorized && (has_live_ln || has_live_exp);
+    let math_frame_bytes = if needs_vec_math {
+        MATH_TOTAL_SLOTS.saturating_mul(32)
+    } else {
+        0
+    };
     let raw_frame = 128usize
         .saturating_add(node_count.saturating_mul(32))
-        .saturating_add(reductions.len().saturating_mul(64));
+        .saturating_add(reductions.len().saturating_mul(64))
+        .saturating_add(math_frame_bytes);
     let frame_bytes = u32::try_from(raw_frame.div_ceil(32) * 32).unwrap_or(16384);
     // sub rsp, frame_bytes
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
@@ -861,6 +957,25 @@ fn emit_x86_64_machine_code(
             }
         }
     }
+    if needs_vec_math {
+        for &(slot_idx, bits) in MATH_CONST_TABLE {
+            let disp = math_slot_disp(node_count, reductions.len(), slot_idx);
+            if bits == 0 {
+                // xor eax, eax
+                code.extend_from_slice(&[0x31, 0xC0]);
+            } else {
+                // movabs rax, bits
+                code.extend_from_slice(&[0x48, 0xB8]);
+                code.extend_from_slice(&bits.to_le_bytes());
+            }
+            for lane_off in [0i32, 8, 16, 24] {
+                let d = disp.saturating_add(lane_off);
+                // mov [rbp + d], rax
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+    }
 
     // 4. Initialize reduction accumulators across all `reductions`.
     // xor r11d, r11d (active element/vector counter for Sum reductions)
@@ -940,6 +1055,18 @@ fn emit_x86_64_machine_code(
                         *lu = idx;
                     }
                     if let Some(lu) = last_use.get_mut(frame.in_b as usize) {
+                        *lu = idx;
+                    }
+                }
+                Opcode::Fma => {
+                    let (in_b, in_c) = frame.decode_fma_bc();
+                    if let Some(lu) = last_use.get_mut(frame.in_a as usize) {
+                        *lu = idx;
+                    }
+                    if let Some(lu) = last_use.get_mut(in_b as usize) {
+                        *lu = idx;
+                    }
+                    if let Some(lu) = last_use.get_mut(in_c as usize) {
                         *lu = idx;
                     }
                 }
@@ -1068,6 +1195,70 @@ fn emit_x86_64_machine_code(
                         emit_store_ymm_rbp(&mut code, 0, disp);
                     }
                 }
+                Opcode::Fma => {
+                    let (in_b, in_c) = frame.decode_fma_bc();
+                    let b_idx = in_b as usize;
+                    let c_idx = in_c as usize;
+                    let disp_b_fma = node_disp(b_idx);
+                    let disp_c_fma = node_disp(c_idx);
+
+                    let reg_a = if let Some(ra) = node_ymm.get(a).copied().flatten() {
+                        ra
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_a);
+                        0
+                    };
+                    let reg_b = if let Some(rb) = node_ymm.get(b_idx).copied().flatten() {
+                        rb
+                    } else if b_idx == a {
+                        reg_a
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 1, disp_b_fma);
+                        1
+                    };
+                    let opt_rc = if c_idx == a {
+                        Some(reg_a)
+                    } else if c_idx == b_idx {
+                        Some(reg_b)
+                    } else {
+                        node_ymm.get(c_idx).copied().flatten()
+                    };
+
+                    free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    if b_idx != a {
+                        free_if_dying(b_idx, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    }
+                    if c_idx != a && c_idx != b_idx {
+                        free_if_dying(c_idx, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
+                    }
+                    let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
+
+                    if dst_reg == reg_a {
+                        if let Some(rc) = opt_rc {
+                            emit_vex_fma_ymm_rr(&mut code, 0xA8, dst_reg, reg_b, rc);
+                        } else {
+                            emit_vex_fma_ymm_rm_rbp(&mut code, 0xA8, dst_reg, reg_b, disp_c_fma);
+                        }
+                    } else if dst_reg == reg_b {
+                        if let Some(rc) = opt_rc {
+                            emit_vex_fma_ymm_rr(&mut code, 0xA8, dst_reg, reg_a, rc);
+                        } else {
+                            emit_vex_fma_ymm_rm_rbp(&mut code, 0xA8, dst_reg, reg_a, disp_c_fma);
+                        }
+                    } else if Some(dst_reg) == opt_rc {
+                        emit_vex_fma_ymm_rr(&mut code, 0xB8, dst_reg, reg_a, reg_b);
+                    } else {
+                        emit_vex_ymm_rr(&mut code, 0x28, dst_reg, 0, reg_a);
+                        if let Some(rc) = opt_rc {
+                            emit_vex_fma_ymm_rr(&mut code, 0xA8, dst_reg, reg_b, rc);
+                        } else {
+                            emit_vex_fma_ymm_rm_rbp(&mut code, 0xA8, dst_reg, reg_b, disp_c_fma);
+                        }
+                    }
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    }
+                }
                 Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
                     let (lhs, disp_lhs, rhs, disp_rhs, imm8) = match frame.opcode {
                         Opcode::CmpGt => (b, disp_b, a, disp_a, 0x01u8),
@@ -1172,36 +1363,32 @@ fn emit_x86_64_machine_code(
                 }
                 Opcode::Ln => {
                     if let Some(ra) = node_ymm.get(a).copied().flatten() {
-                        emit_store_ymm_rbp(&mut code, ra, disp_a);
+                        emit_vex_ymm_rr(&mut code, 0x28, 0, 0, ra);
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_a);
                     }
                     free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
-                    for lane_off in [0i32, 8, 16, 24] {
-                        emit_x87_ln_slot(
-                            &mut code,
-                            disp_a.saturating_add(lane_off),
-                            disp.saturating_add(lane_off),
-                        );
-                    }
+                    emit_avx2_ln_ymm(&mut code, node_count, reductions.len(), disp);
                     let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
-                    if dst_reg != 0 {
-                        emit_load_ymm_rbp(&mut code, dst_reg, disp);
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    } else {
+                        emit_vex_ymm_rr(&mut code, 0x28, dst_reg, 0, 0);
                     }
                 }
                 Opcode::Exp => {
                     if let Some(ra) = node_ymm.get(a).copied().flatten() {
-                        emit_store_ymm_rbp(&mut code, ra, disp_a);
+                        emit_vex_ymm_rr(&mut code, 0x28, 0, 0, ra);
+                    } else {
+                        emit_load_ymm_rbp(&mut code, 0, disp_a);
                     }
                     free_if_dying(a, idx, &last_use, &mut free_ymm_mask, &mut node_ymm);
-                    for lane_off in [0i32, 8, 16, 24] {
-                        emit_x87_exp_slot(
-                            &mut code,
-                            disp_a.saturating_add(lane_off),
-                            disp.saturating_add(lane_off),
-                        );
-                    }
+                    emit_avx2_exp_ymm(&mut code, node_count, reductions.len(), disp);
                     let dst_reg = alloc_ymm_slot(idx, &mut free_ymm_mask, &mut node_ymm);
-                    if dst_reg != 0 {
-                        emit_load_ymm_rbp(&mut code, dst_reg, disp);
+                    if dst_reg == 0 {
+                        emit_store_ymm_rbp(&mut code, 0, disp);
+                    } else {
+                        emit_vex_ymm_rr(&mut code, 0x28, dst_reg, 0, 0);
                     }
                 }
                 Opcode::Gather
@@ -1405,6 +1592,17 @@ fn emit_x86_64_machine_code(
                 // maxsd xmm0, [rbp + disp_b]
                 code.extend_from_slice(&[0xF2, 0x0F, 0x5F, 0x85]);
                 code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                let disp_b_fma = node_disp(in_b as usize);
+                let disp_c_fma = node_disp(in_c as usize);
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // movsd xmm1, [rbp + disp_b_fma]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&disp_b_fma.to_le_bytes());
+                emit_vex_fma213_xmm_rm_rbp(&mut code, 0, 1, disp_c_fma);
                 emit_store_xmm0_rbp(&mut code, disp);
             }
             Opcode::CmpGt => {
@@ -1748,6 +1946,17 @@ fn emit_x86_64_machine_code(
                 code.extend_from_slice(&disp_b.to_le_bytes());
                 emit_store_xmm0_rbp(&mut code, disp);
             }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                let disp_b_fma = node_disp(in_b as usize);
+                let disp_c_fma = node_disp(in_c as usize);
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // movsd xmm1, [rbp + disp_b_fma]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&disp_b_fma.to_le_bytes());
+                emit_vex_fma213_xmm_rm_rbp(&mut code, 0, 1, disp_c_fma);
+                emit_store_xmm0_rbp(&mut code, disp);
+            }
             Opcode::Abs => {
                 // mov rax, [rbp + disp_a]; btr rax, 63; mov [rbp + disp], rax
                 code.extend_from_slice(&[0x48, 0x8B, 0x85]);
@@ -1947,6 +2156,339 @@ fn emit_vex_roundpd_rm_rbp(code: &mut Vec<u8>, dst: u8, disp: i32, imm8: u8) {
     code.push(imm8);
 }
 
+fn emit_vex_fma_ymm_rr(code: &mut Vec<u8>, opcode: u8, dst: u8, src1: u8, src2: u8) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let b_inv = if (src2 & 8) == 0 { 0x20 } else { 0x00 };
+    let byte1 = r_inv | 0x40 | b_inv | 0x02; // mmmmm = 0x02 (0F 38)
+    let vvvv_inv = (!src1) & 0x0F;
+    let byte2 = 0x80 | (vvvv_inv << 3) | 0x05; // W = 1 (f64), L = 1 (256b), pp = 01 (0x66)
+    let modrm = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
+    code.extend_from_slice(&[0xC4, byte1, byte2, opcode, modrm]);
+}
+
+fn emit_vex_fma_ymm_rm_rbp(code: &mut Vec<u8>, opcode: u8, dst: u8, src1: u8, disp: i32) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let byte1 = r_inv | 0x62; // ~X = 1, ~B = 1 (rbp), mmmmm = 0x02 (0F 38)
+    let vvvv_inv = (!src1) & 0x0F;
+    let byte2 = 0x80 | (vvvv_inv << 3) | 0x05; // W = 1 (f64), L = 1 (256b), pp = 01 (0x66)
+    let modrm = 0x85 | ((dst & 7) << 3);
+    code.extend_from_slice(&[0xC4, byte1, byte2, opcode, modrm]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_vex_fma213_xmm_rm_rbp(code: &mut Vec<u8>, dst: u8, src1: u8, disp: i32) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let byte1 = r_inv | 0x62; // ~X = 1, ~B = 1 (rbp), mmmmm = 0x02 (0F 38)
+    let vvvv_inv = (!src1) & 0x0F;
+    let byte2 = 0x80 | (vvvv_inv << 3) | 0x01; // W = 1 (f64), L = 0 (scalar), pp = 01 (0x66)
+    let modrm = 0x85 | ((dst & 7) << 3);
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0xA9, modrm]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_vex_vpsrlq_ymm(code: &mut Vec<u8>, dst: u8, src: u8, imm8: u8) {
+    let b_inv = if (src & 8) == 0 { 0x20 } else { 0x00 };
+    let byte1 = 0xC0 | b_inv | 0x01; // ~R = 1, ~X = 1, ~B, mmmmm = 0x01 (0F)
+    let vvvv_inv = (!dst) & 0x0F;
+    let byte2 = (vvvv_inv << 3) | 0x05; // W = 0, L = 1 (256b), pp = 01 (0x66)
+    let modrm = 0xD0 | (src & 7); // /2
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0x73, modrm, imm8]);
+}
+
+fn emit_vex_vpsllq_ymm(code: &mut Vec<u8>, dst: u8, src: u8, imm8: u8) {
+    let b_inv = if (src & 8) == 0 { 0x20 } else { 0x00 };
+    let byte1 = 0xC0 | b_inv | 0x01; // ~R = 1, ~X = 1, ~B, mmmmm = 0x01 (0F)
+    let vvvv_inv = (!dst) & 0x0F;
+    let byte2 = (vvvv_inv << 3) | 0x05; // W = 0, L = 1 (256b), pp = 01 (0x66)
+    let modrm = 0xF0 | (src & 7); // /6
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0x73, modrm, imm8]);
+}
+
+const MATH_SCRATCH_YMM2: usize = 0;
+const MATH_SCRATCH_YMM3: usize = 1;
+const MATH_ZERO: usize = 2;
+const MATH_ONE: usize = 3;
+const MATH_EXP_MASK: usize = 4;
+const MATH_MANT_MASK: usize = 5;
+const MATH_HALF_EXP: usize = 6;
+const MATH_SQRT_HALF: usize = 7;
+const MATH_TWO52_BITS: usize = 8;
+const MATH_TWO52_PLUS_1022: usize = 9;
+const MATH_TWO52_PLUS_1023: usize = 10;
+const MATH_LN2_HI: usize = 11;
+const MATH_LN2_LO: usize = 12;
+const MATH_LOG2_E: usize = 13;
+const MATH_NEG_INF: usize = 14;
+const MATH_QNAN: usize = 15;
+const MATH_LG1: usize = 16;
+const MATH_LG2: usize = 17;
+const MATH_LG3: usize = 18;
+const MATH_LG4: usize = 19;
+const MATH_LG5: usize = 20;
+const MATH_LG6: usize = 21;
+const MATH_LG7: usize = 22;
+const MATH_EXP_CLAMP_LO: usize = 23;
+const MATH_EXP_CLAMP_HI: usize = 24;
+const MATH_EXP_C3: usize = 25;
+const MATH_EXP_C4: usize = 26;
+const MATH_EXP_C5: usize = 27;
+const MATH_EXP_C6: usize = 28;
+const MATH_EXP_C7: usize = 29;
+const MATH_EXP_C8: usize = 30;
+const MATH_EXP_C9: usize = 31;
+const MATH_EXP_C10: usize = 32;
+const MATH_EXP_C11: usize = 33;
+const MATH_EXP_C12: usize = 34;
+const MATH_DBL_MIN: usize = 35;
+const MATH_TWO54: usize = 36;
+const MATH_FIFTY_FOUR: usize = 37;
+const MATH_TOTAL_SLOTS: usize = 38;
+
+const MATH_CONST_TABLE: &[(usize, u64)] = &[
+    (MATH_ZERO, 0x0000_0000_0000_0000),
+    (MATH_ONE, 0x3FF0_0000_0000_0000),
+    (MATH_EXP_MASK, 0x7FF0_0000_0000_0000),
+    (MATH_MANT_MASK, 0x000F_FFFF_FFFF_FFFF),
+    (MATH_HALF_EXP, 0x3FE0_0000_0000_0000),
+    (MATH_SQRT_HALF, 0x3FE6_A09E_667F_3BCD),
+    (MATH_TWO52_BITS, 0x4330_0000_0000_0000),
+    (MATH_TWO52_PLUS_1022, 0x4330_0000_0000_03FE),
+    (MATH_TWO52_PLUS_1023, 0x4330_0000_0000_03FF),
+    (MATH_LN2_HI, 0x3FE6_2E42_FEE0_0000),
+    (MATH_LN2_LO, 0x3DEA_39EF_3579_3C76),
+    (MATH_LOG2_E, 0x3FF7_1547_652B_82FE),
+    (MATH_NEG_INF, 0xFFF0_0000_0000_0000),
+    (MATH_QNAN, 0x7FF8_0000_0000_0000),
+    (MATH_LG1, 0x3FE5_5555_5555_5593),
+    (MATH_LG2, 0x3FD9_9999_9997_FA04),
+    (MATH_LG3, 0x3FD2_4924_9422_9359),
+    (MATH_LG4, 0x3FCC_71C5_1D8E_78AF),
+    (MATH_LG5, 0x3FC7_4664_96CB_03DE),
+    (MATH_LG6, 0x3FC3_9A09_D078_C69F),
+    (MATH_LG7, 0x3FC2_F112_DF3E_5244),
+    (MATH_EXP_CLAMP_LO, 0xC087_4910_D52D_3052),
+    (MATH_EXP_CLAMP_HI, 0x4086_2E42_FEFA_39EF),
+    (MATH_EXP_C3, (1.0_f64 / 6.0_f64).to_bits()),
+    (MATH_EXP_C4, (1.0_f64 / 24.0_f64).to_bits()),
+    (MATH_EXP_C5, (1.0_f64 / 120.0_f64).to_bits()),
+    (MATH_EXP_C6, (1.0_f64 / 720.0_f64).to_bits()),
+    (MATH_EXP_C7, (1.0_f64 / 5_040.0_f64).to_bits()),
+    (MATH_EXP_C8, (1.0_f64 / 40_320.0_f64).to_bits()),
+    (MATH_EXP_C9, (1.0_f64 / 362_880.0_f64).to_bits()),
+    (MATH_EXP_C10, (1.0_f64 / 3_628_800.0_f64).to_bits()),
+    (MATH_EXP_C11, (1.0_f64 / 39_916_800.0_f64).to_bits()),
+    (MATH_EXP_C12, (1.0_f64 / 479_001_600.0_f64).to_bits()),
+    (MATH_DBL_MIN, 0x0010_0000_0000_0000),
+    (MATH_TWO54, 0x4350_0000_0000_0000),
+    (MATH_FIFTY_FOUR, 0x404B_0000_0000_0000),
+];
+
+fn math_slot_disp(node_count: usize, red_count: usize, slot_idx: usize) -> i32 {
+    let base_nodes =
+        (-128i32).saturating_sub(i32::try_from(node_count).unwrap_or(0).saturating_mul(32));
+    let base_reds =
+        base_nodes.saturating_sub(i32::try_from(red_count).unwrap_or(0).saturating_mul(64));
+    base_reds.saturating_sub(
+        i32::try_from(slot_idx.saturating_add(1))
+            .unwrap_or(1)
+            .saturating_mul(32),
+    )
+}
+
+/// Emits a 4-way vectorized 256-bit AVX2 + FMA3 natural logarithm (`ln(x)`) evaluating `ymm0 -> ymm0`
+/// using fdlibm's rational transformation `s = (m - 1) / (m + 1)` and degree-7 minimax series `Lg1..Lg7`
+/// with full IEEE-754 special-case masking (`x == 0 -> -Inf`, `x < 0 -> NaN`, `+Inf -> +Inf`, `NaN -> NaN`).
+fn emit_avx2_ln_ymm(code: &mut Vec<u8>, node_count: usize, red_count: usize, scratch_disp: i32) {
+    let mslot = |s: usize| math_slot_disp(node_count, red_count, s);
+
+    // Save `ymm2` and `ymm3` to scratch slots and save original input `x` (`ymm0`) to `[rbp + scratch_disp]`.
+    emit_store_ymm_rbp(code, 2, mslot(MATH_SCRATCH_YMM2));
+    emit_store_ymm_rbp(code, 3, mslot(MATH_SCRATCH_YMM3));
+    emit_store_ymm_rbp(code, 0, scratch_disp);
+
+    // 0. Normalize subnormal inputs (`0 < x < 2^-1022`) by scaling `x * 2^54` and subtracting `54.0` from `e0`:
+    // vcmppd ymm3, ymm0, [MATH_DBL_MIN], 0x01 (_CMP_LT_OS)
+    emit_vex_ymm_rm_rbp(code, 0xC2, 3, 0, mslot(MATH_DBL_MIN));
+    code.push(0x01);
+    // vmulpd ymm2, ymm0, [MATH_TWO54]
+    emit_vex_ymm_rm_rbp(code, 0x59, 2, 0, mslot(MATH_TWO54));
+    // vandpd ymm2, ymm3, ymm2
+    emit_vex_ymm_rr(code, 0x54, 2, 3, 2);
+    // vandnpd ymm0, ymm3, ymm0
+    emit_vex_ymm_rr(code, 0x55, 0, 3, 0);
+    // vorpd ymm0, ymm0, ymm2
+    emit_vex_ymm_rr(code, 0x56, 0, 0, 2);
+
+    // 1. Extract unbiased exponent `e0 = ((bits >> 52) & 0x7FF) - 1022` as f64 in `ymm1`:
+    // vandpd ymm1, ymm0, [MATH_EXP_MASK]
+    emit_vex_ymm_rm_rbp(code, 0x54, 1, 0, mslot(MATH_EXP_MASK));
+    // vpsrlq ymm1, ymm1, 52
+    emit_vex_vpsrlq_ymm(code, 1, 1, 52);
+    // vorpd ymm1, ymm1, [MATH_TWO52_BITS]
+    emit_vex_ymm_rm_rbp(code, 0x56, 1, 1, mslot(MATH_TWO52_BITS));
+    // vsubpd ymm1, ymm1, [MATH_TWO52_PLUS_1022]
+    emit_vex_ymm_rm_rbp(code, 0x5C, 1, 1, mslot(MATH_TWO52_PLUS_1022));
+    // vandpd ymm3, ymm3, [MATH_FIFTY_FOUR]
+    emit_vex_ymm_rm_rbp(code, 0x54, 3, 3, mslot(MATH_FIFTY_FOUR));
+    // vsubpd ymm1, ymm1, ymm3 (`e0 -= 54.0` for subnormal lanes)
+    emit_vex_ymm_rr(code, 0x5C, 1, 1, 3);
+
+    // 2. Extract mantissa `m in [0.5, 1.0)` in `ymm2`:
+    // vandpd ymm2, ymm0, [MATH_MANT_MASK]
+    emit_vex_ymm_rm_rbp(code, 0x54, 2, 0, mslot(MATH_MANT_MASK));
+    // vorpd ymm2, ymm2, [MATH_HALF_EXP]
+    emit_vex_ymm_rm_rbp(code, 0x56, 2, 2, mslot(MATH_HALF_EXP));
+
+    // 3. Center `m` into `[sqrt(0.5), sqrt(2))`: if `m < sqrt(0.5)`, `m *= 2` and `e -= 1.0`:
+    // vcmppd ymm3, ymm2, [MATH_SQRT_HALF], 0x01 (_CMP_LT_OS)
+    emit_vex_ymm_rm_rbp(code, 0xC2, 3, 2, mslot(MATH_SQRT_HALF));
+    code.push(0x01);
+    // vandpd ymm0, ymm2, ymm3
+    emit_vex_ymm_rr(code, 0x54, 0, 2, 3);
+    // vaddpd ymm2, ymm2, ymm0
+    emit_vex_ymm_rr(code, 0x58, 2, 2, 0);
+    // vandpd ymm3, ymm3, [MATH_ONE]
+    emit_vex_ymm_rm_rbp(code, 0x54, 3, 3, mslot(MATH_ONE));
+    // vsubpd ymm1, ymm1, ymm3 (`ymm1 = e`)
+    emit_vex_ymm_rr(code, 0x5C, 1, 1, 3);
+
+    // 4. Compute `s = (m - 1.0) / (m + 1.0)` in `ymm2` and `z = s * s` in `ymm3`:
+    // vsubpd ymm0, ymm2, [MATH_ONE]
+    emit_vex_ymm_rm_rbp(code, 0x5C, 0, 2, mslot(MATH_ONE));
+    // vaddpd ymm2, ymm2, [MATH_ONE]
+    emit_vex_ymm_rm_rbp(code, 0x58, 2, 2, mslot(MATH_ONE));
+    // vdivpd ymm2, ymm0, ymm2 (`ymm2 = s`)
+    emit_vex_ymm_rr(code, 0x5E, 2, 0, 2);
+    // vmulpd ymm3, ymm2, ymm2 (`ymm3 = z = s * s`)
+    emit_vex_ymm_rr(code, 0x59, 3, 2, 2);
+
+    // 5. Horner evaluation of `R(z) = z * (Lg1 + z * (Lg2 + ... + z * Lg7))` in `ymm0`:
+    emit_load_ymm_rbp(code, 0, mslot(MATH_LG7));
+    for &lg_slot in &[MATH_LG6, MATH_LG5, MATH_LG4, MATH_LG3, MATH_LG2, MATH_LG1] {
+        emit_vex_fma_ymm_rm_rbp(code, 0xA8, 0, 3, mslot(lg_slot));
+    }
+    // vmulpd ymm0, ymm0, ymm3 (`ymm0 = R(z)`)
+    emit_vex_ymm_rr(code, 0x59, 0, 0, 3);
+    // vaddpd ymm3, ymm2, ymm2 (`ymm3 = 2.0 * s`)
+    emit_vex_ymm_rr(code, 0x58, 3, 2, 2);
+    // vfmadd213pd ymm0, ymm2, ymm3 (`ymm0 = R(z) * s + 2.0 * s = ln(m)`)
+    emit_vex_fma_ymm_rr(code, 0xA8, 0, 2, 3);
+
+    // 6. Combine with `e * ln(2)` using Cody-Waite `LN2_HI + LN2_LO`:
+    emit_load_ymm_rbp(code, 2, mslot(MATH_LN2_LO));
+    // vfmadd213pd ymm2, ymm1, ymm0 (`ymm2 = e * LN2_LO + ln(m)`)
+    emit_vex_fma_ymm_rr(code, 0xA8, 2, 1, 0);
+    emit_load_ymm_rbp(code, 0, mslot(MATH_LN2_HI));
+    // vfmadd213pd ymm0, ymm1, ymm2 (`ymm0 = e * LN2_HI + (e * LN2_LO + ln(m))`)
+    emit_vex_fma_ymm_rr(code, 0xA8, 0, 1, 2);
+
+    // 7. IEEE-754 special cases using saved input `x` in `[rbp + scratch_disp]`:
+    emit_load_ymm_rbp(code, 1, scratch_disp);
+    // 7a. `x == 0.0` (including `-0.0`) -> `-Inf`:
+    emit_vex_ymm_rm_rbp(code, 0xC2, 2, 1, mslot(MATH_ZERO));
+    code.push(0x00); // _CMP_EQ_OQ
+    emit_vex_ymm_rr(code, 0x55, 0, 2, 0); // vandnpd ymm0, ymm2, ymm0
+    emit_vex_ymm_rm_rbp(code, 0x54, 2, 2, mslot(MATH_NEG_INF));
+    emit_vex_ymm_rr(code, 0x56, 0, 0, 2);
+    // 7b. `x == +Inf` -> `+Inf`:
+    emit_vex_ymm_rm_rbp(code, 0xC2, 2, 1, mslot(MATH_EXP_MASK));
+    code.push(0x00); // _CMP_EQ_OQ
+    emit_vex_ymm_rr(code, 0x55, 0, 2, 0);
+    emit_vex_ymm_rm_rbp(code, 0x54, 2, 2, mslot(MATH_EXP_MASK));
+    emit_vex_ymm_rr(code, 0x56, 0, 0, 2);
+    // 7c. `x < 0.0 || x.is_nan()` -> `QNaN`:
+    emit_vex_ymm_rm_rbp(code, 0xC2, 2, 1, mslot(MATH_ZERO));
+    code.push(0x09); // _CMP_NGE_UQ (`!(x >= 0.0)`)
+    emit_vex_ymm_rr(code, 0x55, 0, 2, 0);
+    emit_vex_ymm_rm_rbp(code, 0x54, 2, 2, mslot(MATH_QNAN));
+    emit_vex_ymm_rr(code, 0x56, 0, 0, 2);
+
+    // Restore `ymm2` and `ymm3`.
+    emit_load_ymm_rbp(code, 2, mslot(MATH_SCRATCH_YMM2));
+    emit_load_ymm_rbp(code, 3, mslot(MATH_SCRATCH_YMM3));
+}
+
+/// Emits a 4-way vectorized 256-bit AVX2 + FMA3 exponential (`exp(x)`) evaluating `ymm0 -> ymm0`
+/// using Cody-Waite range reduction `x = k * ln(2) + r` (`|r| <= ln(2)/2`) and degree-12 Taylor/minimax
+/// evaluation with IEEE-754 overflow (`+Inf`), underflow (`0.0`), and `NaN` preservation.
+fn emit_avx2_exp_ymm(code: &mut Vec<u8>, node_count: usize, red_count: usize, scratch_disp: i32) {
+    let mslot = |s: usize| math_slot_disp(node_count, red_count, s);
+
+    // Save `ymm2` and `ymm3` to scratch slots and save original input `x` (`ymm0`) to `[rbp + scratch_disp]`.
+    emit_store_ymm_rbp(code, 2, mslot(MATH_SCRATCH_YMM2));
+    emit_store_ymm_rbp(code, 3, mslot(MATH_SCRATCH_YMM3));
+    emit_store_ymm_rbp(code, 0, scratch_disp);
+
+    // 1. Clamp `x` into `[-745.1332191019412, 709.78271289338397]` so `k` stays in `[-1075, 1024]`:
+    emit_vex_ymm_rm_rbp(code, 0x5F, 0, 0, mslot(MATH_EXP_CLAMP_LO)); // vmaxpd
+    emit_vex_ymm_rm_rbp(code, 0x5D, 0, 0, mslot(MATH_EXP_CLAMP_HI)); // vminpd
+
+    // 2. Range reduction `k = round_nearest_even(x * LOG2_E)` in `ymm1` and `r = (x - k*LN2_HI) - k*LN2_LO` in `ymm0`:
+    emit_vex_ymm_rm_rbp(code, 0x59, 1, 0, mslot(MATH_LOG2_E));
+    emit_vex_roundpd_rr(code, 1, 1, 0x08);
+    emit_vex_ymm_rm_rbp(code, 0x59, 2, 1, mslot(MATH_LN2_HI));
+    emit_vex_ymm_rr(code, 0x5C, 0, 0, 2);
+    emit_vex_ymm_rm_rbp(code, 0x59, 2, 1, mslot(MATH_LN2_LO));
+    emit_vex_ymm_rr(code, 0x5C, 0, 0, 2);
+
+    // 3. Split `k = k1 + k2` (`k1 = floor(k * 0.5)` in `ymm3`, `k2 = k - k1` in `ymm1`) so both
+    //    `2^k1` and `2^k2` stay normal in `[-538, 512]`, avoiding `2^1024` overflow and supporting gradual underflow:
+    emit_vex_ymm_rm_rbp(code, 0x59, 3, 1, mslot(MATH_HALF_EXP));
+    emit_vex_roundpd_rr(code, 3, 3, 0x09); // floor(k * 0.5)
+    emit_vex_ymm_rr(code, 0x5C, 1, 1, 3); // k2 = k - k1
+    emit_vex_ymm_rm_rbp(code, 0x58, 3, 3, mslot(MATH_TWO52_PLUS_1023));
+    emit_vex_vpsllq_ymm(code, 3, 3, 52); // ymm3 = 2^k1
+    emit_vex_ymm_rm_rbp(code, 0x58, 1, 1, mslot(MATH_TWO52_PLUS_1023));
+    emit_vex_vpsllq_ymm(code, 1, 1, 52); // ymm1 = 2^k2
+
+    // 4. Horner evaluation of `exp(r)` (`|r| <= ln(2)/2`) in `ymm2` using `r` in `ymm0`:
+    emit_load_ymm_rbp(code, 2, mslot(MATH_EXP_C12));
+    for &c_slot in &[
+        MATH_EXP_C11,
+        MATH_EXP_C10,
+        MATH_EXP_C9,
+        MATH_EXP_C8,
+        MATH_EXP_C7,
+        MATH_EXP_C6,
+        MATH_EXP_C5,
+        MATH_EXP_C4,
+        MATH_EXP_C3,
+        MATH_HALF_EXP,
+        MATH_ONE,
+        MATH_ONE,
+    ] {
+        emit_vex_fma_ymm_rm_rbp(code, 0xA8, 2, 0, mslot(c_slot));
+    }
+    // vmulpd ymm0, ymm2, ymm3 (`ymm0 = exp(r) * 2^k1`)
+    emit_vex_ymm_rr(code, 0x59, 0, 2, 3);
+    // vmulpd ymm0, ymm0, ymm1 (`ymm0 = (exp(r) * 2^k1) * 2^k2`)
+    emit_vex_ymm_rr(code, 0x59, 0, 0, 1);
+
+    // 5. IEEE-754 special cases using saved input `x` in `[rbp + scratch_disp]`:
+    emit_load_ymm_rbp(code, 1, scratch_disp);
+    // 5a. `x < -745.1332191019412` (including `-Inf`) -> `+0.0`:
+    emit_vex_ymm_rm_rbp(code, 0xC2, 2, 1, mslot(MATH_EXP_CLAMP_LO));
+    code.push(0x01); // _CMP_LT_OS
+    emit_vex_ymm_rr(code, 0x55, 0, 2, 0); // vandnpd ymm0, ymm2, ymm0
+                                          // 5b. `x > 709.782712893384` (including `+Inf`) -> `+Inf`:
+    emit_load_ymm_rbp(code, 2, mslot(MATH_EXP_CLAMP_HI));
+    emit_vex_ymm_rr(code, 0xC2, 2, 2, 1);
+    code.push(0x01); // _CMP_LT_OS (`EXP_CLAMP_HI < x`)
+    emit_vex_ymm_rr(code, 0x55, 0, 2, 0);
+    emit_vex_ymm_rm_rbp(code, 0x54, 2, 2, mslot(MATH_EXP_MASK));
+    emit_vex_ymm_rr(code, 0x56, 0, 0, 2);
+    // 5c. `x.is_nan()` -> `QNaN`:
+    emit_vex_ymm_rr(code, 0xC2, 2, 1, 1);
+    code.push(0x03); // _CMP_UNORD_Q
+    emit_vex_ymm_rr(code, 0x55, 0, 2, 0);
+    emit_vex_ymm_rm_rbp(code, 0x54, 2, 2, mslot(MATH_QNAN));
+    emit_vex_ymm_rr(code, 0x56, 0, 0, 2);
+
+    // Restore `ymm2` and `ymm3`.
+    emit_load_ymm_rbp(code, 2, mslot(MATH_SCRATCH_YMM2));
+    emit_load_ymm_rbp(code, 3, mslot(MATH_SCRATCH_YMM3));
+}
+
 fn emit_load_ymm0_rbp(code: &mut Vec<u8>, disp: i32) {
     emit_load_ymm_rbp(code, 0, disp);
 }
@@ -2112,6 +2654,18 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
                 }
                 if let Some(b) = live.get_mut(frame.in_b as usize) {
                     *b = true;
+                }
+            }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                if let Some(a) = live.get_mut(frame.in_a as usize) {
+                    *a = true;
+                }
+                if let Some(b) = live.get_mut(in_b as usize) {
+                    *b = true;
+                }
+                if let Some(c) = live.get_mut(in_c as usize) {
+                    *c = true;
                 }
             }
         }

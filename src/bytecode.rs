@@ -84,6 +84,8 @@ pub enum Opcode {
     MaskAnd = 0x25,
     /// Branchless elementwise boolean mask disjunction (`mask[i] = a[i] || b[i]`).
     MaskOr = 0x26,
+    /// Branchless elementwise IEEE-754 fused multiply-add (`out[i] = a[i] * b[i] + c[i]` with single rounding; `in_a = a`, `in_b = (b & 0xFFFF) | (c << 16)`).
+    Fma = 0x27,
     /// Enqueue scalar/column output to a hardware NIC ring (requires [`CAP_NET_RING`]).
     RingEnqueue = 0x30,
     /// Output contract assertion checking non-NaN and finite bounds on `in_a`.
@@ -124,6 +126,7 @@ impl Opcode {
             0x24 => Ok(Self::ReduceMin),
             0x25 => Ok(Self::MaskAnd),
             0x26 => Ok(Self::MaskOr),
+            0x27 => Ok(Self::Fma),
             0x30 => Ok(Self::RingEnqueue),
             0x40 => Ok(Self::AssertContract),
             other => Err(RulFormatError::UnknownOpcode(other)),
@@ -537,6 +540,38 @@ impl NodeFrame {
     pub const fn decode_const_f64(self) -> f64 {
         let bits = (self.in_a as u64) | ((self.in_b as u64) << 32);
         f64::from_bits(bits)
+    }
+
+    /// Packs the second (`in_b`) and third (`in_c`) 16-bit node indices into the `in_b` field of an [`Opcode::Fma`] frame.
+    #[must_use]
+    pub const fn encode_fma_bc(in_b: u16, in_c: u16) -> u32 {
+        (in_b as u32) | ((in_c as u32) << 16)
+    }
+
+    /// Unpacks the `(in_b, in_c)` node indices from the `in_b` field of an [`Opcode::Fma`] frame.
+    #[must_use]
+    pub const fn decode_fma_bc(self) -> (u32, u32) {
+        (self.in_b & 0xFFFF, self.in_b >> 16)
+    }
+
+    /// Encodes a ternary [`Opcode::Fma`] frame (`a * b + c` with single IEEE-754 rounding).
+    #[must_use]
+    pub const fn fma(
+        type_lane: TypeLane,
+        in_a: u32,
+        in_b: u16,
+        in_c: u16,
+        schedule: ScheduleHint,
+    ) -> Self {
+        Self {
+            opcode: Opcode::Fma,
+            type_lane,
+            schedule,
+            proof_idx: 0,
+            token_op: TokenOp::PURE,
+            in_a,
+            in_b: Self::encode_fma_bc(in_b, in_c),
+        }
     }
 
     /// Serializes the 128-bit frame into 16 little-endian bytes.

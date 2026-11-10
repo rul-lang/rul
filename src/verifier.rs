@@ -475,6 +475,30 @@ fn verify_node_semantics(
                 origin_arena: None,
             })
         }
+        Opcode::Fma => {
+            let (in_b, in_c) = frame.decode_fma_bc();
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas)?;
+            let meta_b = get_prior_meta(node_idx, in_b, metas)?;
+            let meta_c = get_prior_meta(node_idx, in_c, metas)?;
+            for m in [meta_a, meta_b, meta_c] {
+                if m.elem != ElemType::F64 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ElementTypeMismatch {
+                            expected: ElemType::F64,
+                            actual: m.elem,
+                        },
+                    });
+                }
+            }
+            let shape_ab = unify_elementwise_shapes(node_idx, meta_a.shape, meta_b.shape)?;
+            let shape = unify_elementwise_shapes(node_idx, shape_ab, meta_c.shape)?;
+            Ok(NodeMeta {
+                shape,
+                elem: ElemType::F64,
+                origin_arena: None,
+            })
+        }
         Opcode::Abs | Opcode::Sqrt | Opcode::Floor | Opcode::Ceil | Opcode::Ln | Opcode::Exp => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas)?;
             if meta_a.elem != ElemType::F64 {

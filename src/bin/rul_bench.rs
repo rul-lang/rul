@@ -191,6 +191,32 @@ fn build_horner50_pipeline(elem_count: u32, policy: ExecPolicy) -> Result<RulPro
     b.finish("$sum").map_err(|e| e.to_string())
 }
 
+fn build_horner50_fma_pipeline(elem_count: u32, policy: ExecPolicy) -> Result<RulProgram, String> {
+    let mut b = SymbolicGraphBuilder::new(CAP_NONE);
+    let a0 = b.add_arena(elem_count, TypeLane::F64X8, false);
+    let s = ScheduleHint {
+        fusion_group: 1,
+        policy,
+    };
+    b.emit_arena_input("$x", a0, 1, s)
+        .map_err(|e| e.to_string())?;
+    b.emit_const_f64("$c0", 1.000_001, s)
+        .map_err(|e| e.to_string())?;
+    b.emit_const_f64("$c1", 0.999_999, s)
+        .map_err(|e| e.to_string())?;
+    let mut acc = "$c0".to_owned();
+    for step in 0..50usize {
+        let f = format!("$f{step}");
+        let c = if (step & 1) == 0 { "$c1" } else { "$c0" };
+        b.emit_fma_op(&f, TypeLane::F64X8, &acc, "$x", c, s)
+            .map_err(|e| e.to_string())?;
+        acc = f;
+    }
+    b.emit_unary_op("$sum", Opcode::ReduceSum, TypeLane::F64_SCALAR, &acc, s)
+        .map_err(|e| e.to_string())?;
+    b.finish("$sum").map_err(|e| e.to_string())
+}
+
 #[inline(never)]
 fn run_handwritten_c_horner50(xs: &[f64]) -> f64 {
     let c0 = 1.000_001_f64;
@@ -627,17 +653,21 @@ fn main() -> Result<(), String> {
     let suite_reports = run_10_pipeline_suite(100_000).map_err(|e| e.to_string())?;
     print!("{}", format_suite10_table(&suite_reports));
 
-    // 6. Run BM-HORNER-50 (50-Step Horner Polynomial, 104 SSA Nodes, 10,000,000 Elements = 80 MB SoA)
+    // 6. Run BM-HORNER-50 (50-Step Horner Polynomial: Mul+Add 104 Nodes vs Explicit FMA 54 Nodes, 10,000,000 Elements = 80 MB SoA)
     let horner_elems: u32 = 10_000_000;
     let horner_bytes = (horner_elems as usize) * 8;
     let horner_prog = build_horner50_pipeline(horner_elems, ExecPolicy::SimdStream)?;
+    let horner_fma_prog = build_horner50_fma_pipeline(horner_elems, ExecPolicy::SimdStream)?;
     let horner_x: Vec<f64> = (0..horner_elems)
         .map(|i| 0.5 + (f64::from(i % 16) * 0.025))
         .collect();
     let horner_exe = "target/horner50_aot";
+    let horner_fma_exe = "target/horner50_fma_aot";
     let horner_data = "target/horner50_data.bin";
     let horner_aot_rep =
         compile_rl_to_executable(&horner_prog, horner_exe).map_err(|e| e.to_string())?;
+    let horner_fma_aot_rep =
+        compile_rl_to_executable(&horner_fma_prog, horner_fma_exe).map_err(|e| e.to_string())?;
     write_arena_data_file(horner_data, &[&horner_x]).map_err(|e| e.to_string())?;
     let (h_c_val, h_c_stats) = bench_runs(2, 7, horner_bytes, || {
         run_handwritten_c_horner50(black_box(&horner_x))
@@ -653,7 +683,23 @@ fn main() -> Result<(), String> {
     let (h_aot_val, h_aot_stats) = bench_runs(2, 7, horner_bytes, || {
         run_compiled_executable(horner_exe, horner_data).unwrap_or(f64::NAN)
     });
-    for (label, obs) in [("horner_tier2", h_t2_val), ("horner_aot", h_aot_val)] {
+    let (h_fma_t2_val, h_fma_t2_stats) = bench_runs(2, 7, horner_bytes, || {
+        match execute_tier2_fused(black_box(&horner_fma_prog), &[black_box(&horner_x)])
+            .map(|r| r.output)
+        {
+            Ok(RuntimeValue::Scalar(v)) => v,
+            _ => f64::NAN,
+        }
+    });
+    let (h_fma_aot_val, h_fma_aot_stats) = bench_runs(2, 7, horner_bytes, || {
+        run_compiled_executable(horner_fma_exe, horner_data).unwrap_or(f64::NAN)
+    });
+    for (label, obs) in [
+        ("horner_tier2", h_t2_val),
+        ("horner_aot", h_aot_val),
+        ("horner_fma_tier2", h_fma_t2_val),
+        ("horner_fma_aot", h_fma_aot_val),
+    ] {
         let rel_diff = (obs - h_c_val).abs() / h_c_val.abs().max(1.0);
         if rel_diff > 1e-9 {
             return Err(format!(
@@ -662,13 +708,19 @@ fn main() -> Result<(), String> {
         }
     }
     println!(
-        "\n=== 5. BM-HORNER-50 (50-STEP HORNER POLYNOMIAL, 104 SSA NODES, {horner_elems} ELEMS = 80 MB SoA) ==="
+        "\n=== 5. BM-HORNER-50 (50-STEP HORNER POLYNOMIAL, {horner_elems} ELEMS = 80 MB SoA) ==="
     );
     println!(
-        "  AOT ELF64 Size     : {} B (MachineCode={} B, Compile={} ns)",
+        "  AOT ELF64 (Mul+Add 104 Nodes) : {} B (MachineCode={} B, Compile={} ns)",
         horner_aot_rep.elf_bytes,
         horner_aot_rep.machine_code_bytes,
         horner_aot_rep.total_compile_ns
+    );
+    println!(
+        "  AOT ELF64 (FMA 54 Nodes)      : {} B (MachineCode={} B, Compile={} ns)",
+        horner_fma_aot_rep.elf_bytes,
+        horner_fma_aot_rep.machine_code_bytes,
+        horner_fma_aot_rep.total_compile_ns
     );
     println!(
         "  IMPLEMENTATION                                  | MEDIAN (ms) | MIN..MAX (ms)     | EFF. BW     | RATIO vs C-8ACC"
@@ -681,10 +733,18 @@ fn main() -> Result<(), String> {
             "[A] Hand-Written C/Rust 8-Acc Horner-50 (1-Core)",
             h_c_stats,
         ),
-        ("[B] Rul (.rl) Tier 2 Fused Horner-50 (1-Core)", h_t2_stats),
+        ("[B] Rul (.rl) Tier 2 Fused Mul+Add (1-Core)", h_t2_stats),
         (
-            "[C] Rul (.rl) AOT Native ELF64 Horner-50 (1-Core)",
+            "[C] Rul (.rl) AOT Native ELF64 Mul+Add (1-Core)",
             h_aot_stats,
+        ),
+        (
+            "[D] Rul (.rl) Tier 2 Fused Explicit FMA (1-Core)",
+            h_fma_t2_stats,
+        ),
+        (
+            "[E] Rul (.rl) AOT Native ELF64 FMA (1-Core)",
+            h_fma_aot_stats,
         ),
     ] {
         println!(
@@ -697,7 +757,91 @@ fn main() -> Result<(), String> {
         );
     }
     println!(
-        "  Verified Horner-50 Output Sum : {h_aot_val:.6e} (Tier2={h_t2_val:.6e}, C8={h_c_val:.6e})"
+        "  Verified Horner-50 Output Sum : FMA_AOT={h_fma_aot_val:.6e} (MulAdd_AOT={h_aot_val:.6e}, C8={h_c_val:.6e})"
+    );
+
+    // 7. Run BM-TRANSCENDENTAL-LN-EXP (Vectorized 256-Bit AVX2 Ln + Exp, 1,000,000 Elements = 8 MB SoA)
+    let trans_elems: u32 = 1_000_000;
+    let trans_bytes = (trans_elems as usize) * 8;
+    let trans_rls = format!(
+        "\
+        arena 0 len={trans_elems} lane=f64x8
+        node $x = ArenaInput f64x8 a=0
+        node $half = ConstF64 f64x1 const=0.5
+        node $lnx = Ln f64x8 a=$x
+        node $scaled = Mul f64x8 a=$lnx b=$half
+        node $expx = Exp f64x8 a=$scaled
+        node $sum = ReduceSum f64x1 a=$expx
+        output $sum
+        "
+    );
+    let trans_prog = assemble_rls(&trans_rls).map_err(|e| e.to_string())?;
+    let trans_x: Vec<f64> = (0..trans_elems)
+        .map(|i| 0.25 + (f64::from(i % 1024) * 0.01))
+        .collect();
+    let trans_exe = "target/transcendental_ln_exp_aot";
+    let trans_data = "target/transcendental_ln_exp_data.bin";
+    let trans_aot_rep =
+        compile_rl_to_executable(&trans_prog, trans_exe).map_err(|e| e.to_string())?;
+    write_arena_data_file(trans_data, &[&trans_x]).map_err(|e| e.to_string())?;
+
+    let (tr_c_val, tr_c_stats) = bench_runs(3, 11, trans_bytes, || {
+        let mut s = 0.0_f64;
+        for &x in black_box(&trans_x) {
+            s += (x.ln() * 0.5).exp();
+        }
+        s
+    });
+    let (tr_t2_val, tr_t2_stats) = bench_runs(3, 11, trans_bytes, || {
+        match execute_tier2_fused(black_box(&trans_prog), &[black_box(&trans_x)]).map(|r| r.output)
+        {
+            Ok(RuntimeValue::Scalar(v)) => v,
+            _ => f64::NAN,
+        }
+    });
+    let (tr_aot_val, tr_aot_stats) = bench_runs(3, 11, trans_bytes, || {
+        run_compiled_executable(trans_exe, trans_data).unwrap_or(f64::NAN)
+    });
+    for (label, obs) in [("trans_tier2", tr_t2_val), ("trans_aot", tr_aot_val)] {
+        let rel_diff = (obs - tr_c_val).abs() / tr_c_val.abs().max(1.0);
+        if rel_diff > 1e-11 {
+            return Err(format!(
+                "BM-TRANSCENDENTAL-LN-EXP mismatch on {label}: expected={tr_c_val}, observed={obs}"
+            ));
+        }
+    }
+    println!(
+        "\n=== 6. BM-TRANSCENDENTAL-LN-EXP (VECTORIZED AVX2 LN + EXP, {trans_elems} ELEMS = 8 MB SoA) ==="
+    );
+    println!(
+        "  AOT ELF64 Size     : {} B (MachineCode={} B, Compile={} ns)",
+        trans_aot_rep.elf_bytes, trans_aot_rep.machine_code_bytes, trans_aot_rep.total_compile_ns
+    );
+    println!(
+        "  IMPLEMENTATION                                  | MEDIAN (ms) | MIN..MAX (ms)     | EFF. BW     | SPEEDUP vs LIBM"
+    );
+    println!(
+        "  --------------------------------------------------------------------------------------------------------------------"
+    );
+    for (name, st) in [
+        ("[A] Rust/glibc Scalar x.ln() + exp() (1-Core)", tr_c_stats),
+        ("[B] Rul (.rl) Tier 2 Fused Ln + Exp (1-Core)", tr_t2_stats),
+        (
+            "[C] Rul (.rl) AOT AVX2 Vectorized Ln+Exp (1-Core)",
+            tr_aot_stats,
+        ),
+    ] {
+        println!(
+            "  {name:<47} | {:>8.2} ms | {:>6.2}..{:<6.2} ms | {:>6.2} GB/s | {:>14.2}x",
+            st.median_ms,
+            st.min_ms,
+            st.max_ms,
+            st.gbps,
+            tr_c_stats.median_ms / st.median_ms.max(1e-6),
+        );
+    }
+    println!(
+        "  Verified Transcendental Sum : AOT={tr_aot_val:.9e} (Tier2={tr_t2_val:.9e}, libm={tr_c_val:.9e})"
     );
 
     Ok(())

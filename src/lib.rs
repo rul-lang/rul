@@ -2320,4 +2320,567 @@ mod tests {
         let _ = std::fs::remove_file(&data_path);
         Ok(())
     }
+
+    #[test]
+    fn test_p1b_explicit_fma_opcode_all_tiers_and_aot_horner50() -> Result<(), String> {
+        let pid = std::process::id();
+        let exe_path = std::env::temp_dir().join(format!("rul_test_p1b_fma_{pid}"));
+        let data_path = std::env::temp_dir().join(format!("rul_test_p1b_fma_{pid}.bin"));
+
+        // 1. Verify `.rls` <-> `.rl` round-trip and single-rounded IEEE-754 FMA precision
+        //    on `(1 + 2^-27) * (1 + 2^-27) - 1`, where un-fused `Mul + Add` loses the `2^-54` term!
+        let eps = f64::from_bits(0x3E40_0000_0000_0000); // 2^-27
+        let a_val = 1.0_f64 + eps;
+        let col_x: Vec<f64> = vec![a_val; 11]; // 2 AVX2 vectors (8) + 3 scalar tail
+        let rls_single_round = "\
+            arena 0 len=11 lane=f64x8
+            node $x = ArenaInput f64x8 a=0
+            node $neg1 = ConstF64 f64x1 const=-1.0
+            node $fma = Fma f64x8 a=$x b=$x c=$neg1
+            node $sum = ReduceSum f64x1 a=$fma
+            node $scale = ConstF64 f64x1 const=2.0
+            node $bias = ConstF64 f64x1 const=0.25
+            node $out = Fma f64x1 a=$sum b=$scale c=$bias
+            output $out
+        ";
+        let prog_sr =
+            crate::transpiler::assemble_rls(rls_single_round).map_err(|e| e.to_string())?;
+        let rls_decompiled = crate::transpiler::program_to_rls(&prog_sr);
+        assert!(rls_decompiled.contains("Fma"));
+        let prog_re =
+            crate::transpiler::assemble_rls(&rls_decompiled).map_err(|e| e.to_string())?;
+        assert_eq!(prog_sr, prog_re);
+        let disasm = crate::transpiler::disassemble_rl(&prog_sr);
+        assert!(disasm.contains("Fma"));
+
+        let expected_elem = a_val.mul_add(a_val, -1.0);
+        let unfused_elem = (a_val * a_val) - 1.0;
+        assert_ne!(
+            expected_elem.to_bits(),
+            unfused_elem.to_bits(),
+            "test input must distinguish single-rounded FMA from two-rounding Mul+Add"
+        );
+        let expected_out = (expected_elem * 11.0).mul_add(2.0, 0.25);
+
+        let RuntimeValue::Scalar(s0) = execute_tier0_interpreter(&prog_sr, &[&col_x])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 0 did not return Scalar".to_owned());
+        };
+        let RuntimeValue::Scalar(s1) = execute_tier1_stencil(&prog_sr, &[&col_x])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 1 did not return Scalar".to_owned());
+        };
+        let RuntimeValue::Scalar(s2) = execute_tier2_fused(&prog_sr, &[&col_x])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 2 did not return Scalar".to_owned());
+        };
+        let _rep =
+            crate::aot::compile_rl_to_executable(&prog_sr, &exe_path).map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_path, &[&col_x]).map_err(|e| e.to_string())?;
+        let s_aot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+
+        assert_eq!(s0.to_bits(), expected_out.to_bits());
+        assert_eq!(s1.to_bits(), expected_out.to_bits());
+        assert_eq!(s2.to_bits(), expected_out.to_bits());
+        assert_eq!(s_aot.to_bits(), expected_out.to_bits());
+
+        // 2. Verify all register allocation operand-placement branches in `Opcode::Fma`:
+        //    - `dst_reg == reg_a` (`acc` in `a`)
+        //    - `dst_reg == reg_b` (`acc` in `b`)
+        //    - `Some(dst_reg) == opt_rc` (`acc` in `c`, emitting `vfmadd231pd`)
+        //    - `else` (`a`, `b`, `c` all live after `Fma`, emitting `vmovapd` + `vfmadd213pd`)
+        let rls_branches = "\
+            arena 0 len=11 lane=f64x8
+            node $x = ArenaInput f64x8 a=0
+            node $c1 = ConstF64 f64x1 const=1.25
+            node $c2 = ConstF64 f64x1 const=-0.75
+            node $u = Add f64x8 a=$x b=$c1
+            node $v = Sub f64x8 a=$x b=$c2
+            node $w = Mul f64x8 a=$x b=$c1
+            node $f_else = Fma f64x8 a=$u b=$v c=$w
+            node $keep_uvw = Add f64x8 a=$u b=$v
+            node $keep_all = Add f64x8 a=$keep_uvw b=$w
+            node $f_in_a = Fma f64x8 a=$f_else b=$x c=$c1
+            node $f_in_b = Fma f64x8 a=$x b=$f_in_a c=$c2
+            node $f_in_c = Fma f64x8 a=$x b=$keep_all c=$f_in_b
+            node $out = ReduceSum f64x1 a=$f_in_c
+            output $out
+        ";
+        let prog_br = crate::transpiler::assemble_rls(rls_branches).map_err(|e| e.to_string())?;
+        let RuntimeValue::Scalar(br_t0) = execute_tier0_interpreter(&prog_br, &[&col_x])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 0 did not return Scalar".to_owned());
+        };
+        let RuntimeValue::Scalar(br_t2) = execute_tier2_fused(&prog_br, &[&col_x])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 2 did not return Scalar".to_owned());
+        };
+        crate::aot::compile_rl_to_executable(&prog_br, &exe_path).map_err(|e| e.to_string())?;
+        let br_aot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+        assert!((br_t2 - br_t0).abs() <= 1e-12 * br_t0.abs().max(1.0));
+        assert!((br_aot - br_t0).abs() <= 1e-12 * br_t0.abs().max(1.0));
+
+        // 3. Verify 50-Step Horner Polynomial using explicit `Opcode::Fma` (`54` nodes vs `104` nodes)
+        let elem_count: u32 = 1_027;
+        let sched = ScheduleHint {
+            fusion_group: 1,
+            policy: ExecPolicy::SimdStream,
+        };
+        let mut b_fma = SymbolicGraphBuilder::new(CAP_NONE);
+        let a0 = b_fma.add_arena(elem_count, TypeLane::F64X8, false);
+        b_fma
+            .emit_arena_input("$x", a0, 1, sched)
+            .map_err(|e| e.to_string())?;
+        b_fma
+            .emit_const_f64("$c0", 1.000_001, sched)
+            .map_err(|e| e.to_string())?;
+        b_fma
+            .emit_const_f64("$c1", 0.999_999, sched)
+            .map_err(|e| e.to_string())?;
+        let mut acc = "$c0".to_owned();
+        for step in 0..50usize {
+            let f = format!("$f{step}");
+            let c = if (step & 1) == 0 { "$c1" } else { "$c0" };
+            b_fma
+                .emit_fma_op(&f, TypeLane::F64X8, &acc, "$x", c, sched)
+                .map_err(|e| e.to_string())?;
+            acc = f;
+        }
+        b_fma
+            .emit_unary_op("$sum", Opcode::ReduceSum, TypeLane::F64_SCALAR, &acc, sched)
+            .map_err(|e| e.to_string())?;
+        let prog_h50_fma = b_fma.finish("$sum").map_err(|e| e.to_string())?;
+        assert_eq!(prog_h50_fma.nodes.len(), 54);
+
+        let xs: Vec<f64> = (0..elem_count)
+            .map(|i| 0.5 + (f64::from(i % 16) * 0.025))
+            .collect();
+        let RuntimeValue::Scalar(h_t0) = execute_tier0_interpreter(&prog_h50_fma, &[&xs])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 0 did not return Scalar".to_owned());
+        };
+        let RuntimeValue::Scalar(h_t2) = execute_tier2_fused(&prog_h50_fma, &[&xs])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 2 did not return Scalar".to_owned());
+        };
+        let rep_h50_fma = crate::aot::compile_rl_to_executable(&prog_h50_fma, &exe_path)
+            .map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_path, &[&xs]).map_err(|e| e.to_string())?;
+        let h_aot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+
+        assert!(rep_h50_fma.avx2_vectorized);
+        // 50 single-instruction `vfmadd213pd` steps must produce a much smaller ELF64 (< 3,000B)
+        // than the 104-node `Mul+Add` Horner-50 (`3,713B`).
+        assert!(
+            rep_h50_fma.machine_code_bytes < 3000,
+            "expected compact FMA machine code < 3000B, got {}B",
+            rep_h50_fma.machine_code_bytes
+        );
+        assert!((h_t2 - h_t0).abs() / h_t0.abs().max(1.0) < 1e-12);
+        assert!((h_aot - h_t0).abs() / h_t0.abs().max(1.0) < 1e-12);
+
+        // 4. Verify `Opcode::Fma` 16-bit operand `b`/`c` index boundary (`u16::MAX = 65,535` succeeds; `> 65,535` errors)
+        let mut b_large = SymbolicGraphBuilder::new(CAP_NONE);
+        let a_large = b_large.add_arena(4, TypeLane::F64X8, false);
+        b_large
+            .emit_arena_input("$x", a_large, 1, sched)
+            .map_err(|e| e.to_string())?;
+        for idx in 1..=65_536usize {
+            b_large
+                .emit_const_f64(&format!("$c{idx}"), 1.0, sched)
+                .map_err(|e| e.to_string())?;
+        }
+        // Node `#65535` (`$c65535`) fits in `u16::MAX` and must succeed for both `b` and `c`:
+        b_large
+            .emit_fma_op(
+                "$ok_65535",
+                TypeLane::F64X8,
+                "$x",
+                "$c65535",
+                "$c65535",
+                sched,
+            )
+            .map_err(|e| e.to_string())?;
+        // Node `#65536` (`$c65536`) exceeds `u16::MAX` and must be rejected for `b` and `c`:
+        let err_b = b_large.emit_fma_op("$bad_b", TypeLane::F64X8, "$x", "$c65536", "$c1", sched);
+        assert_eq!(
+            err_b,
+            Err(crate::transpiler::TranspileError::FmaOperandIndexOverflow {
+                symbol: "$c65536".to_owned(),
+                node_idx: 65_536,
+            })
+        );
+        let err_c = b_large.emit_fma_op("$bad_c", TypeLane::F64X8, "$x", "$c1", "$c65536", sched);
+        assert_eq!(
+            err_c,
+            Err(crate::transpiler::TranspileError::FmaOperandIndexOverflow {
+                symbol: "$c65536".to_owned(),
+                node_idx: 65_536,
+            })
+        );
+        // Numeric index `> 65,535` in `.rls` text assembly must also return `FmaOperandIndexOverflow`:
+        let rls_overflow = "\
+            arena 0 len=4 lane=f64x4
+            node $x = ArenaInput f64x4 a=0
+            node $c = ConstF64 f64x1 const=1.0
+            node $fma = Fma f64x4 a=$x b=$c c=69999
+            output $fma
+        ";
+        assert_eq!(
+            crate::transpiler::assemble_rls(rls_overflow),
+            Err(crate::transpiler::RlsError::Symbol(
+                crate::transpiler::TranspileError::FmaOperandIndexOverflow {
+                    symbol: "69999".to_owned(),
+                    node_idx: 69_999,
+                }
+            ))
+        );
+        // Missing `c=` operand in `.rls` text assembly must be rejected rather than defaulting to node `#0`:
+        let rls_missing_c = "\
+            arena 0 len=4 lane=f64x4
+            node $x = ArenaInput f64x4 a=0
+            node $c = ConstF64 f64x1 const=1.0
+            node $fma = Fma f64x4 a=$x b=$c
+            output $fma
+        ";
+        assert!(matches!(
+            crate::transpiler::assemble_rls(rls_missing_c),
+            Err(crate::transpiler::RlsError::LineParse { line: 4, .. })
+        ));
+
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_p1b_vectorized_avx2_ln_and_exp_precision_and_ieee754_edge_cases() -> Result<(), String>
+    {
+        let pid = std::process::id();
+        let exe_path = std::env::temp_dir().join(format!("rul_test_p1b_math_{pid}"));
+        let data_path = std::env::temp_dir().join(format!("rul_test_p1b_math_{pid}.bin"));
+
+        // 1. Precision across wide dynamic range (1,027 elements = 256 AVX2 vectors + 3 scalar tail)
+        //    with live `ymm2`/`ymm3` columns across `Ln` and `Exp` to verify scratch save/restore.
+        let n = 1_027usize;
+        let col_ln_in: Vec<f64> = (0..n)
+            .map(|i| {
+                let frac = (i as f64 + 0.5) / (n as f64);
+                // Span exponents from 2^-400 (~3.8e-121) to 2^+400 (~2.58e+120) including near-1.0 values
+                let exp2 = (frac - 0.5) * 800.0;
+                2.0_f64.powf(exp2) * (0.7 + 0.6 * ((i % 17) as f64 / 16.0))
+            })
+            .collect();
+        let col_exp_in: Vec<f64> = (0..n)
+            .map(|i| {
+                let frac = (i as f64 + 0.5) / (n as f64);
+                // Span [-700.0, +700.0]
+                (frac - 0.5) * 1400.0
+            })
+            .collect();
+
+        let rls_ln = format!(
+            "\
+            arena 0 len={n} lane=f64x8
+            node $x = ArenaInput f64x8 a=0
+            node $c1 = ConstF64 f64x1 const=1.5
+            node $c2 = ConstF64 f64x1 const=0.25
+            node $keep2 = Add f64x8 a=$x b=$c1
+            node $keep3 = Sub f64x8 a=$x b=$c2
+            node $lnx = Ln f64x8 a=$x
+            node $comb = Add f64x8 a=$keep2 b=$keep3
+            node $ratio = Div f64x8 a=$keep2 b=$comb
+            node $tot = Add f64x8 a=$lnx b=$ratio
+            node $out = ReduceSum f64x1 a=$tot
+            output $out
+            "
+        );
+        let prog_ln = crate::transpiler::assemble_rls(&rls_ln).map_err(|e| e.to_string())?;
+        let RuntimeValue::Scalar(ln_t0) = execute_tier0_interpreter(&prog_ln, &[&col_ln_in])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 0 did not return Scalar".to_owned());
+        };
+        let rep_ln =
+            crate::aot::compile_rl_to_executable(&prog_ln, &exe_path).map_err(|e| e.to_string())?;
+        assert!(rep_ln.avx2_vectorized);
+        crate::aot::write_arena_data_file(&data_path, &[&col_ln_in]).map_err(|e| e.to_string())?;
+        let ln_aot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+        let ln_rel_err = (ln_aot - ln_t0).abs() / ln_t0.abs().max(1.0);
+        assert!(
+            ln_rel_err < 1e-13,
+            "AVX2 Ln relative error too large: t0={ln_t0}, aot={ln_aot}, rel_err={ln_rel_err:e}"
+        );
+
+        let rls_exp = format!(
+            "\
+            arena 0 len={n} lane=f64x8
+            node $x = ArenaInput f64x8 a=0
+            node $c1 = ConstF64 f64x1 const=1.5
+            node $c2 = ConstF64 f64x1 const=0.25
+            node $keep2 = Add f64x8 a=$x b=$c1
+            node $keep3 = Sub f64x8 a=$x b=$c2
+            node $expx = Exp f64x8 a=$x
+            node $comb = Add f64x8 a=$keep2 b=$keep3
+            node $prod = Mul f64x8 a=$expx b=$comb
+            node $out = ReduceMax f64x1 a=$expx
+            node $s2 = ReduceMin f64x1 a=$comb
+            node $final = Add f64x1 a=$out b=$s2
+            output $final
+            "
+        );
+        let prog_exp = crate::transpiler::assemble_rls(&rls_exp).map_err(|e| e.to_string())?;
+        let RuntimeValue::Scalar(exp_t0) = execute_tier0_interpreter(&prog_exp, &[&col_exp_in])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 0 did not return Scalar".to_owned());
+        };
+        crate::aot::compile_rl_to_executable(&prog_exp, &exe_path).map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_path, &[&col_exp_in]).map_err(|e| e.to_string())?;
+        let exp_aot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+        let exp_rel_err = (exp_aot - exp_t0).abs() / exp_t0.abs().max(1.0);
+        assert!(
+            exp_rel_err < 1e-13,
+            "AVX2 Exp relative error too large: t0={exp_t0}, aot={exp_aot}, rel_err={exp_rel_err:e}"
+        );
+
+        // Also test ReduceSum of Exp on [-10.0, +10.0] across 1,027 elements
+        let col_exp_mid: Vec<f64> = (0..n)
+            .map(|i| -10.0 + 20.0 * ((i as f64) / (n as f64)))
+            .collect();
+        let rls_exp_sum = format!(
+            "\
+            arena 0 len={n} lane=f64x8
+            node $x = ArenaInput f64x8 a=0
+            node $ex = Exp f64x8 a=$x
+            node $out = ReduceSum f64x1 a=$ex
+            output $out
+            "
+        );
+        let prog_exp_sum =
+            crate::transpiler::assemble_rls(&rls_exp_sum).map_err(|e| e.to_string())?;
+        let RuntimeValue::Scalar(es_t0) = execute_tier0_interpreter(&prog_exp_sum, &[&col_exp_mid])
+            .map_err(|e| e.to_string())?
+            .output
+        else {
+            return Err("Tier 0 did not return Scalar".to_owned());
+        };
+        crate::aot::compile_rl_to_executable(&prog_exp_sum, &exe_path)
+            .map_err(|e| e.to_string())?;
+        crate::aot::write_arena_data_file(&data_path, &[&col_exp_mid])
+            .map_err(|e| e.to_string())?;
+        let es_aot = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+        assert!(
+            (es_aot - es_t0).abs() / es_t0.abs().max(1.0) < 1e-13,
+            "AVX2 Exp sum mismatch: t0={es_t0}, aot={es_aot}"
+        );
+
+        // 2. IEEE-754 special cases inside the 4-element 256-bit AVX2 loop (`len = 4`)
+        let rls_ln_4 = "\
+            arena 0 len=4 lane=f64x4
+            node $x = ArenaInput f64x4 a=0
+            node $y = Ln f64x4 a=$x
+            node $out = ReduceSum f64x1 a=$y
+            output $out
+        ";
+        let prog_ln_4 = crate::transpiler::assemble_rls(rls_ln_4).map_err(|e| e.to_string())?;
+        crate::aot::compile_rl_to_executable(&prog_ln_4, &exe_path).map_err(|e| e.to_string())?;
+
+        for (label, vec4, check_fn) in [
+            (
+                "ln_pos_zero",
+                [0.0, 1.0, 1.0, 1.0],
+                (|v: f64| v == f64::NEG_INFINITY) as fn(f64) -> bool,
+            ),
+            (
+                "ln_neg_zero",
+                [1.0, -0.0, 1.0, 1.0],
+                (|v: f64| v == f64::NEG_INFINITY) as fn(f64) -> bool,
+            ),
+            (
+                "ln_pos_inf",
+                [1.0, 1.0, f64::INFINITY, 1.0],
+                (|v: f64| v == f64::INFINITY) as fn(f64) -> bool,
+            ),
+            (
+                "ln_negative",
+                [1.0, 1.0, 1.0, -2.5],
+                f64::is_nan as fn(f64) -> bool,
+            ),
+            (
+                "ln_neg_inf",
+                [f64::NEG_INFINITY, 1.0, 1.0, 1.0],
+                f64::is_nan as fn(f64) -> bool,
+            ),
+            (
+                "ln_nan",
+                [1.0, f64::NAN, 1.0, 1.0],
+                f64::is_nan as fn(f64) -> bool,
+            ),
+        ] {
+            crate::aot::write_arena_data_file(&data_path, &[&vec4]).map_err(|e| e.to_string())?;
+            let obs = crate::aot::run_compiled_executable(&exe_path, &data_path)
+                .map_err(|e| e.to_string())?;
+            assert!(
+                check_fn(obs),
+                "AVX2 Ln special case `{label}` failed: observed={obs}"
+            );
+        }
+
+        let rls_exp_4 = "\
+            arena 0 len=4 lane=f64x4
+            node $x = ArenaInput f64x4 a=0
+            node $y = Exp f64x4 a=$x
+            node $out = ReduceSum f64x1 a=$y
+            output $out
+        ";
+        let prog_exp_4 = crate::transpiler::assemble_rls(rls_exp_4).map_err(|e| e.to_string())?;
+        crate::aot::compile_rl_to_executable(&prog_exp_4, &exe_path).map_err(|e| e.to_string())?;
+
+        for (label, vec4, check_fn) in [
+            (
+                "exp_underflow_zero",
+                [-800.0, -900.0, f64::NEG_INFINITY, -750.0],
+                (|v: f64| v == 0.0 && !v.is_sign_negative()) as fn(f64) -> bool,
+            ),
+            (
+                "exp_overflow_inf",
+                [0.0, 800.0, 0.0, 0.0],
+                (|v: f64| v == f64::INFINITY) as fn(f64) -> bool,
+            ),
+            (
+                "exp_overflow_first_inf_boundary",
+                [0.0, f64::from_bits(0x4086_2E42_FEFA_39F0), 0.0, 0.0],
+                (|v: f64| v == f64::INFINITY) as fn(f64) -> bool,
+            ),
+            (
+                "exp_pos_inf",
+                [0.0, 0.0, f64::INFINITY, 0.0],
+                (|v: f64| v == f64::INFINITY) as fn(f64) -> bool,
+            ),
+            (
+                "exp_nan",
+                [0.0, 0.0, 0.0, f64::NAN],
+                f64::is_nan as fn(f64) -> bool,
+            ),
+        ] {
+            crate::aot::write_arena_data_file(&data_path, &[&vec4]).map_err(|e| e.to_string())?;
+            let obs = crate::aot::run_compiled_executable(&exe_path, &data_path)
+                .map_err(|e| e.to_string())?;
+            assert!(
+                check_fn(obs),
+                "AVX2 Exp special case `{label}` failed: observed={obs}"
+            );
+        }
+
+        // 3. Subnormal `Ln`, near-overflow `Exp` (`k = 1024`), and gradual-underflow subnormal `Exp`
+        //    inside the 4-lane AVX2 loop (`len = 4`) compared against Tier 0 (`libm`)
+        crate::aot::compile_rl_to_executable(&prog_ln_4, &exe_path).map_err(|e| e.to_string())?;
+        for ln_sub_vec in [
+            [
+                1e-310_f64,
+                f64::from_bits(1), // 5e-324 (min positive subnormal)
+                f64::from_bits(0x000F_FFFF_FFFF_FFFF), // max subnormal
+                f64::MIN_POSITIVE, // min normal (`2^-1022`)
+            ],
+            [1e-320_f64, 1e-315_f64, 1e-309_f64, 1.0_f64],
+        ] {
+            let RuntimeValue::Scalar(t0_sub) =
+                execute_tier0_interpreter(&prog_ln_4, &[&ln_sub_vec])
+                    .map_err(|e| e.to_string())?
+                    .output
+            else {
+                return Err("Tier 0 did not return Scalar".to_owned());
+            };
+            crate::aot::write_arena_data_file(&data_path, &[&ln_sub_vec])
+                .map_err(|e| e.to_string())?;
+            let aot_sub = crate::aot::run_compiled_executable(&exe_path, &data_path)
+                .map_err(|e| e.to_string())?;
+            let rel = (aot_sub - t0_sub).abs() / t0_sub.abs().max(1.0);
+            assert!(
+                rel < 1e-13,
+                "AVX2 Ln subnormal mismatch for {ln_sub_vec:?}: t0={t0_sub}, aot={aot_sub}, rel={rel:e}"
+            );
+        }
+
+        crate::aot::compile_rl_to_executable(&prog_exp_4, &exe_path).map_err(|e| e.to_string())?;
+        for exp_edge_vec in [
+            // `k = 1024` finite near-overflow range `(709.436, 709.78271289338397]`
+            [709.5_f64, 0.0, 0.0, 0.0],
+            [f64::from_bits(0x4086_2E42_FEFA_39EF), 0.0, 0.0, 0.0],
+            // Gradual-underflow subnormal outputs `[-745.1332191019411, -708.3964185322641)`
+            [-708.5_f64, 0.0, 0.0, 0.0],
+            [-710.0_f64, -720.0_f64, -730.0_f64, -740.0_f64],
+            [
+                -744.440_071_921_381_2_f64,
+                f64::from_bits(0xC087_4910_D52D_3051), // last non-zero subnormal `5e-324`
+                f64::from_bits(0xC087_4910_D52D_3052), // first exact `+0.0`
+                -800.0,
+            ],
+        ] {
+            let RuntimeValue::Scalar(t0_edge) =
+                execute_tier0_interpreter(&prog_exp_4, &[&exp_edge_vec])
+                    .map_err(|e| e.to_string())?
+                    .output
+            else {
+                return Err("Tier 0 did not return Scalar".to_owned());
+            };
+            crate::aot::write_arena_data_file(&data_path, &[&exp_edge_vec])
+                .map_err(|e| e.to_string())?;
+            let aot_edge = crate::aot::run_compiled_executable(&exe_path, &data_path)
+                .map_err(|e| e.to_string())?;
+            assert!(
+                aot_edge.is_finite() && t0_edge.is_finite(),
+                "expected finite Exp for {exp_edge_vec:?}: t0={t0_edge}, aot={aot_edge}"
+            );
+            let rel = (aot_edge - t0_edge).abs() / t0_edge.abs().max(f64::MIN_POSITIVE);
+            assert!(
+                rel < 1e-13,
+                "AVX2 Exp boundary mismatch for {exp_edge_vec:?}: t0={t0_edge:e}, aot={aot_edge:e}, rel={rel:e}"
+            );
+        }
+
+        // Also check single-lane subnormal `exp(-744.4400719213812) == 5e-324` without `0.0` lanes masking it:
+        let tiny_vec = [
+            f64::from_bits(0xC087_4910_D52D_3051),
+            -745.133_219_101_941_2_f64,
+            -800.0,
+            -900.0,
+        ];
+        crate::aot::write_arena_data_file(&data_path, &[&tiny_vec]).map_err(|e| e.to_string())?;
+        let aot_tiny = crate::aot::run_compiled_executable(&exe_path, &data_path)
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            aot_tiny.to_bits(),
+            1,
+            "expected smallest subnormal 5e-324 (bits=1), got {aot_tiny:e} (bits={})",
+            aot_tiny.to_bits()
+        );
+
+        let _ = std::fs::remove_file(&exe_path);
+        let _ = std::fs::remove_file(&data_path);
+        Ok(())
+    }
 }
