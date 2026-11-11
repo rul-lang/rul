@@ -2883,4 +2883,1161 @@ mod tests {
         let _ = std::fs::remove_file(&data_path);
         Ok(())
     }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "comprehensive AC-1 verification and execution test for ConstI64, LocalGet/LocalSet, and scalar I64/F64/BoolMask"
+    )]
+    fn test_tc_core1_typed_locals_and_i64_scalar() -> Result<(), String> {
+        use crate::bytecode::{ElemType, RL_FRAME_SIZE, RL_HEADER_SIZE};
+        use crate::transpiler::assemble_rls;
+
+        // 1. Binary wire frame size (16B) and ConstI64 round-trip across boundary values.
+        assert_eq!(RL_FRAME_SIZE, 16);
+        assert_eq!(RL_HEADER_SIZE, 64);
+
+        let sched = ScheduleHint {
+            policy: ExecPolicy::AutoL1Tile,
+            fusion_group: 0,
+        };
+        assert_eq!(
+            ArenaDescriptor {
+                arena_id: 0,
+                element_count: 8,
+                type_lane: TypeLane::F64X8,
+                mutable: false,
+                alignment: 64,
+                initial_version: 1,
+            }
+            .to_bytes()
+            .len(),
+            RL_FRAME_SIZE
+        );
+        assert_eq!(
+            ProofEntry {
+                rule_kind: ProofRuleKind::LoopBound,
+                target_arena: 0,
+                bound_lo: 0,
+                bound_hi: 100,
+                witness_node: 0,
+            }
+            .to_bytes()
+            .len(),
+            RL_FRAME_SIZE
+        );
+        for val in [
+            0_i64,
+            1,
+            -1,
+            42,
+            -42,
+            i64::MAX,
+            i64::MIN,
+            0x1234_5678_9ABC_DEF0_i64,
+            -0x1234_5678_9ABC_DEF0_i64,
+        ] {
+            let nf = NodeFrame::const_i64(val, sched);
+            assert_eq!(nf.to_bytes().len(), RL_FRAME_SIZE);
+            assert_eq!(nf.opcode, Opcode::ConstI64);
+            assert_eq!(nf.decode_const_i64(), val);
+            let decoded = NodeFrame::from_bytes(&nf.to_bytes()).map_err(|e| format!("{e:?}"))?;
+            assert_eq!(decoded.decode_const_i64(), val);
+        }
+
+        // 2. Valid program exercising slots 0 and 63 across I64, F64, and BoolMask,
+        //    plus I64 wrapping Add/Sub/Mul, signed CmpGt/CmpLt/CmpEq, and MaskAnd/MaskOr.
+        let full_valid_rls = "\
+cap NONE
+node $max = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=9223372036854775807
+node $one = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $two = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2
+node $neg5 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-5
+node $pos3 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3
+node $zero = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $wrap_min = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$max b=$one
+node $wrap_back = Sub i64x1 fg=0 pol=l1 proof=0 tok=pure a=$wrap_min b=$one
+node $wrap_mul = Mul i64x1 fg=0 pol=l1 proof=0 tok=pure a=$max b=$two
+node $s0 = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$wrap_mul
+node $f_val = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=3.5
+node $s1 = LocalSet f64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$f_val
+node $g1 = LocalGet f64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0
+node $f_gt = CmpGt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$g1 b=$f_val
+node $lt1 = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$neg5 b=$pos3
+node $eq1 = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$wrap_back b=$max
+node $gt_false = CmpGt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$wrap_min b=$zero
+node $m_and = MaskAnd maskx1 fg=0 pol=l1 proof=0 tok=pure a=$lt1 b=$eq1
+node $m_or = MaskOr maskx1 fg=0 pol=l1 proof=0 tok=pure a=$gt_false b=$f_gt
+node $s63 = LocalSet maskx1 fg=0 pol=l1 proof=0 tok=pure a=63 b=$m_and
+node $g63 = LocalGet maskx1 fg=0 pol=l1 proof=0 tok=pure a=63 b=0
+node $if0 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$g63 b=0
+node $g0_in = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $c44 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=44
+node $sum42 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$g0_in b=$c44
+node $s0_upd = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$sum42
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $s0_else = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$zero
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $if1 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$m_or b=0
+node $s0_bad = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$neg5
+node $end1 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $out
+";
+        let prog = assemble_rls(full_valid_rls).map_err(|e| format!("{e:?}"))?;
+        let summary = verify_program(&prog).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(summary.output_shape, ValueShape::Scalar);
+
+        // `i64::MAX.wrapping_mul(2) == -2`, `-2 + 44 == 42`
+        let rep0 = execute_tier0_interpreter(&prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(t0_out) = rep0.output else {
+            return Err("expected Scalar output from Tier 0".to_owned());
+        };
+        assert_eq!(t0_out.to_bits(), 42_u64);
+
+        let exe_path = std::env::temp_dir().join("rul_tc_core1_ac1_bin");
+        crate::aot::compile_rl_to_executable(&prog, &exe_path).map_err(|e| format!("{e:?}"))?;
+        let aot_res = crate::aot::run_compiled_scalar_executable(&exe_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let aot_out = aot_res.map_err(|e| format!("{e:?}"))?;
+        assert_eq!(aot_out.to_bits(), t0_out.to_bits());
+
+        // 3. Both branches initializing a previously uninitialized local slot makes it definitely initialized after End.
+        let both_init_rls = "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $b = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=20
+node $cond = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$b
+node $if0 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cond b=0
+node $s_then = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=7 b=$a
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $s_else = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=7 b=$b
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=7 b=0
+output $out
+";
+        let both_prog = assemble_rls(both_init_rls).map_err(|e| format!("{e:?}"))?;
+        verify_program(&both_prog).map_err(|e| format!("{e:?}"))?;
+
+        // 4. Reject out-of-range slots (`slot >= 64`) on LocalSet and LocalGet.
+        let slot64_set_rls = "\
+cap NONE
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=5
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=64 b=$c
+output $s
+";
+        let slot64_set_prog = assemble_rls(slot64_set_rls).map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&slot64_set_prog),
+            Err(d) if d.kind == VerifyErrorKind::LocalSlotOutOfRange { slot: 64 }
+        ));
+
+        let slot64_get_rls = "\
+cap NONE
+node $g = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=64 b=0
+output $g
+";
+        let slot64_get_prog = assemble_rls(slot64_get_rls).map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&slot64_get_prog),
+            Err(d) if d.kind == VerifyErrorKind::LocalSlotOutOfRange { slot: 64 }
+        ));
+
+        // 5. Reject uninitialized reads: direct, after If-without-Else, after one-sided If/Else, and after BrIf skip.
+        let uninit_direct = assemble_rls(
+            "cap NONE\nnode $g = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=3 b=0\noutput $g\n",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&uninit_direct),
+            Err(d) if d.kind == VerifyErrorKind::UninitializedLocalRead { slot: 3 }
+        ));
+
+        let uninit_if_no_else = assemble_rls(
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $cond = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$a
+node $if0 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cond b=0
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=4 b=$a
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $g = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=4 b=0
+output $g
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&uninit_if_no_else),
+            Err(d) if d.kind == VerifyErrorKind::UninitializedLocalRead { slot: 4 }
+        ));
+
+        let uninit_one_branch = assemble_rls(
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $cond = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$a
+node $if0 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cond b=0
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=5 b=$a
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $g = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=5 b=0
+output $g
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&uninit_one_branch),
+            Err(d) if d.kind == VerifyErrorKind::UninitializedLocalRead { slot: 5 }
+        ));
+
+        let uninit_brif_skip = assemble_rls(
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $cond = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$a
+node $blk = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $br = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$cond b=0
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=6 b=$a
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $g = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=6 b=0
+output $g
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&uninit_brif_skip),
+            Err(d) if d.kind == VerifyErrorKind::UninitializedLocalRead { slot: 6 }
+        ));
+
+        // 6. Reject changing a local slot's ElemType across scopes or sequentially.
+        let type_change_prog = assemble_rls(
+            "\
+cap NONE
+node $i = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=7
+node $f = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=7.0
+node $cond = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$i b=$i
+node $if0 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cond b=0
+node $s1 = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$i
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $s2 = LocalSet f64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$f
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $i
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&type_change_prog),
+            Err(d) if d.kind == VerifyErrorKind::LocalTypeMismatch {
+                slot: 2,
+                expected: ElemType::I64,
+                actual: ElemType::F64,
+            }
+        ));
+
+        // 7. Reject non-scalar (columnar) values in LocalSet.
+        let non_scalar_prog = assemble_rls(
+            "\
+cap NONE
+arena 0 len=16 lane=f64x4 mut=false ver=1
+node $col = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $s = LocalSet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$col
+output $s
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&non_scalar_prog),
+            Err(d) if matches!(d.kind, VerifyErrorKind::ShapeMismatch { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "comprehensive AC-2 verification test for control stack, BlockSig, AffineToken conservation, and SSA scope sealing"
+    )]
+    fn test_tc_core1_control_stack_verifier() -> Result<(), String> {
+        use crate::transpiler::assemble_rls;
+
+        // 1. Deeply nested structured control flow (depth 6) + BlockSig value-returning If/Else
+        //    where node #0 (`$c0`) is returned on the `then` branch (`a=$c0 b=1`).
+        let deep_and_node0_rls = "\
+cap NONE
+proof 1 rule=block_sig target=0 lo=0 hi=0 witness=33
+proof 2 rule=loop_bound target=0 lo=0 hi=4 witness=0
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=777
+node $c1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=111
+node $cond_t = CmpGt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c0 b=$c1
+node $if_val = If i64x1 fg=0 pol=l1 proof=1 tok=pure a=$cond_t b=0
+node $el_val = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c0 b=1
+node $end_val = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c1 b=1
+node $s0 = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$end_val
+node $b1 = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $lp1 = Loop i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=0
+node $if1 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cond_t b=0
+node $b2 = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $if2 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cond_t b=0
+node $lp2 = Loop i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=0
+node $g0 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $one = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $inc = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$g0 b=$one
+node $su = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$inc
+node $br_out = Br i64x1 fg=0 pol=l1 proof=0 tok=pure a=5 b=0
+node $e_lp2 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $e_if2 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $e_b2 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $e_if1 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $e_lp1 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $e_b1 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $out
+";
+        let deep_prog = assemble_rls(deep_and_node0_rls).map_err(|e| format!("{e:?}"))?;
+        verify_program(&deep_prog).map_err(|e| format!("{e:?}"))?;
+        let rep0 = execute_tier0_interpreter(&deep_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(v0) = rep0.output else {
+            return Err("expected Scalar".to_owned());
+        };
+        assert_eq!(v0.to_bits(), 778_u64);
+
+        let exe_path = std::env::temp_dir().join("rul_tc_core1_ac2_bin");
+        crate::aot::compile_rl_to_executable(&deep_prog, &exe_path)
+            .map_err(|e| format!("{e:?}"))?;
+        let aot_res = crate::aot::run_compiled_scalar_executable(&exe_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let aot_v = aot_res.map_err(|e| format!("{e:?}"))?;
+        assert_eq!(aot_v.to_bits(), 778_u64);
+
+        // 2. BlockSig AffineToken conservation across If/Else/End (`v1 -> v2` on both branches).
+        let affine_join_rls = "\
+cap NONE
+arena 0 len=4 lane=f64x4 mut=true ver=1
+proof 1 rule=block_sig target=0 lo=1 hi=2 witness=0
+node $c1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $cond = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c1 b=$c1
+node $if0 = If i64x1 fg=0 pol=l1 proof=1 tok=pure a=$cond b=0
+node $in_t = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $k2 = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=2.0
+node $mul_t = Mul f64x4 fg=0 pol=l1 proof=0 tok=pure a=$in_t b=$k2
+node $mut_t = ArenaMutate f64x4 fg=0 pol=l1 proof=0 tok=consume(0,1) a=0 b=$mul_t
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $in_e = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $k3 = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=3.0
+node $mul_e = Mul f64x4 fg=0 pol=l1 proof=0 tok=pure a=$in_e b=$k3
+node $mut_e = ArenaMutate f64x4 fg=0 pol=l1 proof=0 tok=consume(0,1) a=0 b=$mul_e
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $in_post = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,2) a=0 b=0
+node $sum = ReduceSum f64x1 fg=0 pol=l1 proof=0 tok=pure a=$in_post b=0
+output $sum
+";
+        let affine_prog = assemble_rls(affine_join_rls).map_err(|e| format!("{e:?}"))?;
+        verify_program(&affine_prog).map_err(|e| format!("{e:?}"))?;
+        let col = [1.0_f64, 2.0, 3.0, 4.0];
+        let rep_aff =
+            execute_tier0_interpreter(&affine_prog, &[&col]).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(rep_aff.output, RuntimeValue::Scalar(20.0));
+
+        // 3. Reject unmatched Else, Else in Block/Loop, duplicate Else, unmatched End, and unclosed blocks at EOF.
+        for bad_ctrl_rls in [
+            "cap NONE\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $e = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n",
+            "cap NONE\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $b = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\nnode $e = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\nnode $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n",
+            "cap NONE\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c\nnode $i = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$m b=0\nnode $e1 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\nnode $e2 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\nnode $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n",
+            "cap NONE\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n",
+            "cap NONE\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $b = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n",
+            "cap NONE\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $b = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\nnode $br = Br i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0\nnode $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n",
+            "cap NONE\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c\nnode $b = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\nnode $br = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$m b=1\nnode $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n",
+        ] {
+            let p = assemble_rls(bad_ctrl_rls).map_err(|e| format!("{e:?}"))?;
+            assert!(
+                matches!(
+                    verify_program(&p),
+                    Err(d) if matches!(d.kind, VerifyErrorKind::InvalidControlFlow(_))
+                ),
+                "expected InvalidControlFlow for:\n{bad_ctrl_rls}"
+            );
+        }
+
+        // 4. Reject non-BoolMask or columnar conditions on If / BrIf.
+        let non_bool_if = assemble_rls(
+            "\
+cap NONE
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $i = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c b=0
+node $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $c
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&non_bool_if),
+            Err(d) if matches!(d.kind, VerifyErrorKind::ElementTypeMismatch { .. })
+        ));
+
+        let col_cond_if = assemble_rls(
+            "\
+cap NONE
+arena 0 len=4 lane=f64x4 mut=false ver=1
+node $in = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $z = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=0.0
+node $cm = CmpGt maskx4 fg=0 pol=l1 proof=0 tok=pure a=$in b=$z
+node $i = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cm b=0
+node $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $sum = ReduceSum f64x1 fg=0 pol=l1 proof=0 tok=pure a=$in b=0
+output $sum
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&col_cond_if),
+            Err(d) if matches!(d.kind, VerifyErrorKind::ShapeMismatch { .. })
+        ));
+
+        // 5. Reject cross-branch SSA reference (`else` using `then` temporary) and escaped inner SSA reference after `End`.
+        let cross_branch_ssa = assemble_rls(
+            "\
+cap NONE
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c
+node $if0 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$m b=0
+node $inner = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $bad = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$inner b=$c
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $c
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&cross_branch_ssa),
+            Err(d) if matches!(d.kind, VerifyErrorKind::ScopedValueEscaped { .. })
+        ));
+
+        let escaped_post_end_ssa = assemble_rls(
+            "\
+cap NONE
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $b0 = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $inner = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $bad = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$inner b=$c
+output $bad
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&escaped_post_end_ssa),
+            Err(d) if matches!(d.kind, VerifyErrorKind::ScopedValueEscaped { .. })
+        ));
+
+        // 6. Reject AffineToken version mismatches across If-without-Else, asymmetric If/Else, and Loop back-edge.
+        for bad_affine_rls in [
+            "\
+cap NONE
+arena 0 len=4 lane=f64x4 mut=true ver=1
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c
+node $if0 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$m b=0
+node $in = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $mut = ArenaMutate f64x4 fg=0 pol=l1 proof=0 tok=consume(0,1) a=0 b=$in
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $c
+",
+            "\
+cap NONE
+arena 0 len=4 lane=f64x4 mut=true ver=1
+proof 1 rule=block_sig target=0 lo=1 hi=2 witness=0
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c
+node $if0 = If i64x1 fg=0 pol=l1 proof=1 tok=pure a=$m b=0
+node $in = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $mut = ArenaMutate f64x4 fg=0 pol=l1 proof=0 tok=consume(0,1) a=0 b=$in
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $c
+",
+            "\
+cap NONE
+arena 0 len=4 lane=f64x4 mut=true ver=1
+proof 1 rule=loop_bound target=0 lo=0 hi=4 witness=0
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $lp = Loop i64x1 fg=0 pol=l1 proof=1 tok=pure a=0 b=0
+node $in = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $mut = ArenaMutate f64x4 fg=0 pol=l1 proof=0 tok=consume(0,1) a=0 b=$in
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $c
+",
+        ] {
+            let p = assemble_rls(bad_affine_rls).map_err(|e| format!("{e:?}"))?;
+            assert!(
+                matches!(
+                    verify_program(&p),
+                    Err(d) if matches!(d.kind, VerifyErrorKind::StaleOrConsumedToken { .. })
+                ),
+                "expected StaleOrConsumedToken for:\n{bad_affine_rls}"
+            );
+        }
+
+        // 7. Strict O(A + N) time & memory regression check:
+        //    20,000 arenas + 10,000 nested Block..End frames (with inner If/Else arena mutation)
+        //    + 10,000 sequential Block..End pairs must verify in < 100 ms without O(A * N) cloning.
+        let arena_count = 20_000_u32;
+        let arenas: Vec<crate::bytecode::ArenaDescriptor> = (0..arena_count)
+            .map(|arena_id| crate::bytecode::ArenaDescriptor {
+                arena_id,
+                element_count: 8,
+                type_lane: TypeLane::F64X8,
+                mutable: true,
+                alignment: 64,
+                initial_version: 1,
+            })
+            .collect();
+        let proofs = vec![crate::bytecode::ProofEntry {
+            rule_kind: crate::bytecode::ProofRuleKind::BlockSig,
+            target_arena: 0,
+            bound_lo: 1,
+            bound_hi: 2,
+            witness_node: 0,
+        }];
+        let sched = ScheduleHint::UNFUSED;
+        let pure_tok = crate::bytecode::TokenOp::PURE;
+        let mut nodes = Vec::with_capacity(40_010);
+        // Node 0: ConstI64(42)
+        nodes.push(NodeFrame::const_i64(42, sched));
+        // Node 1: CmpEq(0, 0) -> scalar BoolMask true
+        nodes.push(NodeFrame {
+            opcode: Opcode::CmpEq,
+            type_lane: TypeLane::MASK_SCALAR,
+            schedule: sched,
+            proof_idx: 0,
+            token_op: pure_tok,
+            in_a: 0,
+            in_b: 0,
+        });
+        for _ in 0..10_000_usize {
+            nodes.push(NodeFrame {
+                opcode: Opcode::Block,
+                type_lane: TypeLane::I64_SCALAR,
+                schedule: sched,
+                proof_idx: 0,
+                token_op: pure_tok,
+                in_a: 0,
+                in_b: 0,
+            });
+        }
+        // Inner If/Else mutating arena 0 (1 -> 2) with BlockSig proof=1 across 20,000 arenas.
+        nodes.push(NodeFrame {
+            opcode: Opcode::If,
+            type_lane: TypeLane::I64_SCALAR,
+            schedule: sched,
+            proof_idx: 1,
+            token_op: pure_tok,
+            in_a: 1,
+            in_b: 0,
+        });
+        let a_t_idx = u32::try_from(nodes.len()).unwrap_or(0);
+        nodes.push(NodeFrame {
+            opcode: Opcode::ArenaInput,
+            type_lane: TypeLane::F64X8,
+            schedule: sched,
+            proof_idx: 0,
+            token_op: crate::bytecode::TokenOp {
+                mode: crate::bytecode::TokenMode::ReadLease,
+                arena_id: 0,
+                version: 1,
+            },
+            in_a: 0,
+            in_b: 0,
+        });
+        nodes.push(NodeFrame {
+            opcode: Opcode::ArenaMutate,
+            type_lane: TypeLane::F64X8,
+            schedule: sched,
+            proof_idx: 0,
+            token_op: crate::bytecode::TokenOp {
+                mode: crate::bytecode::TokenMode::AffineConsume,
+                arena_id: 0,
+                version: 1,
+            },
+            in_a: 0,
+            in_b: a_t_idx,
+        });
+        nodes.push(NodeFrame {
+            opcode: Opcode::Else,
+            type_lane: TypeLane::I64_SCALAR,
+            schedule: sched,
+            proof_idx: 0,
+            token_op: pure_tok,
+            in_a: 0,
+            in_b: 0,
+        });
+        let a_e_idx = u32::try_from(nodes.len()).unwrap_or(0);
+        nodes.push(NodeFrame {
+            opcode: Opcode::ArenaInput,
+            type_lane: TypeLane::F64X8,
+            schedule: sched,
+            proof_idx: 0,
+            token_op: crate::bytecode::TokenOp {
+                mode: crate::bytecode::TokenMode::ReadLease,
+                arena_id: 0,
+                version: 1,
+            },
+            in_a: 0,
+            in_b: 0,
+        });
+        nodes.push(NodeFrame {
+            opcode: Opcode::ArenaMutate,
+            type_lane: TypeLane::F64X8,
+            schedule: sched,
+            proof_idx: 0,
+            token_op: crate::bytecode::TokenOp {
+                mode: crate::bytecode::TokenMode::AffineConsume,
+                arena_id: 0,
+                version: 1,
+            },
+            in_a: 0,
+            in_b: a_e_idx,
+        });
+        nodes.push(NodeFrame {
+            opcode: Opcode::End,
+            type_lane: TypeLane::I64_SCALAR,
+            schedule: sched,
+            proof_idx: 0,
+            token_op: pure_tok,
+            in_a: 0,
+            in_b: 0,
+        });
+        for _ in 0..10_000_usize {
+            nodes.push(NodeFrame {
+                opcode: Opcode::End,
+                type_lane: TypeLane::I64_SCALAR,
+                schedule: sched,
+                proof_idx: 0,
+                token_op: pure_tok,
+                in_a: 0,
+                in_b: 0,
+            });
+        }
+        for _ in 0..10_000_usize {
+            nodes.push(NodeFrame {
+                opcode: Opcode::Block,
+                type_lane: TypeLane::I64_SCALAR,
+                schedule: sched,
+                proof_idx: 0,
+                token_op: pure_tok,
+                in_a: 0,
+                in_b: 0,
+            });
+            nodes.push(NodeFrame {
+                opcode: Opcode::End,
+                type_lane: TypeLane::I64_SCALAR,
+                schedule: sched,
+                proof_idx: 0,
+                token_op: pure_tok,
+                in_a: 0,
+                in_b: 0,
+            });
+        }
+        let expected_nodes = nodes.len();
+        let large_prog = RulProgram {
+            capability_mask: CAP_NONE,
+            arenas,
+            proofs,
+            nodes,
+            output_node: 0,
+        };
+        let t_linear = std::time::Instant::now();
+        let large_sum = verify_program(&large_prog).map_err(|e| format!("{e:?}"))?;
+        let linear_elapsed = t_linear.elapsed();
+        assert_eq!(large_sum.node_count, expected_nodes);
+        assert_eq!(large_sum.output_elem, crate::bytecode::ElemType::I64);
+        assert!(
+            linear_elapsed.as_millis() < 100,
+            "verify_program took {} ms on 20k arenas x 40k control nodes (expected < 100 ms)",
+            linear_elapsed.as_millis()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "comprehensive AC-3 verification and Tier 0 == ELF64 AOT equivalence test for CAP_DIVERGE and LoopBound"
+    )]
+    fn test_tc_core1_cap_diverge_and_aot_equivalence() -> Result<(), String> {
+        use crate::bytecode::CAP_DIVERGE;
+        use crate::transpiler::assemble_rls;
+
+        // 1. Without CAP_DIVERGE: unbounded Loop (`proof=0`) must fail with MissingCapability.
+        let unbounded_no_cap = assemble_rls(
+            "\
+cap NONE
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $lp = Loop i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $c
+",
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            verify_program(&unbounded_no_cap),
+            Err(d) if d.kind == VerifyErrorKind::MissingCapability {
+                required: CAP_DIVERGE,
+                actual: CAP_NONE,
+            }
+        ));
+
+        // 2. Without CAP_DIVERGE: malformed LoopBound proofs must fail with InvalidRefinementProof.
+        for bad_proof_line in [
+            "proof 1 rule=loop_bound target=0 lo=0 hi=0 witness=0",
+            "proof 1 rule=loop_bound target=0 lo=0 hi=1000001 witness=0",
+            "proof 1 rule=loop_bound target=1 lo=0 hi=10 witness=0",
+            "proof 1 rule=loop_bound target=0 lo=1 hi=10 witness=0",
+            "proof 1 rule=loop_bound target=0 lo=0 hi=10 witness=1",
+            "proof 1 rule=block_sig target=0 lo=0 hi=0 witness=0",
+        ] {
+            let src = format!(
+                "cap NONE\n{bad_proof_line}\nnode $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1\nnode $lp = Loop i64x1 fg=0 pol=l1 proof=1 tok=pure a=0 b=0\nnode $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0\noutput $c\n"
+            );
+            let p = assemble_rls(&src).map_err(|e| format!("{e:?}"))?;
+            assert!(
+                matches!(
+                    verify_program(&p),
+                    Err(d) if matches!(d.kind, VerifyErrorKind::InvalidRefinementProof { .. })
+                ),
+                "expected InvalidRefinementProof for {bad_proof_line}"
+            );
+        }
+
+        // 3. Without CAP_DIVERGE: bounded Loop (`hi=20`) summing 1..=10 = 55 succeeds in Tier 0 & AOT,
+        //    while Tier 1 and Tier 2 fail closed with UnsupportedInColumnarTier.
+        let bounded_sum_rls = "\
+cap NONE
+proof 1 rule=loop_bound target=0 lo=0 hi=20 witness=0
+node $zero = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $one = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $ten = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $s_acc = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$zero
+node $s_i = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$one
+node $lp = Loop i64x1 fg=0 pol=l1 proof=1 tok=pure a=0 b=0
+node $acc = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $i = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0
+node $acc2 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$acc b=$i
+node $u_acc = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$acc2
+node $i2 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$i b=$one
+node $u_i = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$i2
+node $cont = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$i2 b=$ten
+node $eq10 = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$i2 b=$ten
+node $keep = MaskOr maskx1 fg=0 pol=l1 proof=0 tok=pure a=$cont b=$eq10
+node $br = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$keep b=0
+node $end = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $out
+";
+        let bounded_prog = assemble_rls(bounded_sum_rls).map_err(|e| format!("{e:?}"))?;
+        verify_program(&bounded_prog).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(
+            execute_tier1_stencil(&bounded_prog, &[]),
+            Err(ExecError::UnsupportedInColumnarTier)
+        );
+        assert_eq!(
+            execute_tier2_fused(&bounded_prog, &[]),
+            Err(ExecError::UnsupportedInColumnarTier)
+        );
+
+        let rep_sum =
+            execute_tier0_interpreter(&bounded_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(t0_sum) = rep_sum.output else {
+            return Err("expected Scalar".to_owned());
+        };
+        assert_eq!(t0_sum.to_bits(), 55_u64);
+
+        let exe_sum = std::env::temp_dir().join("rul_tc_core1_ac3_bounded_ok");
+        crate::aot::compile_rl_to_executable(&bounded_prog, &exe_sum)
+            .map_err(|e| format!("{e:?}"))?;
+        let aot_sum_res = crate::aot::run_compiled_scalar_executable(&exe_sum);
+        let _ = std::fs::remove_file(&exe_sum);
+        assert_eq!(aot_sum_res.map_err(|e| format!("{e:?}"))?.to_bits(), 55_u64);
+
+        // 4. Runtime LoopBound enforcement when back-edges exceed `bound_hi` (`hi=5` on 9 back-edges):
+        //    both without CAP_DIVERGE and with CAP_DIVERGE!
+        for cap_hdr in ["cap NONE", "cap DIVERGE"] {
+            let exceed_rls = bounded_sum_rls
+                .replacen("cap NONE", cap_hdr, 1)
+                .replacen("hi=20", "hi=5", 1);
+            let exceed_prog = assemble_rls(&exceed_rls).map_err(|e| format!("{e:?}"))?;
+            assert_eq!(
+                execute_tier0_interpreter(&exceed_prog, &[]),
+                Err(ExecError::LoopBoundExceeded {
+                    loop_node: 5,
+                    limit: 5,
+                })
+            );
+            let exe_exc = std::env::temp_dir().join("rul_tc_core1_ac3_bounded_exceed");
+            crate::aot::compile_rl_to_executable(&exceed_prog, &exe_exc)
+                .map_err(|e| format!("{e:?}"))?;
+            let aot_exc = crate::aot::run_compiled_scalar_executable(&exe_exc);
+            let _ = std::fs::remove_file(&exe_exc);
+            assert!(matches!(
+                aot_exc,
+                Err(crate::aot::AotError::ContractAssertionFailed)
+            ));
+        }
+
+        // 5. With CAP_DIVERGE: unbounded iterative `fib(50) == 12_586_269_025` (`Tier 0 == ELF64 AOT`).
+        let fib50_rls = "\
+cap DIVERGE
+node $zero = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $one = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $n50 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=50
+node $sa = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$zero
+node $sb = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$one
+node $sk = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$zero
+node $blk = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $lp = Loop i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $k = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=0
+node $done = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$k b=$n50
+node $exit = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$done b=1
+node $a = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $b = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0
+node $next = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$b
+node $ua = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$b
+node $ub = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$next
+node $k1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$k b=$one
+node $uk = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$k1
+node $back = Br i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_lp = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_blk = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $out
+";
+        let fib_prog = assemble_rls(fib50_rls).map_err(|e| format!("{e:?}"))?;
+        let rep_fib = execute_tier0_interpreter(&fib_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(t0_fib) = rep_fib.output else {
+            return Err("expected Scalar".to_owned());
+        };
+        assert_eq!(t0_fib.to_bits(), 12_586_269_025_u64);
+
+        let exe_fib = std::env::temp_dir().join("rul_tc_core1_ac3_fib50");
+        crate::aot::compile_rl_to_executable(&fib_prog, &exe_fib).map_err(|e| format!("{e:?}"))?;
+        let aot_fib_res = crate::aot::run_compiled_scalar_executable(&exe_fib);
+        let _ = std::fs::remove_file(&exe_fib);
+        assert_eq!(
+            aot_fib_res.map_err(|e| format!("{e:?}"))?.to_bits(),
+            12_586_269_025_u64
+        );
+
+        // 6. Arbitrarily nested unbounded loops & branches: sum_{i=1}^{30} gcd(i * 37, 1260) via Euclidean subtraction.
+        let mut rust_gcd_sum = 0_i64;
+        for i in 1_i64..=30 {
+            let mut x = i * 37;
+            let mut y = 1260_i64;
+            while x != y {
+                if x > y {
+                    x -= y;
+                } else {
+                    y -= x;
+                }
+            }
+            rust_gcd_sum += x;
+        }
+
+        let nested_gcd_rls = "\
+cap DIVERGE
+node $zero = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $one = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $lim = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=30
+node $c37 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=37
+node $c1260 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1260
+node $s_total = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$zero
+node $s_i = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$one
+node $outer_blk = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $outer_lp = Loop i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $i = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0
+node $past = CmpGt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$i b=$lim
+node $br_done = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$past b=1
+node $x0 = Mul i64x1 fg=0 pol=l1 proof=0 tok=pure a=$i b=$c37
+node $sx = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$x0
+node $sy = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=3 b=$c1260
+node $inner_blk = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $inner_lp = Loop i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $x = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=0
+node $y = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=3 b=0
+node $eq_xy = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$x b=$y
+node $br_inner_done = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$eq_xy b=1
+node $gt_xy = CmpGt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$x b=$y
+node $if_xy = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$gt_xy b=0
+node $x_dec = Sub i64x1 fg=0 pol=l1 proof=0 tok=pure a=$x b=$y
+node $ux = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$x_dec
+node $el_xy = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $y_dec = Sub i64x1 fg=0 pol=l1 proof=0 tok=pure a=$y b=$x
+node $uy = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=3 b=$y_dec
+node $end_xy = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $back_inner = Br i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_inner_lp = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_inner_blk = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $g = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=0
+node $tot = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $tot2 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$tot b=$g
+node $utot = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$tot2
+node $i_next = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$i b=$one
+node $ui = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$i_next
+node $back_outer = Br i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_outer_lp = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_outer_blk = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $out
+";
+        let gcd_prog = assemble_rls(nested_gcd_rls).map_err(|e| format!("{e:?}"))?;
+        let rep_gcd = execute_tier0_interpreter(&gcd_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(t0_gcd) = rep_gcd.output else {
+            return Err("expected Scalar".to_owned());
+        };
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "positive GCD sum compared via exact 64-bit integer bit pattern"
+        )]
+        let expected_gcd_bits = rust_gcd_sum as u64;
+        assert_eq!(t0_gcd.to_bits(), expected_gcd_bits);
+
+        let exe_gcd = std::env::temp_dir().join("rul_tc_core1_ac3_nested_gcd");
+        crate::aot::compile_rl_to_executable(&gcd_prog, &exe_gcd).map_err(|e| format!("{e:?}"))?;
+        let aot_gcd_res = crate::aot::run_compiled_scalar_executable(&exe_gcd);
+        let _ = std::fs::remove_file(&exe_gcd);
+        assert_eq!(
+            aot_gcd_res.map_err(|e| format!("{e:?}"))?.to_bits(),
+            expected_gcd_bits
+        );
+
+        // 7. Scalar F64 Newton-Raphson sqrt(2.0) loop (`Tier 0 == ELF64 AOT` bit-exact).
+        let newton_f64_rls = "\
+cap DIVERGE
+node $two = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=2.0
+node $half = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=0.5
+node $eps = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=0.000000000001
+node $init = LocalSet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$two
+node $lp = Loop f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $x = LocalGet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $q = Div f64x1 fg=0 pol=l1 proof=0 tok=pure a=$two b=$x
+node $s = Add f64x1 fg=0 pol=l1 proof=0 tok=pure a=$x b=$q
+node $nx = Mul f64x1 fg=0 pol=l1 proof=0 tok=pure a=$half b=$s
+node $diff = Sub f64x1 fg=0 pol=l1 proof=0 tok=pure a=$nx b=$x
+node $err = Abs f64x1 fg=0 pol=l1 proof=0 tok=pure a=$diff b=0
+node $ux = LocalSet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$nx
+node $more = CmpGt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$err b=$eps
+node $again = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$more b=0
+node $end = End f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $res = LocalGet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $checked = AssertContract f64x1 fg=0 pol=l1 proof=0 tok=pure a=$res b=0
+output $checked
+";
+        let newton_prog = assemble_rls(newton_f64_rls).map_err(|e| format!("{e:?}"))?;
+        let rep_nr = execute_tier0_interpreter(&newton_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(t0_nr) = rep_nr.output else {
+            return Err("expected Scalar".to_owned());
+        };
+        let exe_nr = std::env::temp_dir().join("rul_tc_core1_ac3_newton");
+        crate::aot::compile_rl_to_executable(&newton_prog, &exe_nr)
+            .map_err(|e| format!("{e:?}"))?;
+        let aot_nr_res = crate::aot::run_compiled_scalar_executable(&exe_nr);
+        let _ = std::fs::remove_file(&exe_nr);
+        let aot_nr = aot_nr_res.map_err(|e| format!("{e:?}"))?;
+        assert_eq!(t0_nr.to_bits(), aot_nr.to_bits());
+        assert!((aot_nr - std::f64::consts::SQRT_2).abs() < 1e-15);
+
+        // 8. Nested bounded Loops without CAP_DIVERGE: outer `hi=3` (4 runs) x inner `hi=2` (3 runs) = 12 increments.
+        //    Verifies inner Loop resets its `bound_hi` fuel on each entry rather than exhausting globally.
+        let nested_bounded_rls = "\
+cap NONE
+proof 1 rule=loop_bound target=0 lo=0 hi=3 witness=0
+proof 2 rule=loop_bound target=0 lo=0 hi=2 witness=0
+node $zero = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $one = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $four = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=4
+node $three = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3
+node $s_cnt = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$zero
+node $s_out = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$zero
+node $lp_out = Loop i64x1 fg=0 pol=l1 proof=1 tok=pure a=0 b=0
+node $s_in = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$zero
+node $lp_in = Loop i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=0
+node $cnt = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $cnt1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cnt b=$one
+node $u_cnt = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$cnt1
+node $in_k = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=0
+node $in_k1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$in_k b=$one
+node $u_in = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=$in_k1
+node $in_lt = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$in_k1 b=$three
+node $br_in = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$in_lt b=0
+node $end_in = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out_k = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0
+node $out_k1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$out_k b=$one
+node $u_out = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$out_k1
+node $out_lt = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$out_k1 b=$four
+node $br_out = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$out_lt b=0
+node $end_out = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $res_cnt = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $res_cnt
+";
+        let nb_prog = assemble_rls(nested_bounded_rls).map_err(|e| format!("{e:?}"))?;
+        let rep_nb = execute_tier0_interpreter(&nb_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(t0_nb) = rep_nb.output else {
+            return Err("expected Scalar".to_owned());
+        };
+        assert_eq!(t0_nb.to_bits(), 12_u64);
+        let exe_nb = std::env::temp_dir().join("rul_tc_core1_ac3_nested_bounded");
+        crate::aot::compile_rl_to_executable(&nb_prog, &exe_nb).map_err(|e| format!("{e:?}"))?;
+        let aot_nb_res = crate::aot::run_compiled_scalar_executable(&exe_nb);
+        let _ = std::fs::remove_file(&exe_nb);
+        assert_eq!(aot_nb_res.map_err(|e| format!("{e:?}"))?.to_bits(), 12_u64);
+
+        // Verify white-box tracer and MCP differential harness on structured control-flow program.
+        let trace_rep =
+            crate::engine::trace_program(&nb_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(trace_rep.output, RuntimeValue::Scalar(f64::from_bits(12)));
+
+        // 9. Scalar F64 loop with `Ln`/`Exp` and `f64x8` lane hints on scalar nodes (including `output_node`),
+        //    verifying `Tier 0 == ELF64 AOT` via `summary.output_shape == ValueShape::Scalar` AND MCP `rul_test_differential`.
+        let f64_hint_rls = "\
+cap NONE
+proof 1 rule=loop_bound target=0 lo=0 hi=10 witness=0
+node $init_c = ConstF64 f64x8 fg=0 pol=simd proof=0 tok=pure const=0.5
+node $one_c = ConstF64 f64x8 fg=0 pol=simd proof=0 tok=pure const=1.0
+node $zero_i = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $one_i = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $four_i = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=4
+node $sx = LocalSet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$init_c
+node $sk = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$zero_i
+node $lp = Loop f64x1 fg=0 pol=l1 proof=1 tok=pure a=0 b=0
+node $xv = LocalGet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ex = Exp f64x8 fg=0 pol=simd proof=0 tok=pure a=$xv b=0
+node $ep1 = Add f64x8 fg=0 pol=simd proof=0 tok=pure a=$ex b=$one_c
+node $nx = Ln f64x8 fg=0 pol=simd proof=0 tok=pure a=$ep1 b=0
+node $ux = LocalSet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$nx
+node $kv = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0
+node $kv1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$kv b=$one_i
+node $uk = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$kv1
+node $cont = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$kv1 b=$four_i
+node $br = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$cont b=0
+node $end = End f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $res = LocalGet f64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = Add f64x8 fg=0 pol=simd proof=0 tok=pure a=$res b=$one_c
+output $out
+";
+        let f64_hint_prog = assemble_rls(f64_hint_rls).map_err(|e| format!("{e:?}"))?;
+        let f64_sum = verify_program(&f64_hint_prog).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(f64_sum.output_shape, crate::verifier::ValueShape::Scalar);
+        assert_eq!(f64_sum.output_elem, crate::bytecode::ElemType::F64);
+
+        let rep_hint =
+            execute_tier0_interpreter(&f64_hint_prog, &[]).map_err(|e| format!("{e:?}"))?;
+        let RuntimeValue::Scalar(t0_hint) = rep_hint.output else {
+            return Err("expected Scalar".to_owned());
+        };
+        let exe_hint = std::env::temp_dir().join("rul_tc_core1_ac3_f64_hint_ln_exp");
+        crate::aot::compile_rl_to_executable(&f64_hint_prog, &exe_hint)
+            .map_err(|e| format!("{e:?}"))?;
+        let aot_hint_res = crate::aot::run_compiled_scalar_executable(&exe_hint);
+        let _ = std::fs::remove_file(&exe_hint);
+        let aot_hint = aot_hint_res.map_err(|e| format!("{e:?}"))?;
+        let expected_hint = (0.5_f64.exp() + 4.0).ln() + 1.0;
+        assert!((t0_hint - expected_hint).abs() < 1e-12);
+        assert!((aot_hint - t0_hint).abs() < 1e-12);
+
+        let mcp = crate::mcp::RulMcpServer::new();
+        for rls_case in [nested_bounded_rls, f64_hint_rls] {
+            let escaped = rls_case.replace('\n', "\\n");
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{{"name":"rul_test_differential","arguments":{{"rls_source":"{escaped}"}}}}}}"#
+            );
+            let resp = mcp.handle_line(&req);
+            assert!(
+                resp.contains("DIFFERENTIAL_EQUIVALENCE_PASS"),
+                "expected DIFFERENTIAL_EQUIVALENCE_PASS in MCP response, got: {resp}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tc_core1_rls_roundtrip() -> Result<(), String> {
+        use crate::bytecode::CAP_DIVERGE;
+        use crate::transpiler::{assemble_rls, program_to_rls};
+
+        // Program 1: CAP_DIVERGE | CAP_NET_RING, ConstI64 extremes, LocalGet/LocalSet,
+        // Block/Loop/If/Else/End/Br/BrIf, BlockSig (value-returning including node #0), and LoopBound.
+        let rls_1 = "\
+cap NET_RING|DIVERGE
+proof 1 rule=block_sig target=0 lo=0 hi=0 witness=33
+proof 2 rule=loop_bound target=0 lo=0 hi=1000 witness=0
+node $n0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-9223372036854775808
+node $n1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=9223372036854775807
+node $n2 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $n3 = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$n0 b=$n1
+node $n4 = If i64x1 fg=0 pol=l1 proof=1 tok=pure a=$n3 b=0
+node $n5 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=$n0 b=1
+node $n6 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=$n1 b=1
+node $n7 = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$n6
+node $n8 = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n9 = Loop i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=0
+node $n10 = Loop i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n11 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n12 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$n11 b=$n2
+node $n13 = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$n12
+node $n14 = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$n3 b=2
+node $n15 = Br i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n16 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n17 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n18 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n19 = Block i64x1 fg=0 pol=l1 proof=1 tok=pure a=0 b=0
+node $n20 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $n21 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=$n20 b=1
+output $n21
+";
+        let prog_1 = assemble_rls(rls_1).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(prog_1.capability_mask, CAP_NET_RING | CAP_DIVERGE);
+        verify_program(&prog_1).map_err(|e| format!("{e:?}"))?;
+
+        let rl_bytes_1 = prog_1.to_rl_bytes();
+        let from_bin_1 = RulProgram::from_rl_bytes(&rl_bytes_1).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(from_bin_1.to_rl_bytes(), rl_bytes_1);
+
+        let decompiled_1 = program_to_rls(&from_bin_1);
+        let reassembled_1 = assemble_rls(&decompiled_1).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(reassembled_1.to_rl_bytes(), rl_bytes_1);
+
+        let disasm_1 = disassemble_rl(&prog_1);
+        assert!(disasm_1.contains("ConstI64"));
+        assert!(disasm_1.contains("BlockSig"));
+        assert!(disasm_1.contains("LoopBound"));
+
+        // Program 2: Arena-tracking BlockSig (`target=0 lo=1 hi=2 witness=0`) + void If/Else/End.
+        let rls_2 = "\
+cap NONE
+arena 0 len=8 lane=f64x4 mut=true ver=1
+proof 1 rule=block_sig target=0 lo=1 hi=2 witness=0
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=42
+node $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c b=$c
+node $if0 = If i64x1 fg=0 pol=l1 proof=1 tok=pure a=$m b=0
+node $a_t = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $w_t = ArenaMutate f64x4 fg=0 pol=l1 proof=0 tok=consume(0,1) a=0 b=$a_t
+node $el0 = Else i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $a_e = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+node $w_e = ArenaMutate f64x4 fg=0 pol=l1 proof=0 tok=consume(0,1) a=0 b=$a_e
+node $end0 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $a_post = ArenaInput f64x4 fg=0 pol=l1 proof=0 tok=read(0,2) a=0 b=0
+node $out = ReduceSum f64x1 fg=0 pol=l1 proof=0 tok=pure a=$a_post b=0
+output $out
+";
+        let prog_2 = assemble_rls(rls_2).map_err(|e| format!("{e:?}"))?;
+        verify_program(&prog_2).map_err(|e| format!("{e:?}"))?;
+        let rl_bytes_2 = prog_2.to_rl_bytes();
+        let decompiled_2 = program_to_rls(&prog_2);
+        let reassembled_2 = assemble_rls(&decompiled_2).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(reassembled_2.to_rl_bytes(), rl_bytes_2);
+
+        Ok(())
+    }
 }

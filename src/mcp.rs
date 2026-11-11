@@ -6,10 +6,11 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::aot::compile_rl_to_executable;
-use crate::bytecode::RulProgram;
+use crate::aot::{compile_rl_to_executable, run_compiled_scalar_executable};
+use crate::bytecode::{ElemType, RulProgram};
 use crate::cas::builtin_intrinsics;
 use crate::engine::{
     autotune_schedule, execute_tier0_interpreter, execute_tier1_stencil,
@@ -202,12 +203,86 @@ fn format_runtime_value(val: &RuntimeValue) -> String {
     }
 }
 
+fn mcp_scalars_equivalent(output_elem: ElemType, expected: f64, actual: f64) -> bool {
+    match output_elem {
+        ElemType::I64 | ElemType::BoolMask => expected.to_bits() == actual.to_bits(),
+        ElemType::F64 => {
+            if expected.is_nan() && actual.is_nan() {
+                return true;
+            }
+            if expected.is_nan() || actual.is_nan() {
+                return false;
+            }
+            if expected.is_infinite() || actual.is_infinite() {
+                return expected.is_infinite()
+                    && actual.is_infinite()
+                    && expected.is_sign_positive() == actual.is_sign_positive();
+            }
+            let diff = (expected - actual).abs();
+            let scale = expected.abs().max(actual.abs()).max(1.0);
+            diff <= 1e-9 * scale
+        }
+    }
+}
+
 fn tool_test_differential(
     rls_source: &str,
     sample_size_override: Option<u32>,
 ) -> Result<String, String> {
+    static AOT_DIFF_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let (program, owned_arenas) = prepare_program_and_arenas(rls_source, sample_size_override)?;
+    let summary = verify_program(&program).map_err(|e| format!("VERIFY_ERROR: {e:?}"))?;
     let input_slices: Vec<&[f64]> = owned_arenas.iter().map(Vec::as_slice).collect();
+
+    if program.uses_structured_control_or_locals() {
+        let rep0 = execute_tier0_interpreter(&program, &input_slices)
+            .map_err(|e| format!("TIER0_EXEC_ERROR: {e:?}"))?;
+        let mut out = String::with_capacity(512);
+        if program.arenas.is_empty() {
+            let seq = AOT_DIFF_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_exe =
+                std::env::temp_dir().join(format!("rul_mcp_diff_{}_{seq}", std::process::id()));
+            let aot_rep = compile_rl_to_executable(&program, &tmp_exe)
+                .map_err(|e| format!("AOT_COMPILE_ERROR: {e:?}"))?;
+            let aot_res = run_compiled_scalar_executable(&tmp_exe);
+            let _ = std::fs::remove_file(&tmp_exe);
+            let aot_val = aot_res.map_err(|e| format!("AOT_EXEC_ERROR: {e:?}"))?;
+            if let RuntimeValue::Scalar(t0_val) = rep0.output {
+                if !mcp_scalars_equivalent(summary.output_elem, t0_val, aot_val) {
+                    return Err(format!(
+                        "AOT_EQUIVALENCE_ERROR ({:?}): Tier0=0x{:016x} != AOT=0x{:016x}",
+                        summary.output_elem,
+                        t0_val.to_bits(),
+                        aot_val.to_bits()
+                    ));
+                }
+            }
+            let _ = writeln!(out, "STATUS: DIFFERENTIAL_EQUIVALENCE_PASS");
+            let _ = writeln!(out, "MODE: STRUCTURED_SCALAR_TIER0_VS_ELF64_AOT");
+            let _ = writeln!(out, "OUTPUT: {}", format_runtime_value(&rep0.output));
+            let _ = writeln!(
+                out,
+                "TIER0_INTERPRETER: exec_ns={} alloc_bytes={}",
+                rep0.telemetry.exec_ns, rep0.telemetry.intermediate_bytes_allocated
+            );
+            let _ = writeln!(
+                out,
+                "AOT_ELF64: elf_bytes={} codegen_ns={}",
+                aot_rep.elf_bytes, aot_rep.codegen_ns
+            );
+        } else {
+            let _ = writeln!(out, "STATUS: TIER0_ORACLE_PASS");
+            let _ = writeln!(out, "OUTPUT: {}", format_runtime_value(&rep0.output));
+            let _ = writeln!(
+                out,
+                "TIER0_INTERPRETER: exec_ns={} alloc_bytes={}",
+                rep0.telemetry.exec_ns, rep0.telemetry.intermediate_bytes_allocated
+            );
+        }
+        return Ok(out);
+    }
+
     let zmap = owned_arenas.first().map(|col| ArenaZoneMap::build(col));
 
     let rep0 = execute_tier0_interpreter(&program, &input_slices)

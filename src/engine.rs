@@ -64,6 +64,8 @@ pub enum RuntimeValue {
 enum EvalValue<'a> {
     Unused,
     Scalar(f64),
+    ScalarI64(i64),
+    ScalarMask(bool),
     ColumnF64(Cow<'a, [f64]>),
     ColumnMask(Vec<bool>),
 }
@@ -72,6 +74,15 @@ impl EvalValue<'_> {
     fn into_runtime_value(self, node_idx: u32) -> Result<RuntimeValue, ExecError> {
         match self {
             Self::Scalar(v) => Ok(RuntimeValue::Scalar(v)),
+            Self::ScalarI64(v) => {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "scalar i64 output bit-pattern is plumbed losslessly via f64::from_bits(v as u64)"
+                )]
+                let raw_bits = v as u64;
+                Ok(RuntimeValue::Scalar(f64::from_bits(raw_bits)))
+            }
+            Self::ScalarMask(b) => Ok(RuntimeValue::Scalar(f64::from_bits(u64::from(b)))),
             Self::ColumnF64(cow) => Ok(RuntimeValue::ColumnF64(cow.into_owned())),
             Self::ColumnMask(m) => Ok(RuntimeValue::ColumnMask(m)),
             Self::Unused => Err(ExecError::InvalidOperandState(node_idx)),
@@ -139,6 +150,15 @@ pub enum ExecError {
         /// Observed scalar value.
         observed: f64,
     },
+    /// Structured control-flow or typed scalar local opcode is unsupported in columnar Tier 1 / Tier 2.
+    UnsupportedInColumnarTier,
+    /// Bounded `Loop` (`ProofRuleKind::LoopBound`) exceeded its declared `bound_hi` back-edge limit.
+    LoopBoundExceeded {
+        /// Offending `Loop` header node index.
+        loop_node: u32,
+        /// Maximum permitted back-edge iterations (`bound_hi`).
+        limit: u32,
+    },
 }
 
 impl fmt::Display for ExecError {
@@ -166,6 +186,14 @@ impl fmt::Display for ExecError {
             Self::ContractAssertionFailed { node_idx, observed } => write!(
                 f,
                 "contract assertion failed at node #{node_idx}: observed {observed}"
+            ),
+            Self::UnsupportedInColumnarTier => write!(
+                f,
+                "structured control flow and typed scalar locals are unsupported in columnar Tier 1 / Tier 2"
+            ),
+            Self::LoopBoundExceeded { loop_node, limit } => write!(
+                f,
+                "loop bound exceeded at Loop node #{loop_node}: back-edge limit {limit} exhausted"
             ),
         }
     }
@@ -220,6 +248,9 @@ fn build_telemetry(
 #[must_use]
 pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
     let n = program.nodes.len();
+    if program.uses_structured_control_or_locals() {
+        return vec![true; n];
+    }
     let mut live = vec![false; n];
     if let Some(slot) = live.get_mut(program.output_node as usize) {
         *slot = true;
@@ -233,7 +264,13 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             continue;
         };
         match frame.opcode {
-            Opcode::ArenaInput | Opcode::ConstF64 => {}
+            Opcode::ArenaInput
+            | Opcode::ConstF64
+            | Opcode::ConstI64
+            | Opcode::LocalGet
+            | Opcode::Block
+            | Opcode::Loop
+            | Opcode::Br => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt
@@ -245,14 +282,23 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::ReduceMax
             | Opcode::ReduceMin
             | Opcode::RingEnqueue
-            | Opcode::AssertContract => {
+            | Opcode::AssertContract
+            | Opcode::If
+            | Opcode::BrIf => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
                     *a = true;
                 }
             }
-            Opcode::ArenaMutate => {
+            Opcode::ArenaMutate | Opcode::LocalSet => {
                 if let Some(b) = live.get_mut(frame.in_b as usize) {
                     *b = true;
+                }
+            }
+            Opcode::Else | Opcode::End => {
+                if frame.in_b != 0 {
+                    if let Some(a) = live.get_mut(frame.in_a as usize) {
+                        *a = true;
+                    }
                 }
             }
             Opcode::Add
@@ -293,13 +339,14 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
     live
 }
 
-/// **Tier 0 — Zero-Copy Reference Columnar Interpreter (Golden Oracle)**.
+/// **Tier 0 — Zero-Copy Reference Columnar & Structured Control-Flow Interpreter (Golden Oracle)**.
 ///
 /// Verifies the `.rl` program in $O(N)$ and evaluates each node sequentially using
-/// zero-copy `Cow<'a, [f64]>` borrows on `ArenaInput` and `ArenaSlice`.
+/// zero-copy `Cow<'a, [f64]>` borrows on `ArenaInput` and `ArenaSlice`, or executes
+/// structured WASM-style control flow and 64 typed scalar local slots when present.
 ///
 /// # Errors
-/// Returns [`ExecError`] if verification, input binding, gather bounds, or contract assertions fail.
+/// Returns [`ExecError`] if verification, input binding, loop bounds, gather bounds, or contract assertions fail.
 pub fn execute_tier0_interpreter(
     program: &RulProgram,
     inputs: &[&[f64]],
@@ -311,21 +358,18 @@ pub fn execute_tier0_interpreter(
     let elements_processed = validate_inputs(program, inputs)?;
 
     let t_exec = Instant::now();
-    let mut values: Vec<EvalValue<'_>> = Vec::with_capacity(program.nodes.len());
-    let mut intermediate_bytes = 0usize;
-
-    for (idx, frame) in program.nodes.iter().enumerate() {
-        let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
-        let val = eval_node_tier0(
-            program,
-            frame,
-            node_idx,
-            inputs,
-            &values,
-            &mut intermediate_bytes,
-        )?;
-        values.push(val);
-    }
+    let (values, intermediate_bytes) = if program.uses_structured_control_or_locals() {
+        eval_structured_tier0(program, inputs)?
+    } else {
+        let mut vals: Vec<EvalValue<'_>> = Vec::with_capacity(program.nodes.len());
+        let mut inter_bytes = 0usize;
+        for (idx, frame) in program.nodes.iter().enumerate() {
+            let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
+            let val = eval_node_tier0(program, frame, node_idx, inputs, &vals, &mut inter_bytes)?;
+            vals.push(val);
+        }
+        (vals, inter_bytes)
+    };
 
     let exec_ns = u64::try_from(t_exec.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let out_eval = values
@@ -338,6 +382,307 @@ pub fn execute_tier0_interpreter(
         output,
         telemetry: build_telemetry(verify_ns, exec_ns, elements_processed, intermediate_bytes),
     })
+}
+
+fn eval_structured_tier0<'a>(
+    program: &RulProgram,
+    inputs: &[&'a [f64]],
+) -> Result<(Vec<EvalValue<'a>>, usize), ExecError> {
+    let n = program.nodes.len();
+    let mut if_to_else: Vec<Option<usize>> = vec![None; n];
+    let mut else_to_if: Vec<usize> = vec![0; n];
+    let mut header_to_end: Vec<usize> = vec![0; n];
+    let mut br_target_header: Vec<usize> = vec![0; n];
+    let mut stack: Vec<usize> = Vec::new();
+
+    for (idx, frame) in program.nodes.iter().enumerate() {
+        let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
+        match frame.opcode {
+            Opcode::Block | Opcode::Loop | Opcode::If => {
+                stack.push(idx);
+            }
+            Opcode::Else => {
+                let if_hdr = stack
+                    .last()
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = if_to_else.get_mut(if_hdr) {
+                    *slot = Some(idx);
+                }
+                if let Some(slot) = else_to_if.get_mut(idx) {
+                    *slot = if_hdr;
+                }
+            }
+            Opcode::End => {
+                let hdr = stack
+                    .pop()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = header_to_end.get_mut(hdr) {
+                    *slot = idx;
+                }
+            }
+            Opcode::Br => {
+                let depth = frame.in_a as usize;
+                let target_pos = stack
+                    .len()
+                    .checked_sub(1 + depth)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let hdr = stack
+                    .get(target_pos)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = br_target_header.get_mut(idx) {
+                    *slot = hdr;
+                }
+            }
+            Opcode::BrIf => {
+                let depth = frame.in_b as usize;
+                let target_pos = stack
+                    .len()
+                    .checked_sub(1 + depth)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let hdr = stack
+                    .get(target_pos)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = br_target_header.get_mut(idx) {
+                    *slot = hdr;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut values: Vec<EvalValue<'a>> = vec![EvalValue::Unused; n];
+    let mut locals: [EvalValue<'a>; 64] = std::array::from_fn(|_i| EvalValue::Unused);
+    let mut arena_state: Vec<Cow<'a, [f64]>> = inputs.iter().map(|&s| Cow::Borrowed(s)).collect();
+    let mut loop_fuel: Vec<u32> = vec![0; n];
+    let mut intermediate_bytes = 0usize;
+    let mut pc = 0usize;
+
+    while pc < n {
+        let node_idx = u32::try_from(pc).unwrap_or(u32::MAX);
+        let frame = program
+            .nodes
+            .get(pc)
+            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+
+        match frame.opcode {
+            Opcode::ArenaInput => {
+                let col = arena_state
+                    .get(frame.in_a as usize)
+                    .cloned()
+                    .ok_or(ExecError::MissingArenaInput(frame.in_a))?;
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = EvalValue::ColumnF64(col);
+                pc += 1;
+            }
+            Opcode::ArenaMutate => {
+                let src = values
+                    .get(frame.in_b as usize)
+                    .cloned()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let EvalValue::ColumnF64(ref col) = src {
+                    let arena_slot = arena_state
+                        .get_mut(frame.in_a as usize)
+                        .ok_or(ExecError::MissingArenaInput(frame.in_a))?;
+                    *arena_slot = col.clone();
+                }
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = src;
+                pc += 1;
+            }
+            Opcode::ConstI64 => {
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = EvalValue::ScalarI64(frame.decode_const_i64());
+                pc += 1;
+            }
+            Opcode::LocalGet => {
+                let val = locals
+                    .get(frame.in_a as usize)
+                    .cloned()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if matches!(val, EvalValue::Unused) {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                }
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = val;
+                pc += 1;
+            }
+            Opcode::LocalSet => {
+                let val = values
+                    .get(frame.in_b as usize)
+                    .cloned()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let local_slot = locals
+                    .get_mut(frame.in_a as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *local_slot = val.clone();
+                let node_slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *node_slot = val;
+                pc += 1;
+            }
+            Opcode::Block => {
+                pc += 1;
+            }
+            Opcode::Loop => {
+                if frame.proof_idx > 0 {
+                    let proof = program
+                        .proofs
+                        .get(usize::from(frame.proof_idx - 1))
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let fuel_slot = loop_fuel
+                        .get_mut(pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *fuel_slot = proof.bound_hi;
+                }
+                pc += 1;
+            }
+            Opcode::If => {
+                let cond_val = values
+                    .get(frame.in_a as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let EvalValue::ScalarMask(cond_bool) = *cond_val else {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                };
+                if cond_bool {
+                    pc += 1;
+                } else if let Some(else_pc) = if_to_else.get(pc).copied().flatten() {
+                    pc = else_pc + 1;
+                } else {
+                    let end_pc = header_to_end
+                        .get(pc)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    pc = end_pc + 1;
+                }
+            }
+            Opcode::Else => {
+                let if_hdr = else_to_if
+                    .get(pc)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let end_pc = header_to_end
+                    .get(if_hdr)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if frame.in_b != 0 {
+                    let then_val = values
+                        .get(frame.in_a as usize)
+                        .cloned()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let end_slot = values
+                        .get_mut(end_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *end_slot = then_val;
+                }
+                pc = end_pc + 1;
+            }
+            Opcode::End => {
+                if frame.in_b != 0 {
+                    let res_val = values
+                        .get(frame.in_a as usize)
+                        .cloned()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let end_slot = values
+                        .get_mut(pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *end_slot = res_val;
+                }
+                pc += 1;
+            }
+            Opcode::Br => {
+                let hdr = br_target_header
+                    .get(pc)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                pc = step_branch_target(program, hdr, node_idx, &header_to_end, &mut loop_fuel)?;
+            }
+            Opcode::BrIf => {
+                let cond_val = values
+                    .get(frame.in_a as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let EvalValue::ScalarMask(cond_bool) = *cond_val else {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                };
+                if cond_bool {
+                    let hdr = br_target_header
+                        .get(pc)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    pc =
+                        step_branch_target(program, hdr, node_idx, &header_to_end, &mut loop_fuel)?;
+                } else {
+                    pc += 1;
+                }
+            }
+            _ => {
+                let val = eval_node_tier0(
+                    program,
+                    frame,
+                    node_idx,
+                    inputs,
+                    &values,
+                    &mut intermediate_bytes,
+                )?;
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = val;
+                pc += 1;
+            }
+        }
+    }
+
+    Ok((values, intermediate_bytes))
+}
+
+fn step_branch_target(
+    program: &RulProgram,
+    hdr: usize,
+    branch_node: u32,
+    header_to_end: &[usize],
+    loop_fuel: &mut [u32],
+) -> Result<usize, ExecError> {
+    let hdr_frame = program
+        .nodes
+        .get(hdr)
+        .ok_or(ExecError::InvalidOperandState(branch_node))?;
+    if hdr_frame.opcode == Opcode::Loop {
+        if hdr_frame.proof_idx > 0 {
+            let proof = program
+                .proofs
+                .get(usize::from(hdr_frame.proof_idx - 1))
+                .ok_or(ExecError::InvalidOperandState(branch_node))?;
+            let fuel_slot = loop_fuel
+                .get_mut(hdr)
+                .ok_or(ExecError::InvalidOperandState(branch_node))?;
+            if *fuel_slot == 0 {
+                return Err(ExecError::LoopBoundExceeded {
+                    loop_node: u32::try_from(hdr).unwrap_or(u32::MAX),
+                    limit: proof.bound_hi,
+                });
+            }
+            *fuel_slot -= 1;
+        }
+        Ok(hdr + 1)
+    } else {
+        let end_pc = header_to_end
+            .get(hdr)
+            .copied()
+            .ok_or(ExecError::InvalidOperandState(branch_node))?;
+        Ok(end_pc + 1)
+    }
 }
 
 fn eval_node_tier0<'a>(
@@ -358,6 +703,7 @@ fn eval_node_tier0<'a>(
             Ok(EvalValue::ColumnF64(Cow::Borrowed(slice)))
         }
         Opcode::ConstF64 => Ok(EvalValue::Scalar(frame.decode_const_f64())),
+        Opcode::ConstI64 => Ok(EvalValue::ScalarI64(frame.decode_const_i64())),
         Opcode::ArenaSlice => {
             let proof = program
                 .proofs
@@ -433,6 +779,17 @@ fn eval_node_tier0<'a>(
                 }
             };
             match (left, right) {
+                (EvalValue::Scalar(a), EvalValue::Scalar(b)) => {
+                    Ok(EvalValue::ScalarMask(cmp(*a, *b)))
+                }
+                (EvalValue::ScalarI64(a), EvalValue::ScalarI64(b)) => {
+                    let res = match frame.opcode {
+                        Opcode::CmpGt => *a > *b,
+                        Opcode::CmpLt => *a < *b,
+                        _ => *a == *b,
+                    };
+                    Ok(EvalValue::ScalarMask(res))
+                }
                 (EvalValue::ColumnF64(col), EvalValue::Scalar(thr)) => {
                     *intermediate_bytes = intermediate_bytes.saturating_add(col.len());
                     let mask: Vec<bool> = col.iter().map(|&x| cmp(x, *thr)).collect();
@@ -459,19 +816,27 @@ fn eval_node_tier0<'a>(
             let right = values
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
-            if let (EvalValue::ColumnMask(a), EvalValue::ColumnMask(b)) = (left, right) {
-                *intermediate_bytes = intermediate_bytes.saturating_add(a.len());
-                let out: Vec<bool> = a
-                    .iter()
-                    .zip(b.iter())
-                    .map(|(&x, &y)| match frame.opcode {
-                        Opcode::MaskAnd => x && y,
-                        _ => x || y,
-                    })
-                    .collect();
-                Ok(EvalValue::ColumnMask(out))
-            } else {
-                Err(ExecError::InvalidOperandState(node_idx))
+            match (left, right) {
+                (EvalValue::ScalarMask(a), EvalValue::ScalarMask(b)) => {
+                    let res = match frame.opcode {
+                        Opcode::MaskAnd => *a && *b,
+                        _ => *a || *b,
+                    };
+                    Ok(EvalValue::ScalarMask(res))
+                }
+                (EvalValue::ColumnMask(a), EvalValue::ColumnMask(b)) => {
+                    *intermediate_bytes = intermediate_bytes.saturating_add(a.len());
+                    let out: Vec<bool> = a
+                        .iter()
+                        .zip(b.iter())
+                        .map(|(&x, &y)| match frame.opcode {
+                            Opcode::MaskAnd => x && y,
+                            _ => x || y,
+                        })
+                        .collect();
+                    Ok(EvalValue::ColumnMask(out))
+                }
+                _ => Err(ExecError::InvalidOperandState(node_idx)),
             }
         }
         Opcode::SelectZero => {
@@ -482,6 +847,15 @@ fn eval_node_tier0<'a>(
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             match (mask_val, col_val) {
+                (EvalValue::ScalarMask(m), EvalValue::Scalar(s)) => {
+                    Ok(EvalValue::Scalar(if *m { *s } else { 0.0 }))
+                }
+                (EvalValue::ScalarMask(m), EvalValue::ScalarI64(v)) => {
+                    Ok(EvalValue::ScalarI64(if *m { *v } else { 0 }))
+                }
+                (EvalValue::ScalarMask(m), EvalValue::ScalarMask(b)) => {
+                    Ok(EvalValue::ScalarMask(*m && *b))
+                }
                 (EvalValue::ColumnMask(mask), EvalValue::ColumnF64(col)) => {
                     *intermediate_bytes = intermediate_bytes.saturating_add(col.len() * 8);
                     let out: Vec<f64> = mask
@@ -622,6 +996,15 @@ fn eval_node_tier0<'a>(
             }
             Ok(src)
         }
+        Opcode::LocalGet
+        | Opcode::LocalSet
+        | Opcode::Block
+        | Opcode::Loop
+        | Opcode::If
+        | Opcode::Else
+        | Opcode::End
+        | Opcode::Br
+        | Opcode::BrIf => Err(ExecError::UnsupportedInColumnarTier),
     }
 }
 
@@ -632,6 +1015,14 @@ fn eval_arith_tier0<'a>(
     node_idx: u32,
     intermediate_bytes: &mut usize,
 ) -> Result<EvalValue<'a>, ExecError> {
+    if let (EvalValue::ScalarI64(a), EvalValue::ScalarI64(b)) = (left, right) {
+        return match opcode {
+            Opcode::Add => Ok(EvalValue::ScalarI64(a.wrapping_add(*b))),
+            Opcode::Sub => Ok(EvalValue::ScalarI64(a.wrapping_sub(*b))),
+            Opcode::Mul => Ok(EvalValue::ScalarI64(a.wrapping_mul(*b))),
+            _ => Err(ExecError::InvalidOperandState(node_idx)),
+        };
+    }
     let apply = |a: f64, b: f64| -> f64 {
         match opcode {
             Opcode::Add => a + b,
@@ -780,6 +1171,10 @@ pub fn execute_tier1_stencil(
     verify_program(program).map_err(ExecError::VerificationFailed)?;
     let verify_ns = u64::try_from(t_verify.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
+    if program.uses_structured_control_or_locals() {
+        return Err(ExecError::UnsupportedInColumnarTier);
+    }
+
     let elements_processed = validate_inputs(program, inputs)?;
 
     let t_exec = Instant::now();
@@ -847,6 +1242,10 @@ pub fn execute_tier2_with_zonemap(
     let t_verify = Instant::now();
     verify_program(program).map_err(ExecError::VerificationFailed)?;
     let verify_ns = u64::try_from(t_verify.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+    if program.uses_structured_control_or_locals() {
+        return Err(ExecError::UnsupportedInColumnarTier);
+    }
 
     let elements_processed = validate_inputs(program, inputs)?;
 
@@ -1101,7 +1500,18 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
                 post_reduce_nodes.push(idx);
                 TileNodePhase::PostReduceScalar
             }
-            Opcode::FilterCompact | Opcode::Gather => return None,
+            Opcode::FilterCompact
+            | Opcode::Gather
+            | Opcode::ConstI64
+            | Opcode::LocalGet
+            | Opcode::LocalSet
+            | Opcode::Block
+            | Opcode::Loop
+            | Opcode::If
+            | Opcode::Else
+            | Opcode::End
+            | Opcode::Br
+            | Opcode::BrIf => return None,
         };
         if let Some(slot) = phases.get_mut(idx) {
             *slot = phase;
@@ -2244,25 +2654,29 @@ pub fn trace_program(
     let live = compute_live_nodes(program);
 
     let t_exec = Instant::now();
-    let mut values: Vec<EvalValue<'_>> = Vec::with_capacity(program.nodes.len());
     let mut entries: Vec<NodeTraceEntry> = Vec::with_capacity(program.nodes.len());
-    let mut intermediate_bytes = 0usize;
-
-    for (idx, frame) in program.nodes.iter().enumerate() {
-        let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
-        let is_live = live.get(idx).copied().unwrap_or(false);
-        let val = eval_node_tier0(
-            program,
-            frame,
-            node_idx,
-            inputs,
-            &values,
-            &mut intermediate_bytes,
-        )?;
-        let entry = summarize_eval_value(node_idx, frame.opcode, is_live, &val);
-        entries.push(entry);
-        values.push(val);
-    }
+    let (values, intermediate_bytes) = if program.uses_structured_control_or_locals() {
+        let (vals, inter_bytes) = eval_structured_tier0(program, inputs)?;
+        for (idx, frame) in program.nodes.iter().enumerate() {
+            let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
+            let is_live = live.get(idx).copied().unwrap_or(false);
+            let val = vals.get(idx).unwrap_or(&EvalValue::Unused);
+            entries.push(summarize_eval_value(node_idx, frame.opcode, is_live, val));
+        }
+        (vals, inter_bytes)
+    } else {
+        let mut vals: Vec<EvalValue<'_>> = Vec::with_capacity(program.nodes.len());
+        let mut inter_bytes = 0usize;
+        for (idx, frame) in program.nodes.iter().enumerate() {
+            let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
+            let is_live = live.get(idx).copied().unwrap_or(false);
+            let val = eval_node_tier0(program, frame, node_idx, inputs, &vals, &mut inter_bytes)?;
+            let entry = summarize_eval_value(node_idx, frame.opcode, is_live, &val);
+            entries.push(entry);
+            vals.push(val);
+        }
+        (vals, inter_bytes)
+    };
 
     let exec_ns = u64::try_from(t_exec.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let out_eval = values
@@ -2297,6 +2711,40 @@ fn summarize_eval_value(
             nan_or_inf_count: usize::from(!x.is_finite()),
             sample_head: vec![*x],
         },
+        EvalValue::ScalarI64(v) => {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "human-readable trace summary converts i64 scalar to approximate f64 display metric"
+            )]
+            let approx = *v as f64;
+            NodeTraceEntry {
+                node_idx,
+                opcode,
+                is_live,
+                value_kind: "ScalarI64",
+                element_count: 1,
+                min_val: approx,
+                max_val: approx,
+                sum_or_true_count: approx,
+                nan_or_inf_count: 0,
+                sample_head: vec![approx],
+            }
+        }
+        EvalValue::ScalarMask(b) => {
+            let bit = if *b { 1.0 } else { 0.0 };
+            NodeTraceEntry {
+                node_idx,
+                opcode,
+                is_live,
+                value_kind: "ScalarMask",
+                element_count: 1,
+                min_val: bit,
+                max_val: bit,
+                sum_or_true_count: bit,
+                nan_or_inf_count: 0,
+                sample_head: vec![bit],
+            }
+        }
         EvalValue::ColumnF64(col) => {
             let mut min_v = f64::INFINITY;
             let mut max_v = f64::NEG_INFINITY;

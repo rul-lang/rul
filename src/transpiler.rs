@@ -10,7 +10,8 @@ use std::fmt::{self, Write as _};
 
 use crate::bytecode::{
     ArenaDescriptor, ElemType, ExecPolicy, NodeFrame, Opcode, ProofEntry, ProofRuleKind,
-    RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane,
+    RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane, CAP_DIVERGE,
+    CAP_GPU_DISPATCH, CAP_NET_RING, CAP_NONE, CAP_STORAGE_DMA,
 };
 
 /// Error returned when resolving symbolic labels in [`SymbolicGraphBuilder`].
@@ -388,6 +389,8 @@ pub fn disassemble_rl(program: &RulProgram) -> String {
     for (idx, frame) in program.nodes.iter().enumerate() {
         let inputs = if frame.opcode == Opcode::ConstF64 {
             format!("const={:.4}", frame.decode_const_f64())
+        } else if frame.opcode == Opcode::ConstI64 {
+            format!("const_i64={}", frame.decode_const_i64())
         } else if frame.opcode == Opcode::Fma {
             let (b, c) = frame.decode_fma_bc();
             format!("in_a={}, in_b={b}, in_c={c}", frame.in_a)
@@ -469,6 +472,8 @@ pub fn program_to_rls(program: &RulProgram) -> String {
         let rule_str = match proof.rule_kind {
             ProofRuleKind::SliceBounds => "slice_bounds",
             ProofRuleKind::GatherIndexInBounds => "gather_bounds",
+            ProofRuleKind::BlockSig => "block_sig",
+            ProofRuleKind::LoopBound => "loop_bound",
         };
         let _ = writeln!(
             out,
@@ -495,6 +500,13 @@ pub fn program_to_rls(program: &RulProgram) -> String {
                 "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} const={val:?}",
                 frame.schedule.fusion_group, frame.proof_idx
             );
+        } else if frame.opcode == Opcode::ConstI64 {
+            let val = frame.decode_const_i64();
+            let _ = writeln!(
+                out,
+                "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} const_i64={val}",
+                frame.schedule.fusion_group, frame.proof_idx
+            );
         } else if frame.opcode == Opcode::Fma {
             let (b, c) = frame.decode_fma_bc();
             let a_ref = format_node_ref(frame.opcode, true, frame.in_a);
@@ -505,12 +517,42 @@ pub fn program_to_rls(program: &RulProgram) -> String {
                 "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={a_ref} b={b_ref} c={c_ref}",
                 frame.schedule.fusion_group, frame.proof_idx
             );
-        } else if matches!(frame.opcode, Opcode::ArenaInput | Opcode::ArenaMutate) {
+        } else if matches!(
+            frame.opcode,
+            Opcode::ArenaInput | Opcode::ArenaMutate | Opcode::LocalSet
+        ) {
             let b_ref = format_node_ref(frame.opcode, false, frame.in_b);
             let _ = writeln!(
                 out,
                 "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={} b={b_ref}",
                 frame.schedule.fusion_group, frame.proof_idx, frame.in_a
+            );
+        } else if matches!(
+            frame.opcode,
+            Opcode::LocalGet | Opcode::Block | Opcode::Loop | Opcode::Br
+        ) {
+            let _ = writeln!(
+                out,
+                "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={} b={}",
+                frame.schedule.fusion_group, frame.proof_idx, frame.in_a, frame.in_b
+            );
+        } else if matches!(frame.opcode, Opcode::If | Opcode::BrIf) {
+            let a_ref = format_node_ref(frame.opcode, true, frame.in_a);
+            let _ = writeln!(
+                out,
+                "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={a_ref} b={}",
+                frame.schedule.fusion_group, frame.proof_idx, frame.in_b
+            );
+        } else if matches!(frame.opcode, Opcode::Else | Opcode::End) {
+            let a_ref = if frame.in_b == 0 {
+                frame.in_a.to_string()
+            } else {
+                format!("$n{}", frame.in_a)
+            };
+            let _ = writeln!(
+                out,
+                "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={a_ref} b={}",
+                frame.schedule.fusion_group, frame.proof_idx, frame.in_b
             );
         } else {
             let a_ref = format_node_ref(frame.opcode, true, frame.in_a);
@@ -558,7 +600,7 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
                     line: line_no,
                     message: "missing capability mask value".to_owned(),
                 })?;
-                capability_mask = parse_u64_auto(raw_val).ok_or_else(|| RlsError::LineParse {
+                capability_mask = parse_cap_mask(raw_val).ok_or_else(|| RlsError::LineParse {
                     line: line_no,
                     message: format!("invalid capability mask: {raw_val}"),
                 })?;
@@ -722,6 +764,8 @@ fn parse_proof_line<'a>(
                     "gather_bounds" | "GatherIndexInBounds" | "2" => {
                         ProofRuleKind::GatherIndexInBounds
                     }
+                    "block_sig" | "BlockSig" | "3" => ProofRuleKind::BlockSig,
+                    "loop_bound" | "LoopBound" | "4" => ProofRuleKind::LoopBound,
                     _ => {
                         return Err(RlsError::LineParse {
                             line: line_no,
@@ -749,10 +793,17 @@ fn parse_proof_line<'a>(
                 })?);
             }
             "witness" => {
-                witness_node = v.parse::<u32>().map_err(|_e| RlsError::LineParse {
-                    line: line_no,
-                    message: format!("invalid witness_node '{v}'"),
-                })?;
+                witness_node = if let Some(num) = parse_u64_auto(v) {
+                    u32::try_from(num).map_err(|_e| RlsError::LineParse {
+                        line: line_no,
+                        message: format!("invalid witness_node '{v}'"),
+                    })?
+                } else if v == "void" {
+                    0
+                } else {
+                    let tl = parse_type_lane(line_no, v)?;
+                    u32::from(tl.to_u8())
+                };
             }
             _ => {
                 return Err(RlsError::LineParse {
@@ -815,6 +866,7 @@ fn parse_node_line<'a>(
     let mut proof_idx: u8 = 0;
     let mut explicit_token: Option<TokenOp> = None;
     let mut const_val: Option<f64> = None;
+    let mut const_i64_val: Option<i64> = None;
     let mut raw_a: Option<&str> = None;
     let mut raw_b: Option<&str> = None;
     let mut raw_c: Option<&str> = None;
@@ -846,9 +898,22 @@ fn parse_node_line<'a>(
                 explicit_token = Some(parse_token_op(line_no, v)?);
             }
             "const" => {
-                const_val = Some(v.parse::<f64>().map_err(|_e| RlsError::LineParse {
+                if opcode == Opcode::ConstI64 {
+                    const_i64_val = Some(parse_i64_auto(v).ok_or_else(|| RlsError::LineParse {
+                        line: line_no,
+                        message: format!("invalid i64 constant '{v}'"),
+                    })?);
+                } else {
+                    const_val = Some(v.parse::<f64>().map_err(|_e| RlsError::LineParse {
+                        line: line_no,
+                        message: format!("invalid f64 constant '{v}'"),
+                    })?);
+                }
+            }
+            "const_i64" => {
+                const_i64_val = Some(parse_i64_auto(v).ok_or_else(|| RlsError::LineParse {
                     line: line_no,
-                    message: format!("invalid f64 constant '{v}'"),
+                    message: format!("invalid i64 constant '{v}'"),
                 })?);
             }
             "a" => {
@@ -886,12 +951,33 @@ fn parse_node_line<'a>(
             f.token_op = tok;
         }
         f
+    } else if opcode == Opcode::ConstI64 {
+        let c = const_i64_val.ok_or_else(|| RlsError::LineParse {
+            line: line_no,
+            message: "ConstI64 requires const_i64=<i64>".to_owned(),
+        })?;
+        let mut f = NodeFrame::const_i64(c, schedule);
+        f.type_lane = type_lane;
+        f.proof_idx = proof_idx;
+        if let Some(tok) = explicit_token {
+            f.token_op = tok;
+        }
+        f
     } else {
         let in_a = if let Some(a_str) = raw_a {
-            if matches!(opcode, Opcode::ArenaInput | Opcode::ArenaMutate) {
+            if matches!(
+                opcode,
+                Opcode::ArenaInput
+                    | Opcode::ArenaMutate
+                    | Opcode::LocalGet
+                    | Opcode::LocalSet
+                    | Opcode::Block
+                    | Opcode::Loop
+                    | Opcode::Br
+            ) {
                 a_str.parse::<u32>().map_err(|_e| RlsError::LineParse {
                     line: line_no,
-                    message: format!("expected numeric arena_id for a=, got '{a_str}'"),
+                    message: format!("expected numeric operand for a=, got '{a_str}'"),
                 })?
             } else {
                 resolve_sym_or_u32(line_no, a_str, symbols)?
@@ -931,7 +1017,26 @@ fn parse_node_line<'a>(
             })?;
             NodeFrame::encode_fma_bc(b16, c16)
         } else if let Some(b_str) = raw_b {
-            resolve_sym_or_u32(line_no, b_str, symbols)?
+            if matches!(
+                opcode,
+                Opcode::LocalGet
+                    | Opcode::Block
+                    | Opcode::Loop
+                    | Opcode::If
+                    | Opcode::Else
+                    | Opcode::End
+                    | Opcode::Br
+                    | Opcode::BrIf
+            ) {
+                b_str.parse::<u32>().map_err(|_e| RlsError::LineParse {
+                    line: line_no,
+                    message: format!("expected numeric operand for b=, got '{b_str}'"),
+                })?
+            } else {
+                resolve_sym_or_u32(line_no, b_str, symbols)?
+            }
+        } else if matches!(opcode, Opcode::Else | Opcode::End) && raw_a.is_some_and(|s| s != "0") {
+            1
         } else {
             0
         };
@@ -1000,6 +1105,46 @@ fn parse_u64_auto(raw: &str) -> Option<u64> {
     }
 }
 
+fn parse_i64_auto(raw: &str) -> Option<i64> {
+    if let Some(neg_hex) = raw.strip_prefix("-0x").or_else(|| raw.strip_prefix("-0X")) {
+        let mag = u64::from_str_radix(neg_hex, 16).ok()?;
+        if mag == (1_u64 << 63) {
+            Some(i64::MIN)
+        } else {
+            i64::try_from(mag).ok()?.checked_neg()
+        }
+    } else if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        let bits = u64::from_str_radix(hex, 16).ok()?;
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "hex literal in const_i64 encodes exact 64-bit two's-complement bit pattern"
+        )]
+        Some(bits as i64)
+    } else {
+        raw.parse::<i64>().ok()
+    }
+}
+
+fn parse_cap_mask(raw: &str) -> Option<u64> {
+    if let Some(num) = parse_u64_auto(raw) {
+        return Some(num);
+    }
+    let mut mask: u64 = 0;
+    for part in raw.split(['|', '+', ',']) {
+        let tok = part.trim();
+        let bit = match tok {
+            "none" | "NONE" | "CAP_NONE" => CAP_NONE,
+            "net_ring" | "NET_RING" | "CAP_NET_RING" => CAP_NET_RING,
+            "storage_dma" | "STORAGE_DMA" | "CAP_STORAGE_DMA" => CAP_STORAGE_DMA,
+            "gpu_dispatch" | "GPU_DISPATCH" | "CAP_GPU_DISPATCH" => CAP_GPU_DISPATCH,
+            "diverge" | "DIVERGE" | "CAP_DIVERGE" => CAP_DIVERGE,
+            other => parse_u64_auto(other)?,
+        };
+        mask |= bit;
+    }
+    Some(mask)
+}
+
 fn format_type_lane(lane: TypeLane) -> &'static str {
     match (lane.elem, lane.width) {
         (ElemType::F64, SimdWidth::Scalar) => "f64x1",
@@ -1056,6 +1201,9 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::ConstF64 => "ConstF64",
         Opcode::ArenaSlice => "ArenaSlice",
         Opcode::ArenaMutate => "ArenaMutate",
+        Opcode::ConstI64 => "ConstI64",
+        Opcode::LocalGet => "LocalGet",
+        Opcode::LocalSet => "LocalSet",
         Opcode::Add => "Add",
         Opcode::Sub => "Sub",
         Opcode::Mul => "Mul",
@@ -1082,6 +1230,13 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::Fma => "Fma",
         Opcode::RingEnqueue => "RingEnqueue",
         Opcode::AssertContract => "AssertContract",
+        Opcode::Block => "Block",
+        Opcode::Loop => "Loop",
+        Opcode::If => "If",
+        Opcode::Else => "Else",
+        Opcode::End => "End",
+        Opcode::Br => "Br",
+        Opcode::BrIf => "BrIf",
     }
 }
 
@@ -1091,6 +1246,9 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "ConstF64" => Opcode::ConstF64,
         "ArenaSlice" => Opcode::ArenaSlice,
         "ArenaMutate" => Opcode::ArenaMutate,
+        "ConstI64" => Opcode::ConstI64,
+        "LocalGet" => Opcode::LocalGet,
+        "LocalSet" => Opcode::LocalSet,
         "Add" => Opcode::Add,
         "Sub" => Opcode::Sub,
         "Mul" => Opcode::Mul,
@@ -1117,6 +1275,13 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "Fma" => Opcode::Fma,
         "RingEnqueue" => Opcode::RingEnqueue,
         "AssertContract" => Opcode::AssertContract,
+        "Block" => Opcode::Block,
+        "Loop" => Opcode::Loop,
+        "If" => Opcode::If,
+        "Else" => Opcode::Else,
+        "End" => Opcode::End,
+        "Br" => Opcode::Br,
+        "BrIf" => Opcode::BrIf,
         _ => {
             return Err(RlsError::LineParse {
                 line: line_no,

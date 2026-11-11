@@ -14,7 +14,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::bytecode::{ElemType, Opcode, RulProgram};
-use crate::verifier::{verify_program, VerifyDiagnostic};
+use crate::verifier::{verify_program, ValueShape, VerifiedSummary, VerifyDiagnostic};
 
 /// Base virtual address for the standalone `x86_64` `ELF64` executable.
 const ELF_BASE_VADDR: u64 = 0x0040_0000;
@@ -131,10 +131,13 @@ pub fn compile_to_elf64_bytes(
     program: &RulProgram,
 ) -> Result<(Vec<u8>, AotCompileReport), AotError> {
     let t_ver = Instant::now();
-    verify_program(program).map_err(AotError::VerificationFailed)?;
+    let summary = verify_program(program).map_err(AotError::VerificationFailed)?;
     let verify_ns = u64::try_from(t_ver.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
     let t_cg = Instant::now();
+    if program.uses_structured_control_or_locals() {
+        return compile_structured_to_elf64_bytes(program, &summary, verify_ns, t_cg);
+    }
     let live = compute_live_nodes(program);
 
     let out_idx = program.output_node as usize;
@@ -492,6 +495,20 @@ pub fn compile_to_elf64_bytes(
                 post_reduce_nodes.push(idx);
                 AotNodePhase::PostReduceScalar
             }
+            Opcode::ConstI64
+            | Opcode::LocalGet
+            | Opcode::LocalSet
+            | Opcode::Block
+            | Opcode::Loop
+            | Opcode::If
+            | Opcode::Else
+            | Opcode::End
+            | Opcode::Br
+            | Opcode::BrIf => {
+                return Err(AotError::UnsupportedGraph(
+                    "structured control-flow opcode reached columnar AOT pipeline",
+                ));
+            }
         };
         if let Some(slot) = phases.get_mut(idx) {
             *slot = phase;
@@ -590,7 +607,17 @@ pub fn compile_to_elf64_bytes(
             | Opcode::ReduceMax
             | Opcode::ReduceMin
             | Opcode::RingEnqueue
-            | Opcode::AssertContract => {}
+            | Opcode::AssertContract
+            | Opcode::ConstI64
+            | Opcode::LocalGet
+            | Opcode::LocalSet
+            | Opcode::Block
+            | Opcode::Loop
+            | Opcode::If
+            | Opcode::Else
+            | Opcode::End
+            | Opcode::Br
+            | Opcode::BrIf => {}
         }
     }
 
@@ -748,6 +775,697 @@ pub fn run_compiled_executable(
         ))
     })?;
     Ok(f64::from_le_bytes(bytes))
+}
+
+/// Executes a compiled standalone scalar Rul `ELF64` binary (requiring no arena data file)
+/// and reads back its 8-byte scalar output bit-pattern as `f64`.
+///
+/// # Errors
+/// Returns [`AotError`] if the process exits with a contract/loop-bound violation (`70`) or I/O fails.
+pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64, AotError> {
+    let exe_ref = exe_path.as_ref();
+    let mut attempt = 0u32;
+    let output = loop {
+        match Command::new(exe_ref).output() {
+            Ok(out) => break out,
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 32 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_micros(250));
+            }
+            Err(e) => return Err(AotError::Io(e)),
+        }
+    };
+
+    if !output.status.success() {
+        match output.status.code() {
+            Some(AOT_EXIT_CONTRACT_FAILED) => return Err(AotError::ContractAssertionFailed),
+            Some(AOT_EXIT_GATHER_OOB) => return Err(AotError::GatherOutOfBounds),
+            other => {
+                return Err(AotError::ExecutionFailed(format!(
+                    "standalone binary exited with status {other:?}"
+                )))
+            }
+        }
+    }
+
+    let bytes: [u8; 8] = output.stdout.as_slice().try_into().map_err(|_e| {
+        AotError::ExecutionFailed(format!(
+            "expected 8-byte scalar output on stdout, got {} bytes",
+            output.stdout.len()
+        ))
+    })?;
+    Ok(f64::from_le_bytes(bytes))
+}
+
+const SC_STDOUT_DISP: i32 = -520;
+
+fn sc_local_disp(slot: u32) -> i32 {
+    let slot_i32 = i32::try_from(slot).unwrap_or(0);
+    (-8i32).saturating_mul(slot_i32.saturating_add(1))
+}
+
+fn sc_node_disp(node_idx: usize) -> i32 {
+    let idx_i32 = i32::try_from(node_idx).unwrap_or(0);
+    (-528i32).saturating_sub(idx_i32.saturating_mul(8))
+}
+
+#[derive(Debug)]
+enum AotCtrlKind {
+    Block,
+    Loop {
+        body_start_offset: usize,
+        loop_node_idx: usize,
+        bounded: bool,
+    },
+    If {
+        if_node_idx: usize,
+        false_jump_patch: usize,
+        has_else: bool,
+    },
+}
+
+#[derive(Debug)]
+struct AotCtrlFrame {
+    kind: AotCtrlKind,
+    end_patches: Vec<usize>,
+}
+
+fn compile_structured_to_elf64_bytes(
+    program: &RulProgram,
+    summary: &VerifiedSummary,
+    verify_ns: u64,
+    t_cg: Instant,
+) -> Result<(Vec<u8>, AotCompileReport), AotError> {
+    if !program.arenas.is_empty() {
+        return Err(AotError::UnsupportedGraph(
+            "structured control-flow AOT requires scalar-only programs without columnar arenas",
+        ));
+    }
+    if program.nodes.len() > 65_536 {
+        return Err(AotError::UnsupportedGraph(
+            "structured control-flow AOT exceeds 65,536-node stack frame limit",
+        ));
+    }
+    if program.nodes.get(program.output_node as usize).is_none() {
+        return Err(AotError::UnsupportedGraph("invalid output node index"));
+    }
+    if summary.output_shape != ValueShape::Scalar {
+        return Err(AotError::UnsupportedGraph(
+            "structured control-flow AOT requires scalar output_node",
+        ));
+    }
+
+    let code = emit_x86_64_scalar_control_flow(program)?;
+    let machine_code_bytes = code.len();
+    let total_elf_size = ELF_CODE_OFFSET + machine_code_bytes;
+    let mut elf = Vec::with_capacity(total_elf_size);
+    write_elf64_headers(&mut elf, total_elf_size as u64);
+    elf.extend_from_slice(&code);
+
+    let codegen_ns = u64::try_from(t_cg.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let report = AotCompileReport {
+        elf_bytes: elf.len(),
+        machine_code_bytes,
+        avx2_vectorized: false,
+        verify_ns,
+        codegen_ns,
+        total_compile_ns: verify_ns.saturating_add(codegen_ns),
+    };
+    Ok((elf, report))
+}
+
+fn emit_mov_rax_rbp(code: &mut Vec<u8>, disp: i32) {
+    // mov rax, qword ptr [rbp + disp32]
+    code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_mov_rbp_rax(code: &mut Vec<u8>, disp: i32) {
+    // mov qword ptr [rbp + disp32], rax
+    code.extend_from_slice(&[0x48, 0x89, 0x85]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_loop_backedge_jump(
+    code: &mut Vec<u8>,
+    body_start_offset: usize,
+    loop_node_idx: usize,
+    bounded: bool,
+) -> Result<(), AotError> {
+    if bounded {
+        let fuel_disp = sc_node_disp(loop_node_idx);
+        emit_mov_rax_rbp(code, fuel_disp);
+        // test rax, rax
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+        // jnz +12 (skip 12-byte SYS_exit(70))
+        code.extend_from_slice(&[0x75, 0x0C]);
+        emit_sys_exit(code, AOT_EXIT_CONTRACT_FAILED as u32);
+        // dec rax
+        code.extend_from_slice(&[0x48, 0xFF, 0xC8]);
+        emit_mov_rbp_rax(code, fuel_disp);
+    }
+    // jmp rel32 -> body_start_offset
+    code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+    let patch_pos = code.len() - 4;
+    patch_rel32(code, patch_pos, body_start_offset)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass O(N) structured x86_64 scalar control-flow emitter"
+)]
+fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotError> {
+    let node_count = program.nodes.len();
+    let mut code: Vec<u8> = Vec::with_capacity(256 + node_count * 24);
+
+    // 1. Entry prologue: align stack to 32B, establish `rbp`, allocate 64 local slots + SSA slots.
+    // and rsp, -32
+    code.extend_from_slice(&[0x48, 0x83, 0xE4, 0xE0]);
+    // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
+
+    let raw_frame = 528usize.saturating_add(node_count.saturating_mul(8));
+    let frame_bytes = u32::try_from(raw_frame.div_ceil(32) * 32)
+        .map_err(|_e| AotError::UnsupportedGraph("stack frame overflow"))?;
+    // sub rsp, frame_bytes
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_bytes.to_le_bytes());
+
+    let mut node_elem: Vec<ElemType> = vec![ElemType::I64; node_count];
+    let mut local_elem: [ElemType; 64] = [ElemType::I64; 64];
+    let mut ctrl_stack: Vec<AotCtrlFrame> = Vec::new();
+
+    for (idx, frame) in program.nodes.iter().enumerate() {
+        let disp = sc_node_disp(idx);
+        let a_idx = frame.in_a as usize;
+        let b_idx = frame.in_b as usize;
+        let disp_a = sc_node_disp(a_idx);
+        let disp_b = sc_node_disp(b_idx);
+
+        match frame.opcode {
+            Opcode::ConstF64 => {
+                let bits = frame.decode_const_f64().to_bits();
+                // movabs rax, bits
+                code.extend_from_slice(&[0x48, 0xB8]);
+                code.extend_from_slice(&bits.to_le_bytes());
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::ConstI64 => {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "two's-complement i64 immediate encoded as exact 64-bit movabs pattern"
+                )]
+                let bits = frame.decode_const_i64() as u64;
+                // movabs rax, bits
+                code.extend_from_slice(&[0x48, 0xB8]);
+                code.extend_from_slice(&bits.to_le_bytes());
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::I64;
+                }
+            }
+            Opcode::LocalGet => {
+                let slot = frame.in_a;
+                emit_mov_rax_rbp(&mut code, sc_local_disp(slot));
+                emit_mov_rbp_rax(&mut code, disp);
+                let el_val = local_elem
+                    .get(slot as usize)
+                    .copied()
+                    .unwrap_or(frame.type_lane.elem);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = el_val;
+                }
+            }
+            Opcode::LocalSet => {
+                let slot = frame.in_a;
+                emit_mov_rax_rbp(&mut code, disp_b);
+                emit_mov_rbp_rax(&mut code, sc_local_disp(slot));
+                emit_mov_rbp_rax(&mut code, disp);
+                let el_val = node_elem
+                    .get(b_idx)
+                    .copied()
+                    .unwrap_or(frame.type_lane.elem);
+                if let Some(le) = local_elem.get_mut(slot as usize) {
+                    *le = el_val;
+                }
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = el_val;
+                }
+            }
+            Opcode::Add | Opcode::Sub | Opcode::Mul => {
+                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
+                if elem_a == ElemType::I64 {
+                    emit_mov_rax_rbp(&mut code, disp_a);
+                    match frame.opcode {
+                        Opcode::Add => {
+                            // add rax, [rbp + disp_b]
+                            code.extend_from_slice(&[0x48, 0x03, 0x85]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                        }
+                        Opcode::Sub => {
+                            // sub rax, [rbp + disp_b]
+                            code.extend_from_slice(&[0x48, 0x2B, 0x85]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                        }
+                        _ => {
+                            // imul rax, [rbp + disp_b]
+                            code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0x85]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                        }
+                    }
+                    emit_mov_rbp_rax(&mut code, disp);
+                    if let Some(el) = node_elem.get_mut(idx) {
+                        *el = ElemType::I64;
+                    }
+                } else {
+                    emit_load_xmm0_rbp(&mut code, disp_a);
+                    let op_byte = match frame.opcode {
+                        Opcode::Add => 0x58,
+                        Opcode::Sub => 0x5C,
+                        _ => 0x59,
+                    };
+                    code.extend_from_slice(&[0xF2, 0x0F, op_byte, 0x85]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    emit_store_xmm0_rbp(&mut code, disp);
+                    if let Some(el) = node_elem.get_mut(idx) {
+                        *el = ElemType::F64;
+                    }
+                }
+            }
+            Opcode::Div | Opcode::Min | Opcode::Max => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                let op_byte = match frame.opcode {
+                    Opcode::Div => 0x5E,
+                    Opcode::Min => 0x5D,
+                    _ => 0x5F,
+                };
+                code.extend_from_slice(&[0xF2, 0x0F, op_byte, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                let disp_b_fma = sc_node_disp(in_b as usize);
+                let disp_c_fma = sc_node_disp(in_c as usize);
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                // movsd xmm1, [rbp + disp_b_fma]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                code.extend_from_slice(&disp_b_fma.to_le_bytes());
+                emit_vex_fma213_xmm_rm_rbp(&mut code, 0, 1, disp_c_fma);
+                emit_store_xmm0_rbp(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::Abs => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                // btr rax, 63
+                code.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]);
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::Sqrt => {
+                // sqrtsd xmm0, [rbp + disp_a]
+                code.extend_from_slice(&[0xF2, 0x0F, 0x51, 0x85]);
+                code.extend_from_slice(&disp_a.to_le_bytes());
+                emit_store_xmm0_rbp(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::Floor => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x09]);
+                emit_store_xmm0_rbp(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::Ceil => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0A]);
+                emit_store_xmm0_rbp(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::Ln => {
+                emit_x87_ln_slot(&mut code, disp_a, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::Exp => {
+                emit_x87_exp_slot(&mut code, disp_a, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::F64;
+                }
+            }
+            Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
+                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
+                if elem_a == ElemType::I64 {
+                    emit_mov_rax_rbp(&mut code, disp_a);
+                    // cmp rax, [rbp + disp_b]
+                    code.extend_from_slice(&[0x48, 0x3B, 0x85]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    let setcc = match frame.opcode {
+                        Opcode::CmpGt => 0x9F, // setg al
+                        Opcode::CmpLt => 0x9C, // setl al
+                        _ => 0x94,             // sete al
+                    };
+                    code.extend_from_slice(&[0x0F, setcc, 0xC0]);
+                    // movzx eax, al
+                    code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
+                    emit_mov_rbp_rax(&mut code, disp);
+                } else {
+                    match frame.opcode {
+                        Opcode::CmpGt => {
+                            // b < a (ordered): xmm0 = b, xmm1 = a, cmpltsd xmm0, xmm1
+                            emit_load_xmm0_rbp(&mut code, disp_b);
+                            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                            code.extend_from_slice(&disp_a.to_le_bytes());
+                            code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
+                        }
+                        Opcode::CmpLt => {
+                            // a < b (ordered): xmm0 = a, xmm1 = b, cmpltsd xmm0, xmm1
+                            emit_load_xmm0_rbp(&mut code, disp_a);
+                            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                            code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
+                        }
+                        _ => {
+                            // a == b (ordered): xmm0 = a, xmm1 = b, cmpeqsd xmm0, xmm1
+                            emit_load_xmm0_rbp(&mut code, disp_a);
+                            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                            code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x00]);
+                        }
+                    }
+                    // movq rax, xmm0
+                    code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]);
+                    // and eax, 1
+                    code.extend_from_slice(&[0x83, 0xE0, 0x01]);
+                    emit_mov_rbp_rax(&mut code, disp);
+                }
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::BoolMask;
+                }
+            }
+            Opcode::MaskAnd | Opcode::MaskOr => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                let op_byte = if frame.opcode == Opcode::MaskAnd {
+                    0x23
+                } else {
+                    0x0B
+                };
+                code.extend_from_slice(&[0x48, op_byte, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::BoolMask;
+                }
+            }
+            Opcode::SelectZero => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                // neg rax (0 -> 0, 1 -> 0xFFFF_FFFF_FFFF_FFFF)
+                code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+                // and rax, [rbp + disp_b]
+                code.extend_from_slice(&[0x48, 0x23, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_mov_rbp_rax(&mut code, disp);
+                let el_b = node_elem.get(b_idx).copied().unwrap_or(ElemType::F64);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = el_b;
+                }
+            }
+            Opcode::RingEnqueue => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                emit_mov_rbp_rax(&mut code, disp);
+                let el_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = el_a;
+                }
+            }
+            Opcode::AssertContract => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                emit_mov_rbp_rax(&mut code, disp);
+                let el_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
+                if el_a == ElemType::F64 {
+                    // movabs rdx, 0x7FF0_0000_0000_0000
+                    code.extend_from_slice(&[0x48, 0xBA]);
+                    code.extend_from_slice(&0x7FF0_0000_0000_0000_u64.to_le_bytes());
+                    // and rax, rdx
+                    code.extend_from_slice(&[0x48, 0x21, 0xD0]);
+                    // cmp rax, rdx
+                    code.extend_from_slice(&[0x48, 0x39, 0xD0]);
+                    // jne +12 (skip 12-byte SYS_exit(70))
+                    code.extend_from_slice(&[0x75, 0x0C]);
+                    emit_sys_exit(&mut code, AOT_EXIT_CONTRACT_FAILED as u32);
+                }
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = el_a;
+                }
+            }
+            Opcode::Block => {
+                ctrl_stack.push(AotCtrlFrame {
+                    kind: AotCtrlKind::Block,
+                    end_patches: Vec::new(),
+                });
+            }
+            Opcode::Loop => {
+                let bounded = if frame.proof_idx > 0 {
+                    let proof = program
+                        .proofs
+                        .get(usize::from(frame.proof_idx - 1))
+                        .ok_or(AotError::UnsupportedGraph("missing LoopBound proof"))?;
+                    // mov eax, bound_hi (zero-extends into rax)
+                    code.push(0xB8);
+                    code.extend_from_slice(&proof.bound_hi.to_le_bytes());
+                    emit_mov_rbp_rax(&mut code, disp);
+                    true
+                } else {
+                    false
+                };
+                let body_start_offset = code.len();
+                ctrl_stack.push(AotCtrlFrame {
+                    kind: AotCtrlKind::Loop {
+                        body_start_offset,
+                        loop_node_idx: idx,
+                        bounded,
+                    },
+                    end_patches: Vec::new(),
+                });
+            }
+            Opcode::If => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                // test rax, rax
+                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                // jz rel32 (patched to Else body or End)
+                code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                let false_jump_patch = code.len() - 4;
+                ctrl_stack.push(AotCtrlFrame {
+                    kind: AotCtrlKind::If {
+                        if_node_idx: idx,
+                        false_jump_patch,
+                        has_else: false,
+                    },
+                    end_patches: Vec::new(),
+                });
+            }
+            Opcode::Else => {
+                let top = ctrl_stack
+                    .last_mut()
+                    .ok_or(AotError::UnsupportedGraph("Else without open If"))?;
+                let AotCtrlKind::If {
+                    if_node_idx,
+                    false_jump_patch,
+                    ref mut has_else,
+                } = top.kind
+                else {
+                    return Err(AotError::UnsupportedGraph("Else without matching If"));
+                };
+                if frame.in_b != 0 {
+                    emit_mov_rax_rbp(&mut code, disp_a);
+                    emit_mov_rbp_rax(&mut code, sc_node_disp(if_node_idx));
+                }
+                // jmp rel32 (from end of then-branch to End)
+                code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                top.end_patches.push(code.len() - 4);
+
+                let else_body_pos = code.len();
+                patch_rel32(&mut code, false_jump_patch, else_body_pos)?;
+                *has_else = true;
+            }
+            Opcode::End => {
+                let popped = ctrl_stack
+                    .pop()
+                    .ok_or(AotError::UnsupportedGraph("End without open block"))?;
+                match popped.kind {
+                    AotCtrlKind::Block | AotCtrlKind::Loop { .. } => {
+                        if frame.in_b != 0 {
+                            emit_mov_rax_rbp(&mut code, disp_a);
+                            emit_mov_rbp_rax(&mut code, disp);
+                            let el_res = node_elem
+                                .get(a_idx)
+                                .copied()
+                                .unwrap_or(frame.type_lane.elem);
+                            if let Some(el) = node_elem.get_mut(idx) {
+                                *el = el_res;
+                            }
+                        }
+                        let end_pos = code.len();
+                        for p in popped.end_patches {
+                            patch_rel32(&mut code, p, end_pos)?;
+                        }
+                    }
+                    AotCtrlKind::If {
+                        if_node_idx,
+                        false_jump_patch,
+                        has_else,
+                    } => {
+                        if has_else {
+                            if frame.in_b != 0 {
+                                emit_mov_rax_rbp(&mut code, disp_a);
+                                emit_mov_rbp_rax(&mut code, sc_node_disp(if_node_idx));
+                            }
+                            let join_pos = code.len();
+                            for p in popped.end_patches {
+                                patch_rel32(&mut code, p, join_pos)?;
+                            }
+                            if frame.in_b != 0 {
+                                emit_mov_rax_rbp(&mut code, sc_node_disp(if_node_idx));
+                                emit_mov_rbp_rax(&mut code, disp);
+                                let el_res = node_elem
+                                    .get(a_idx)
+                                    .copied()
+                                    .unwrap_or(frame.type_lane.elem);
+                                if let Some(el) = node_elem.get_mut(idx) {
+                                    *el = el_res;
+                                }
+                            }
+                        } else {
+                            let end_pos = code.len();
+                            patch_rel32(&mut code, false_jump_patch, end_pos)?;
+                            for p in popped.end_patches {
+                                patch_rel32(&mut code, p, end_pos)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Opcode::Br => {
+                let depth = frame.in_a as usize;
+                let pos = ctrl_stack
+                    .len()
+                    .checked_sub(1 + depth)
+                    .ok_or(AotError::UnsupportedGraph("Br depth overflow"))?;
+                let target = ctrl_stack
+                    .get_mut(pos)
+                    .ok_or(AotError::UnsupportedGraph("Br target missing"))?;
+                match target.kind {
+                    AotCtrlKind::Loop {
+                        body_start_offset,
+                        loop_node_idx,
+                        bounded,
+                    } => {
+                        emit_loop_backedge_jump(
+                            &mut code,
+                            body_start_offset,
+                            loop_node_idx,
+                            bounded,
+                        )?;
+                    }
+                    AotCtrlKind::Block | AotCtrlKind::If { .. } => {
+                        code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                        target.end_patches.push(code.len() - 4);
+                    }
+                }
+            }
+            Opcode::BrIf => {
+                let depth = frame.in_b as usize;
+                let pos = ctrl_stack
+                    .len()
+                    .checked_sub(1 + depth)
+                    .ok_or(AotError::UnsupportedGraph("BrIf depth overflow"))?;
+                emit_mov_rax_rbp(&mut code, disp_a);
+                // test rax, rax
+                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                let target = ctrl_stack
+                    .get_mut(pos)
+                    .ok_or(AotError::UnsupportedGraph("BrIf target missing"))?;
+                match target.kind {
+                    AotCtrlKind::Loop {
+                        body_start_offset,
+                        loop_node_idx,
+                        bounded,
+                    } => {
+                        if bounded {
+                            // jz skip_backedge (0F 84 <rel32>)
+                            code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                            let skip_patch = code.len() - 4;
+                            emit_loop_backedge_jump(
+                                &mut code,
+                                body_start_offset,
+                                loop_node_idx,
+                                true,
+                            )?;
+                            let after_pos = code.len();
+                            patch_rel32(&mut code, skip_patch, after_pos)?;
+                        } else {
+                            // jnz rel32 -> body_start_offset
+                            code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                            let patch_pos = code.len() - 4;
+                            patch_rel32(&mut code, patch_pos, body_start_offset)?;
+                        }
+                    }
+                    AotCtrlKind::Block | AotCtrlKind::If { .. } => {
+                        // jnz rel32 -> End
+                        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                        target.end_patches.push(code.len() - 4);
+                    }
+                }
+            }
+            Opcode::ArenaInput
+            | Opcode::ArenaSlice
+            | Opcode::ArenaMutate
+            | Opcode::FilterCompact
+            | Opcode::ReduceSum
+            | Opcode::ReduceMax
+            | Opcode::ReduceMin
+            | Opcode::Gather => {
+                return Err(AotError::UnsupportedGraph(
+                    "columnar opcode in scalar structured control-flow AOT",
+                ));
+            }
+        }
+    }
+
+    // Epilogue: write 8-byte output_node bit-pattern to stdout (`fd = 1`) and `SYS_exit(0)`.
+    emit_mov_rax_rbp(&mut code, sc_node_disp(program.output_node as usize));
+    emit_mov_rbp_rax(&mut code, SC_STDOUT_DISP);
+
+    // mov eax, 1 (SYS_write)
+    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+    // mov edi, 1 (STDOUT_FILENO)
+    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
+    // lea rsi, [rbp + SC_STDOUT_DISP]
+    code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+    code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
+    // mov edx, 8
+    code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    emit_sys_exit(&mut code, 0);
+    Ok(code)
 }
 
 // =========================================================================
@@ -1075,7 +1793,17 @@ fn emit_x86_64_machine_code(
                 | Opcode::ReduceMax
                 | Opcode::ReduceMin
                 | Opcode::RingEnqueue
-                | Opcode::AssertContract => {}
+                | Opcode::AssertContract
+                | Opcode::ConstI64
+                | Opcode::LocalGet
+                | Opcode::LocalSet
+                | Opcode::Block
+                | Opcode::Loop
+                | Opcode::If
+                | Opcode::Else
+                | Opcode::End
+                | Opcode::Br
+                | Opcode::BrIf => {}
             }
         }
         for spec in reductions {
@@ -1396,7 +2124,17 @@ fn emit_x86_64_machine_code(
                 | Opcode::ReduceMax
                 | Opcode::ReduceMin
                 | Opcode::RingEnqueue
-                | Opcode::AssertContract => {}
+                | Opcode::AssertContract
+                | Opcode::ConstI64
+                | Opcode::LocalGet
+                | Opcode::LocalSet
+                | Opcode::Block
+                | Opcode::Loop
+                | Opcode::If
+                | Opcode::Else
+                | Opcode::End
+                | Opcode::Br
+                | Opcode::BrIf => {}
             }
         }
 
@@ -1748,7 +2486,17 @@ fn emit_x86_64_machine_code(
             | Opcode::ReduceMax
             | Opcode::ReduceMin
             | Opcode::RingEnqueue
-            | Opcode::AssertContract => {}
+            | Opcode::AssertContract
+            | Opcode::ConstI64
+            | Opcode::LocalGet
+            | Opcode::LocalSet
+            | Opcode::Block
+            | Opcode::Loop
+            | Opcode::If
+            | Opcode::Else
+            | Opcode::End
+            | Opcode::Br
+            | Opcode::BrIf => {}
         }
     }
 
@@ -2613,7 +3361,13 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             continue;
         };
         match frame.opcode {
-            Opcode::ArenaInput | Opcode::ConstF64 => {}
+            Opcode::ArenaInput
+            | Opcode::ConstF64
+            | Opcode::ConstI64
+            | Opcode::LocalGet
+            | Opcode::Block
+            | Opcode::Loop
+            | Opcode::Br => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt
@@ -2625,14 +3379,23 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::ReduceMax
             | Opcode::ReduceMin
             | Opcode::RingEnqueue
-            | Opcode::AssertContract => {
+            | Opcode::AssertContract
+            | Opcode::If
+            | Opcode::BrIf => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
                     *a = true;
                 }
             }
-            Opcode::ArenaMutate => {
+            Opcode::ArenaMutate | Opcode::LocalSet => {
                 if let Some(b) = live.get_mut(frame.in_b as usize) {
                     *b = true;
+                }
+            }
+            Opcode::Else | Opcode::End => {
+                if frame.in_b != 0 {
+                    if let Some(a) = live.get_mut(frame.in_a as usize) {
+                        *a = true;
+                    }
                 }
             }
             Opcode::Add
