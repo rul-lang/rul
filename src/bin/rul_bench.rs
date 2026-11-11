@@ -1,4 +1,4 @@
-//! Rul (`.rl`) CLI Inspector & First-Principles Production Benchmark Suite.
+//! Rul (`.rl`) CLI Inspector & Production Benchmark Suite.
 //!
 //! Compares Rul (`.rl`) across:
 //! - `[A]` Legacy Imperative AoS + `Vec::collect()`

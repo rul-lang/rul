@@ -221,10 +221,10 @@ cargo test
 
 ## Documentation
 
-- **[`ROADMAP.md`](./ROADMAP.md)**: Four-Milestone Roadmap from `v0.4` Columnar Engine to `v1.0` General-Purpose Systems Language.
+- **[`ROADMAP.md`](./ROADMAP.md)**: Technical Roadmap from `v0.4` Columnar Engine to `v1.0` General-Purpose Systems Language.
 - **[`docs/rul_spec_v0.md`](./docs/rul_spec_v0.md)**: Official `.rl` v0.4 Binary Layout, 128-Bit Instruction Frame & `O(N)` Verifier Specification.
 - **[`docs/about_rul.md`](./docs/about_rul.md)**: Plain-English Overview of How Rul Works.
-- **[`docs/new_language_for_AI.md`](./docs/new_language_for_AI.md)**: First-Principles Design Notes & Architectural Breakdown.
+- **[`docs/new_language_for_AI.md`](./docs/new_language_for_AI.md)**: Design Notes & Architectural Breakdown.
 - **[`docs/WHITEPAPER_RUL_V0_1.md`](./docs/WHITEPAPER_RUL_V0_1.md)**: Technical Whitepaper & Empirical Evaluation (Zenodo Archive).
 - **[`docs/prior_art/`](./docs/prior_art/)**: Cryptographic SHA-256 Prior Art Manifest & OpenTimestamps Proofs.
 

@@ -1,64 +1,76 @@
 # Rul (.rl) Technical Roadmap
 
-This document outlines the engineering roadmap for **Rul (`.rl`)**, tracking what has already shipped (`v0.1.0` through `v0.4.0`) and the four milestones taking Rul from a verified compute engine to a general-purpose systems programming language (`v1.0`).
+This document defines the engineering roadmap for **Rul (`.rl`)**, tracking what has already shipped (`v0.1.0` through `v0.4.0`) and the six program-driven milestones (`v0.5` through `v1.0`) taking Rul from a verified columnar compute engine to a Turing-complete systems programming language designed to replace Rust and Go for AI-generated services and CLIs.
 
 ---
 
-## Why We Started with Data Pipelines (`v0.1` to `v0.4`)
+## 1. Foundation Shipped (`v0.1` to `v0.4` — Columnar & Vector Compute Core)
 
-Traditional languages like C, Go, and Rust were designed for humans typing text at a keyboard. Because humans cannot manually write memory-lifetime proofs and CPU scheduling hints on every instruction, compilers like `rustc` and `LLVM` spend seconds or minutes parsing text, solving borrow-checker constraints, and searching for optimizations.
+Traditional languages like C, Go, and Rust were designed around human text files (`fn main() { ... }`), requiring multi-second lexing, parsing, constraint-solving borrow checks, and 100+ heuristic LLVM passes.
 
-Rul is built for AI agents. Instead of text files, an AI emits a flat list of 16-byte binary instructions (`.rl`). Each 16-byte instruction carries three things up front:
-1. **The operation** (what to compute).
-2. **The hardware schedule hint** (single-core SIMD or multi-core).
-3. **The safety witness** (memory version tag and bounds index).
-
-To prove that this 16-byte binary format works on real hardware before adding general-purpose language features, we restricted Phases `v0.1` through `v0.4` to array and vector processing pipelines:
-- **`v0.1.0` (Initial Binary Core)**: 64-byte header, 16-byte `NodeFrame` format, single-pass `O(N)` verifier, 3-tier execution engine, and direct Linux `x86_64` `ELF64` compiler.
+Rul replaces text source files with a flat array of 16-byte binary instruction frames (`.rl`), where each instruction carries its **operation**, **hardware schedule hint**, and **safety witness** up front:
+- **`v0.1.0` (Initial Binary Core)**: 64-byte `RulHeader`, 16-byte `NodeFrame`, single-pass `O(N)` verifier, 3-tier execution engine, and direct Linux `x86_64` `ELF64` native compiler.
 - **`v0.2.0` (Standalone Toolchain & MCP)**: Standalone `rul` CLI (`new`, `check`, `build`, `run`, `autotune`, `inspect`, `decompile`), lossless `.rls` symbolic assembler, `rul-mcp` server, content-addressed intrinsics (`rul-cas`), and C-compatible embedding pods (`rul-ffi`).
-- **`v0.3.0` (White-Box Tracer & Verifier Hardening)**: Expanded to 20 opcodes, added `rul trace` for node-by-node inspection (`min`, `max`, `sum`, `NaN/Inf` counts), and added IEEE-754 edge-case verification.
-- **`v0.4.0` (29-Opcode ISA, Multi-Reduce & Linear-Scan `YMM` Allocator)**: Added transcendental/math opcodes (`Abs`, `Sqrt`, `Floor`, `Ceil`, `Ln`, `Exp`, `MaskAnd`, `MaskOr`, `ReduceMin`), multi-reduction and post-reduction scalar DAG support, nested slice bounds verification, and a linear-scan `YMM` register allocator in the native `ELF64` compiler (`~5.8 ns/node` verification, `~6.4 us` native compilation, `51.53 GB/s` effective throughput).
+- **`v0.3.0` (White-Box Tracer & Verifier Hardening)**: Expanded ISA, node-by-node white-box execution tracer (`rul trace`), and IEEE-754 edge-case verification.
+- **`v0.4.0` + `P0/P1/P1b` (30-Opcode ISA, `YMM` Register Allocator & AVX2 Vector Math)**: Linear-scan `ymm2..ymm13` register allocator + `ymm14/ymm15` reduction accumulators, explicit single-rounded `Opcode::Fma (0x27)`, 256-bit AVX2 vectorized `Ln`/`Exp`, multi-reduction scalar DAGs, and hardened slice/gather bounds (`~5.8 ns/node` verification, `~6.4–10.1 us` native compilation, `51.53 GB/s` effective columnar throughput, `3.33x` faster than hand-written C/Rust 8-accumulator Horner-50).
 
 ---
 
-## Six-Month Roadmap to `v1.0` (General-Purpose Systems Language)
+## 2. Architectural Principles for `v0.5`–`v1.0` (Turing-Complete Systems Language)
 
-Over the next four milestones, we are expanding Rul from a columnar compute engine into a general-purpose, proof-carrying systems language capable of replacing Rust and Go for AI-generated software while keeping single-pass `O(N)` verification.
+To break the traditional compiler triangle (**Memory Safe · C-Level Execution Speed · Microsecond Compilation**) while achieving full Turing-completeness without bloating the core compiler:
 
-### Milestone 1 (`v0.5` — Months 1-2): Control Flow, Functions, and Data Types
-
-Expand the 16-byte `NodeFrame` instruction set beyond numeric arrays to support general-purpose data structures, structured control flow, and modular functions:
-- **General Scalar and Composite Types**: First-class `i64`, `i32`, `u8`, `f32`, fixed-layout structs, algebraic enums (tagged unions), validated UTF-8 strings, and arena-backed hash maps.
-- **Structured Control Flow (`SelectBranch` and `RegionLoop`)**:
-  - `SelectBranch` evaluates conditional branches while requiring both branches to end at the same memory version state, allowing the verifier to check branch merges in `O(1)`.
-  - `RegionLoop` supports general iteration while requiring an explicit termination witness in the `ProofEntry` table (either a strictly decreasing integer variant or an explicit step/fuel bound). This provides practical Turing-completeness for systems software while preserving guaranteed termination and single-pass `O(N)` verification.
-- **Modular Function Table (`Call`)**: Function headers declare explicit input and output memory version signatures so each function is verified independently in a single linear scan without whole-program inlining.
-
-### Milestone 2 (`v0.6` to `v0.7` — Months 2-3): Rust-Grade Ownership and Lifetimes in `O(N)` Time
-
-Generalize Rul's 32-bit memory version token (`TokenOp`) and 16-byte `ProofEntry` sidecar table from flat arrays to general systems memory:
-- **Region-Based Heap Allocations**: Deterministic allocation and deallocation tied to linear ownership tokens, with zero garbage collection and zero per-object `malloc`/`free` fragmentation.
-- **Struct Field Borrows and Slice Lifetimes**: Sidecar `ProofEntry` witnesses for struct field offsets, disjoint field mutations, and zero-copy sub-slice lifetimes checked in `O(1)` per instruction.
-- **Result**: Rust-level protection against use-after-free, double-free, and data aliasing without the multi-second constraint solver overhead of `rustc`.
-
-### Milestone 3 (`v0.8` to `v0.9` — Months 4-5): Go-Style Concurrency and Capability-Gated Systems I/O
-
-Introduce lightweight concurrency and operating system I/O governed by compile-time ownership and header capability bits:
-- **Deterministic Structured Concurrency**: Lightweight tasks and typed channels. Sending a buffer over a channel consumes the sender's memory version token (`AffineConsume`) and transfers ownership to the receiver, preventing data races at load time without a garbage collector.
-- **Fine-Grained `CapabilityMask` for OS Syscalls**: Extend the 64-bit header `CapabilityMask` to gate filesystem reads/writes, network sockets, timers, and subprocess execution. An AI agent running a `.rl` binary with `CAP_NONE (0x0)` is mathematically blocked from making network or disk calls before execution begins.
-
-### Milestone 4 (`v1.0` — Month 6): Multi-Architecture Native Backends and Formal Soundness Proofs
-
-Harden the compiler and specification for production `v1.0` stability across major hardware targets:
-- **Multi-Target Zero-LLVM Native Compilation**: Extend `src/aot.rs` beyond Linux `x86_64` to emit standalone executables for `x86_64` and `AArch64` (`ARM64`) across Linux, macOS, and Windows, plus deterministic WebAssembly (`WASI`) modules.
-- **Formal Soundness Verification and Continuous Fuzzing**: Bounded model-checking proofs (Kani) and continuous differential fuzzing (`cargo-fuzz` / property testing) across the binary decoder, `O(N)` verifier, interpreter, and native code generator.
-- **`v1.0` Binary Format Stability Guarantee**: Freeze the `.rl` `v1.0` binary specification and publish a 50-program conformance test suite.
+1. **Termination as a Capability Policy (`CAP_DIVERGE = 0x08`), Not a Hardwired Cage**:
+   - **Without `CAP_DIVERGE` (`0x00` Sandbox Mode)**: Every loop must carry a verified `LoopBound` witness and recursive function calls are rejected at load time. AI plugins, UDFs, and sandboxed filters are mathematically guaranteed to halt.
+   - **With `CAP_DIVERGE` (`0x08` Systems/Daemon Mode)**: Unbounded structured loops and general recursion are permitted (with deterministic fail-closed call-depth guards), enabling Turing-complete interpreters, parsers, and long-lived network servers.
+2. **WASM-Style Structured Control Flow + Typed Locals + Witness Signatures in `O(N)`**:
+   - Instead of inventing ad-hoc graph-sealing rules for branches, loops, and functions separately, Rul uses a single push/pop control stack (`Block`, `Loop`, `If`, `Else`, `End`, `Br`, `BrIf`, `Func`, `Return`) paired with definitely-initialized typed scalar locals (`LocalGet`/`LocalSet`) and sidecar witness signatures (`BlockSig` / `FuncSig`) carrying return types and `AffineToken` ownership states. Validation remains a single forward `O(N)` pass with unlimited nesting depth.
+3. **Runtime Bounds Checks by Default, Static Proofs to Elide Checks**:
+   - Dynamic indexed memory accesses (`RegionLoad` / `RegionStore`) emit a fast unsigned bounds check (`cmp + jae`, ~1–3% overhead, identical to Rust) by default when `proof_idx == 0`, and elide the runtime check whenever a `ProofEntry` witness certifies the index bound.
+4. **Dual-Track Execution Equivalence (`Tier 0 == AOT` for General Code, `Tier 1/2` for Columnar SIMD)**:
+   - General-purpose control flow, growable heap regions, syscalls, and concurrency target **`Tier 0` (Reference Oracle) == `ELF64` AOT**.
+   - `Tier 1` (vector stencils) and `Tier 2` (L1-cache tile fuser + `ArenaZoneMap`) remain dedicated high-throughput accelerators for columnar subgraphs and fail closed with an explicit error on non-columnar constructs.
+5. **Library Over ISA Bloat**:
+   - Data structures and text routines (`Vec`, `String`, `utf8_validate`, `HashMap`, JSON parsing) are implemented as standard library modules in Rul rather than dedicated compiler opcodes.
 
 ---
 
-## Core Engineering Rules (Non-Goals)
+## 3. Program-Driven Roadmap to `v1.0` (7–9 Months)
 
-To keep verification at nanoseconds per instruction and compilation at microseconds, Rul intentionally avoids the following:
-1. **No Backtracking Constraint Solvers in the Verifier**: Every safety property (types, memory ownership, bounds, loop termination, and I/O permissions) must be verifiable in a single forward pass `O(N)` using witnesses attached to the `.rl` binary.
-2. **No Garbage Collector or Hidden Runtime Threads**: Memory lifetime is tracked explicitly through versioned arenas and regions.
-3. **No Silent Fallbacks in Native Code Generation**: Every execution tier (`Tier 0`, `Tier 1`, `Tier 2`, and `AOT`) must produce matching results or fail closed with a clear error.
+Every milestone is defined by **concrete runnable programs passing `Tier 0 == ELF64 AOT`**, not merely a checklist of opcodes:
+
+### Milestone 1 (`v0.5` — Weeks 1–7): Turing-Complete Core (`TC Core`)
+- **Scope**:
+  - **`v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`)**: `ConstI64`, definitely-initialized scalar locals (`LocalGet`, `LocalSet`), structured control stack (`Block`, `Loop`, `If`, `Else`, `End`, `Br`, `BrIf`), `BlockSig`/`LoopBound` proofs, and `CAP_DIVERGE` (`0x08`) termination policy across `.rl`, `.rls`, `O(N)` Verifier, `Tier 0`, and `x86_64` `ELF64` AOT.
+  - **`v0-5-tc-core-2` (`I64`/`U8` Arithmetic & Growable Regions)**: Scalar `I64`/`U8` operations (`Cast`, wrapping `Add`/`Sub`/`Mul`, checked `Div`/`Rem`, bitwise `BitAnd`/`BitOr`/`BitXor`/`Shl`/`ShrU`), linear growable regions (`RegionNew`, `RegionGrow`, `RegionLen`, `RegionLoad`, `RegionStore` backed by `SYS_mmap`/`SYS_mremap`), and runtime bounds checks (elided when `proof_idx > 0`).
+  - **`v0-5-tc-core-3` (Function Table & Recursion)**: `Func`..`End` scopes (`FuncSig`), `Call`/`CallArg`/`Return`, `CAP_DIVERGE`-gated recursion, and deterministic call-stack depth guards (`MAX_CALL_DEPTH` fail-closed in `Tier 0` and `ELF64` AOT).
+- **Exit Programs (`Tier 0 == ELF64 AOT`)**:
+  - **A complete Brainf\*ck interpreter written in Rul** (executable proof of Turing-completeness), recursive `fib`, in-place `quicksort`, prime `sieve`, and `sha256`.
+
+### Milestone 2 (`v0.6` — Weeks 8–13): Ownership Across Joins & Rul Standard Library
+- **Scope**: Full `AffineToken` consumption/transfer and scoped `ReadLease` tracking across `BlockSig`/`FuncSig` control-flow joins, region-backed struct/enum layouts, and core Rul standard library modules (`Vec`, `String` + `utf8_validate`, `HashMap`).
+- **Exit Programs (`Tier 0 == ELF64 AOT`)**: Zero-GC JSON parser, in-memory key-value store, and buffer-level `wc`/`grep`.
+
+### Milestone 3 (`v0.7` — Weeks 14–17): Capability-Gated Linux Systems I/O
+- **Scope**: Direct Linux syscalls (`openat`, `read`, `write`, `close`, `stat`, `clock_gettime`, `socket`, `epoll`) governed at load time by fine-grained `CapabilityMask` bits (`CAP_FS_READ`, `CAP_FS_WRITE`, `CAP_NET`, `CAP_CLOCK`).
+- **Exit Programs (`Tier 0 == ELF64 AOT`)**: Standalone native `cat`, `grep`, and `wc` CLI binaries, plus a CSV file aggregator invoking Rul's columnar SIMD engine.
+
+### Milestone 4 (`v0.8` — Weeks 18–25): Thread-Per-Core Concurrency & Network Servers
+- **Scope**: Share-nothing thread-per-core worker tasks (preserving zero hidden runtime threads and zero GC), typed channels that linearly transfer `AffineToken` region ownership across cores (preventing data races at load time), and `epoll`/`io_uring` event loops under `CAP_DIVERGE`.
+- **Exit Programs (`Tier 0 == ELF64 AOT`)**: Standalone **HTTP/1.1 Key-Value Server** benchmarked head-to-head against Go (`net/http`) and Rust (`axum`) on RPS, p99 latency, binary size, and microsecond compile time.
+
+### Milestone 5 (`v0.9` — Weeks 26–29): C ABI Ecosystem FFI & AI Synthesis (`pass@1`)
+- **Scope**: Explicit `CAP_FFI`-gated C ABI foreign function calls (unlocking `libc`, `SQLite`, and `OpenSSL`/crypto libraries with clear trust boundaries), structured JSON verifier diagnostics with repair hints, and the **Rul-50 LLM Synthesis Benchmark** measuring first-shot AI code generation (`pass@1`).
+- **Exit Programs**: Rul service querying `SQLite` over `CAP_FFI` and measured LLM `pass@1` benchmark report.
+
+### Milestone 6 (`v1.0` — Weeks 30–35): Linux `AArch64` Backend, Formal Proofs & Binary Freeze
+- **Scope**: Native zero-LLVM `AArch64` (`ARM64`) Linux `ELF64` backend alongside `x86_64`, continuous differential fuzzing (`Tier 0` vs `AOT`), Kani bounded model-checking proofs for the `O(N)` verifier, and `.rl` `v1.0` format freeze.
+- **Exit Deliverable**: 50-program cross-architecture (`x86_64` + `AArch64`) conformance suite.
+
+---
+
+## 4. Core Engineering Invariants (Non-Goals)
+
+1. **No Backtracking Constraint Solvers in the Verifier**: Every safety property (types, definite local initialization, `AffineToken` ownership, `ProofEntry` bounds, and `CapabilityMask` permissions) must be verifiable in a single forward `O(N)` pass.
+2. **No Garbage Collector or Hidden M:N Runtime Scheduler**: Memory lifetime is governed explicitly by versioned arenas/regions, and concurrency uses explicit share-nothing thread-per-core execution.
+3. **No Silent Fallbacks**: Every supported execution tier must match the `Tier 0` reference oracle (`Tier 0 == AOT` for general programs; `Tier 0 == Tier 1 == Tier 2 == AOT` for columnar pipelines) or fail closed with an explicit error.

@@ -1,7 +1,7 @@
 //! # Rul (`.rl`) — AI-Native Binary Programming Language & Execution Engine
 //!
 //! Rul replaces human-centric textual source code with a flat, memory-mapped
-//! 128-bit instruction graph (`.rl`) governed by the First-Principles equation:
+//! 128-bit instruction graph (`.rl`) governed by the core architecture equation:
 //!
 //! $$\text{Artifact (}\mathtt{.rl}\text{)} = \text{Algorithm} + \text{Schedule} + \text{Proof}$$
 //! $$\text{Compiler} = \text{Linear Verifier } O(N) + \text{Tiered Stencil/Tile Engine } O(N)$$

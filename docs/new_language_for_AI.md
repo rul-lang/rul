@@ -1,4 +1,4 @@
-# First-Principles Design Notes: Why AI Agents Need a 128-Bit Binary Language (`.rl`)
+# Design Notes: Why AI Agents Need a 128-Bit Binary Language (`.rl`)
 
 > **Core Idea**: Stop forcing AI agents to output 1970s human text syntax (`fn main() { let x = 5; }`) and waiting seconds for a compiler to parse and optimize it. Replace text source files with a memory-mapped **128-bit (16-byte) binary instruction graph (`.rl`)** where each instruction carries its operation, CPU schedule hint, and safety witness up front.
 
