@@ -2,7 +2,23 @@
 
 All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Tier execution engine, and `ELF64` AOT compiler are documented in this file.
 
-## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation) & Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`)
+## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`) & `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`)
+
+### Added (`v0-5-tc-core-1` — 40-Opcode ISA: Structured Control Flow, Typed Scalar Locals & `CAP_DIVERGE`)
+- **Termination capability `CAP_DIVERGE = 0x08` (`src/bytecode.rs`, `src/verifier.rs`)**:
+  - Termination is now a capability policy. Without `CAP_DIVERGE`, every `Loop` must carry a `ProofRuleKind::LoopBound = 4` witness (`1 <= bound_hi <= 1_000_000` back-edge iterations) or the verifier rejects the program with `VerifyErrorKind::MissingCapability`. With `CAP_DIVERGE`, unbounded loops (`proof_idx == 0`) are admitted.
+- **Structured control flow (`Block = 0x50`, `Loop = 0x51`, `If = 0x52`, `Else = 0x53`, `End = 0x54`, `Br = 0x55`, `BrIf = 0x56`)**:
+  - Verified in the same single forward `O(N)` pass with an explicit control stack: block matching, relative branch depths, scalar `BoolMask` conditions, sealing of inner SSA temporaries at `Else`/`End`, and `AffineToken` conservation across joins through `ProofRuleKind::BlockSig = 3`.
+- **64-bit integer constants and typed scalar locals (`ConstI64 = 0x05`, `LocalGet = 0x06`, `LocalSet = 0x07`)**:
+  - 64 local slots with definite-initialization and fixed-type checks (`VerifyErrorKind::UninitializedLocalRead`, `VerifyErrorKind::LocalTypeMismatch`); scalar `I64` `Add`/`Sub`/`Mul` wrap.
+- **Execution (`src/engine.rs`, `src/aot.rs`)**:
+  - Structured programs run in `Tier 0` and compile to standalone `x86_64` `ELF64` binaries through a dedicated single-pass scalar code generator (`compile_structured_to_elf64_bytes`) with `Tier 0 == AOT` results. A bounded loop that exceeds its `LoopBound` fails closed (`ExecError::LoopBoundExceeded` in `Tier 0`, exit code `70` in AOT).
+  - `Tier 1` and `Tier 2` fail closed on structured programs with `ExecError::UnsupportedInColumnarTier`.
+- **`.rls` assembler/decompiler (`src/transpiler.rs`)**: Lossless round-trip for all ten new opcodes and the `block_sig` / `loop_bound` proof rules.
+
+### Changed (Roadmap & Documentation)
+- `ROADMAP.md` now states host-independent recursion limits, function signatures resolved by function id with function-relative operands, statically declared regions, static resource bounds in sandbox mode, a scalar register-allocation slice with a performance gate, the `v0.6` ownership/linking/data-section work, the `v0.7` columnar bridge, and a binary format change schedule.
+- `README.md`, `docs/about_rul.md`, `docs/new_language_for_AI.md`, and `docs/rul_spec_v0.md` are aligned with the six-milestone roadmap and the 40-opcode ISA.
 
 ### Added (Phase P1b — 30-Opcode ISA: `Opcode::Fma` & Vectorized 256-Bit AVX2 `Ln`/`Exp`)
 - **Explicit `Opcode::Fma = 0x27` (`src/bytecode.rs`, `src/verifier.rs`, `src/transpiler.rs`, `src/engine.rs`, `src/aot.rs`)**:

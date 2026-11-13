@@ -39,7 +39,7 @@ We removed text lexers, AST parsers, garbage collection, exceptions, and LLVM fr
 | :--- | :--- | :--- |
 | **1. `Arena<Shape, Align>`** | 64-byte-aligned memory buffer (`ArenaDescriptor`). | Eliminates per-item heap allocation, maximizes CPU cache utilization, and requires no garbage collector. |
 | **2. `TokenOp` (`ReadLease` / `AffineConsume`)** | Explicit 32-bit memory ownership and version tag on every instruction. | Prevents use-after-free and read/write aliasing in `O(1)` per instruction without a slow borrow-checker solver. |
-| **3. `DataflowOp<SIMD>`** | 29-opcode instruction set covering inputs, slices, in-place mutation, arithmetic, transcendental math, masks, reductions, gathers, and contracts. | Enables single-pass L1-tile fusion and direct 256-bit AVX2 machine code generation. |
+| **3. `DataflowOp<SIMD>`** | 30-opcode columnar instruction set covering inputs, slices, in-place mutation, arithmetic, transcendental math, masks, reductions, gathers, and contracts. | Enables single-pass L1-tile fusion and direct 256-bit AVX2 machine code generation. |
 | **4. `CapabilityMask`** | 64-bit hardware permission bitmask in `RulHeader`. | Blocks unauthorized network, disk, or device I/O at load time before a binary can run. |
 | **5. `ProofEntry`** | 16-byte sidecar table certifying slice and gather index bounds. | Proves array bounds safety at load time in `O(1)` per instruction. |
 
@@ -73,8 +73,10 @@ We staged the engineering in two phases (see **[`ROADMAP.md`](../ROADMAP.md)**):
 
 1. **Phase 1 (`v0.1` to `v0.4` — Completed Foundation)**:
    - Proved the 16-byte `NodeFrame` binary format, single-pass `O(N)` verifier (`5.78 ns/node`), white-box execution tracer (`rul trace`), and zero-LLVM `x86_64` `ELF64` native compiler (`6.38 us`) on high-throughput data and vector workloads, while also providing zero-panic embedding (`src/ffi.rs`) and MCP tools (`src/mcp.rs`) for existing hosts.
-2. **Phase 2 (`v0.5` to `v1.0` — Four-Milestone General-Purpose Roadmap)**:
-   - **Milestone 1 (Control Flow, Functions & Data Types)**: Expand the 16-byte instruction set to general integers/bytes (`i64`, `i32`, `u8`), structs, UTF-8 strings, hash maps, conditional branches (`SelectBranch`), bounded loops with mandatory termination fuel/variant proofs (`RegionLoop`), and modular function calls (`Call`).
-   - **Milestone 2 (General Ownership & Lifetimes in `O(N)`)**: Extend versioned `TokenOp` and `ProofEntry` checks to region heap allocations, struct field borrows, and slice lifetimes in a single forward pass.
-   - **Milestone 3 (Go-Style Concurrency & Capability-Gated I/O)**: Add lightweight tasks and typed channels (where sending a buffer transfers its ownership token so data races are impossible without a garbage collector), plus `CapabilityMask` enforcement for file, socket, and subprocess system calls.
-   - **Milestone 4 (Multi-Arch Zero-LLVM Backends & Formal Proofs)**: Emit standalone native binaries across `x86_64`, `AArch64` (`ARM64`), and WebAssembly (`WASI`) without LLVM, backed by Kani model-checking proofs and continuous differential fuzzing.
+2. **Phase 2 (`v0.5` to `v1.0` — Six-Milestone General-Purpose Roadmap)**:
+   - **Milestone 1 (`v0.5` — Turing-Complete Core)**: WASM-style structured control flow (`Block`, `Loop`, `If`, `Else`, `End`, `Br`, `BrIf`), typed scalar locals, and the `CAP_DIVERGE` termination policy are implemented (40-opcode ISA). The remaining slices add `I64`/`U8` arithmetic, statically declared growable regions with runtime bounds checks, byte input/output regions, a function table with recursion under host-independent call-depth and stack limits, and single-pass scalar register allocation.
+   - **Milestone 2 (`v0.6` — Ownership Across Joins, Linking & Standard Library)**: Region handles with `O(1)` typestate joins at every `Else`/`End`, a constant data section, module linking, typed indirect calls, and `Vec`, `String`, and `HashMap` written in Rul.
+   - **Milestone 3 (`v0.7` — Capability-Gated Linux I/O & Columnar Bridge)**: Direct syscalls governed by fine-grained `CapabilityMask` bits, and a region-as-arena view so structured programs invoke columnar AVX2 kernels.
+   - **Milestone 4 (`v0.8` — Thread-Per-Core Concurrency)**: Share-nothing worker tasks and typed channels that transfer region ownership across cores, so data races are impossible without a garbage collector.
+   - **Milestone 5 (`v0.9` — C ABI FFI & AI Synthesis)**: `CAP_FFI`-gated foreign calls, structured verifier diagnostics with repair hints, and a measured LLM `pass@1` benchmark.
+   - **Milestone 6 (`v1.0` — `AArch64` Backend, Formal Proofs & Format Freeze)**: A second zero-LLVM native backend, continuous differential fuzzing, Kani model-checking proofs for the verifier, and the frozen `.rl` `v1.0` format.

@@ -25,7 +25,7 @@ Languages like C, Go, and Rust were built for humans typing text at a keyboard. 
 3. **A memory safety tag** (a version number and bounds index proving the memory access is valid).
 
 Because the AI provides the CPU schedule and safety tags inside each instruction, the Rul compiler does not need to guess or run slow optimization passes:
-- **Fast safety checks**: Rul verifies memory ownership, array bounds, termination, and I/O permissions in a single forward pass (**~5.8 nanoseconds per instruction**, or under 60 microseconds for 10,000 instructions).
+- **Fast safety checks**: Rul verifies memory ownership, array bounds, the termination policy, and I/O permissions in a single forward pass (**~5.8 nanoseconds per instruction**, or under 60 microseconds for 10,000 instructions).
 - **Microsecond native compilation**: Rul compiles verified `.rl` programs directly into standalone Linux `x86_64` executables (**628 to 1,037 bytes**) in **~6.4 microseconds**, without LLVM or an external linker.
 - **Easy for humans to inspect**: Humans never need to write `.rl` by hand, but can inspect any program at any time using `rul decompile` (readable text view) or `rul trace` (which prints the exact `min`, `max`, `sum`, and `NaN` count at every step).
 
@@ -137,20 +137,26 @@ A common question is: *"If humans do not write `.rl` code, how do teams debug or
 
 ---
 
-## Where Rul is Today (`v0.4.0`) and Roadmap to `v1.0`
+## Where Rul is Today and Roadmap to `v1.0`
 
-We intentionally restricted `v0.1` through `v0.4.0` to **array and vector dataflow pipelines** (`29 opcodes`) to prove the 16-byte binary instruction format, single-pass `O(N)` verifier, and zero-LLVM native `ELF64` compiler on real hardware first.
+We intentionally restricted `v0.1` through `v0.4.0` to **array and vector dataflow pipelines** (`29 opcodes` at the `v0.4.0` release) to prove the 16-byte binary instruction format, single-pass `O(N)` verifier, and zero-LLVM native `ELF64` compiler on real hardware first.
 
-We are now executing a four-milestone roadmap (see **[`ROADMAP.md`](./ROADMAP.md)**) to expand Rul from a columnar compute engine into a **general-purpose systems language capable of replacing Rust and Go for AI-generated software**:
+The first `v0.5` slice is implemented on top of that base. Structured control flow (`Block`, `Loop`, `If`, `Else`, `End`, `Br`, `BrIf`), 64-bit integer constants, and typed scalar locals bring the instruction set to 40 opcodes. Termination is now a capability policy: without `CAP_DIVERGE` every loop needs a verified iteration bound, and with `CAP_DIVERGE` a program may loop without bound. Structured programs run in `Tier 0` and as native `ELF64` binaries with identical results.
 
-1. **Milestone 1 (`v0.5`): General-Purpose Control Flow, Functions, and Data Types**
-   - Expand the 16-byte instruction set to support general integers/bytes (`i64`, `i32`, `u8`), structs, UTF-8 strings, hash maps, conditional branches (`SelectBranch`), bounded loops with explicit termination fuel/variant proofs (`RegionLoop`), and modular function calls (`Call`).
-2. **Milestone 2 (`v0.6`–`v0.7`): General Heap Ownership and Struct Lifetimes in `O(N)` Time**
-   - Extend versioned memory tokens (`TokenOp`) and `ProofEntry` witnesses to verify region heap allocations, struct field borrows, and zero-copy slice lifetimes in a single pass.
-3. **Milestone 3 (`v0.8`–`v0.9`): Go-Style Deterministic Concurrency and Capability-Gated OS I/O**
-   - Add lightweight tasks and typed channels (where sending a buffer transfers its ownership token so data races are impossible without a garbage collector), plus fine-grained `CapabilityMask` checks for file, network socket, and subprocess system calls.
-4. **Milestone 4 (`v1.0`): Multi-Architecture Native Backends (`x86_64`, `ARM64`, `WASI`) and Formal Proofs**
-   - Emit standalone native binaries across `x86_64`, `AArch64` (`ARM64`), and WebAssembly (`WASI`) without LLVM, backed by Kani model-checking proofs and continuous differential fuzzing.
+We are executing a six-milestone roadmap (see **[`ROADMAP.md`](./ROADMAP.md)**) to expand Rul from a columnar compute engine into a **general-purpose systems language capable of replacing Rust and Go for AI-generated software**. Each milestone is defined by programs that must run identically in `Tier 0` and as native binaries:
+
+1. **Milestone 1 (`v0.5`): Turing-Complete Core**
+   - Integer and byte arithmetic, declared growable memory regions with runtime bounds checks, byte input and output, a function table with recursion guarded by host-independent call-depth and stack limits, and single-pass scalar register allocation. Exit programs: a Brainf\*ck interpreter written in Rul, recursive `fib`, `quicksort`, a prime `sieve`, and `sha256`.
+2. **Milestone 2 (`v0.6`): Ownership Across Joins, Linking & Standard Library**
+   - Region ownership and leases checked across branches, loops, and calls in `O(N)`, a constant data section, linking of separately verified modules, and `Vec`, `String`, and `HashMap` written in Rul.
+3. **Milestone 3 (`v0.7`): Capability-Gated Linux I/O & Columnar Bridge**
+   - File, clock, and network syscalls gated by fine-grained `CapabilityMask` bits, and a region-as-arena view so general programs call the columnar SIMD engine.
+4. **Milestone 4 (`v0.8`): Thread-Per-Core Concurrency & Network Servers**
+   - Share-nothing worker tasks and typed channels that transfer region ownership across cores, with an HTTP key-value server benchmarked against Go and Rust.
+5. **Milestone 5 (`v0.9`): C ABI FFI & AI Synthesis Benchmark**
+   - `CAP_FFI`-gated calls into C libraries, verifier diagnostics with repair hints, and a measured first-shot code generation benchmark.
+6. **Milestone 6 (`v1.0`): `AArch64` Backend, Formal Proofs & Format Freeze**
+   - A second zero-LLVM native backend, continuous differential fuzzing, Kani proofs for the verifier, and the frozen `.rl` `v1.0` format.
 
 ---
 
@@ -171,7 +177,7 @@ We are now executing a four-milestone roadmap (see **[`ROADMAP.md`](./ROADMAP.md
 ## Repository Architecture
 
 1. **16-Byte Binary Format ([`src/bytecode.rs`](./src/bytecode.rs)) & Symbolic Assembler ([`src/transpiler.rs`](./src/transpiler.rs))**:
-   - 64-byte `RulHeader`, 16-byte `ArenaDescriptor` table, 16-byte `ProofEntry` table, and 16-byte `NodeFrame` instructions across 29 opcodes.
+   - 64-byte `RulHeader`, 16-byte `ArenaDescriptor` table, 16-byte `ProofEntry` table, and 16-byte `NodeFrame` instructions across 40 opcodes (30 columnar dataflow opcodes plus 10 structured control-flow and scalar-local opcodes).
    - Lossless `.rls` <-> `.rl` assembler and decompiler (`assemble_rls`, `program_to_rls`).
 2. **Single-Pass `O(N)` Static Verifier ([`src/verifier.rs`](./src/verifier.rs))**:
    - Checks acyclic instruction ordering (`in_a < idx`), memory version transitions (`AffineConsume` / `ReadLease`), slice/gather bounds (`ProofEntry`), and `CapabilityMask` permissions in one pass.
@@ -221,8 +227,8 @@ cargo test
 
 ## Documentation
 
-- **[`ROADMAP.md`](./ROADMAP.md)**: Technical Roadmap from `v0.4` Columnar Engine to `v1.0` General-Purpose Systems Language.
-- **[`docs/rul_spec_v0.md`](./docs/rul_spec_v0.md)**: Official `.rl` v0.4 Binary Layout, 128-Bit Instruction Frame & `O(N)` Verifier Specification.
+- **[`ROADMAP.md`](./ROADMAP.md)**: Six-Milestone Technical Roadmap from the `v0.4` Columnar Engine to the `v1.0` General-Purpose Systems Language.
+- **[`docs/rul_spec_v0.md`](./docs/rul_spec_v0.md)**: Official `.rl` Binary Layout, 128-Bit Instruction Frame & `O(N)` Verifier Specification (`v0.4` baseline plus the implemented `v0.5` structured control-flow subset).
 - **[`docs/about_rul.md`](./docs/about_rul.md)**: Plain-English Overview of How Rul Works.
 - **[`docs/new_language_for_AI.md`](./docs/new_language_for_AI.md)**: Design Notes & Architectural Breakdown.
 - **[`docs/WHITEPAPER_RUL_V0_1.md`](./docs/WHITEPAPER_RUL_V0_1.md)**: Technical Whitepaper & Empirical Evaluation (Zenodo Archive).
