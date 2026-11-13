@@ -22,7 +22,7 @@ Because the AI Agent emits explicit schedule hints (`ScheduleHint`) and memory/b
 
 ---
 
-## 1. First-Principles Motivation: Why AI Agents Need a Non-Human Language
+## 1. Architectural Motivation: Why AI Agents Need a Non-Human Language
 
 ### 1.1 The Serialization and Search Tax of Textual Languages
 When a Large Language Model (LLM) or autonomous agent synthesizes a data processing pipeline in Rust or C:

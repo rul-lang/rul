@@ -23,15 +23,18 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rul::aot::{compile_rl_to_executable, run_compiled_executable, write_arena_data_file};
-use rul::bytecode::RulProgram;
+use rul::aot::{
+    compile_rl_to_executable, run_compiled_executable, run_compiled_scalar_executable,
+    write_arena_data_file,
+};
+use rul::bytecode::{ElemType, RulProgram};
 use rul::engine::{
     autotune_schedule, execute_tier0_interpreter, execute_tier2_fused, format_trace_table,
     trace_program, RuntimeValue,
 };
 use rul::suite10::{load_rl_file, save_rl_file, MAX_RL_FILE_BYTES};
 use rul::transpiler::{assemble_rls, disassemble_rl, program_to_rls};
-use rul::verifier::verify_program;
+use rul::verifier::{verify_program, VerifiedSummary};
 
 const RUL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -225,7 +228,7 @@ fn cmd_check(arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram), String> {
+fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram, VerifiedSummary), String> {
     let entry = resolve_entry_path(arg)?;
     let t0 = Instant::now();
     let prog = load_program(&entry)?;
@@ -258,13 +261,16 @@ fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram), String
         aot_rep.verify_ns,
         aot_rep.codegen_ns
     );
-    Ok((rl_out, exe_out, prog))
+    Ok((rl_out, exe_out, prog, summary))
 }
 
 fn load_or_synthesize_arenas_in_dir(
     prog: &RulProgram,
     data_dir: &Path,
 ) -> Result<(Vec<Vec<f64>>, bool), String> {
+    if prog.arenas.is_empty() {
+        return Ok((Vec::new(), false));
+    }
     // Load every declared arena from `<data_dir>/arena_<idx>.bin`, for any arena
     // count. Real user data must never be silently replaced by synthetic
     // data: a program that declares N arenas runs on the user's N columns,
@@ -356,12 +362,60 @@ fn scalars_equivalent(expected: f64, actual: f64) -> bool {
     diff <= 1e-9 * scale
 }
 
+fn scalar_outputs_equivalent(output_elem: ElemType, expected: f64, actual: f64) -> bool {
+    match output_elem {
+        ElemType::F64 => scalars_equivalent(expected, actual),
+        ElemType::I64 | ElemType::BoolMask => expected.to_bits() == actual.to_bits(),
+    }
+}
+
 fn cmd_run(arg: Option<&str>) -> Result<(), String> {
-    let (_rl_path, exe_path, prog) = cmd_build(arg)?;
+    let (_rl_path, exe_path, prog, summary) = cmd_build(arg)?;
     let (cols, is_synthetic) = load_or_synthesize_arenas(&prog)?;
-    let arena_file = prepare_aot_arena_file(&cols, Path::new("data"), is_synthetic)?;
     let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
 
+    if prog.uses_structured_control_or_locals() {
+        let tier0 = execute_tier0_interpreter(&prog, &refs).map_err(|e| e.to_string())?;
+        let tier0_scalar = match tier0.output {
+            RuntimeValue::Scalar(v) => v,
+            RuntimeValue::ColumnF64(ref c) => c.iter().copied().sum(),
+            RuntimeValue::ColumnMask(ref m) => m.iter().filter(|&&b| b).count() as f64,
+        };
+        let t_aot = Instant::now();
+        let aot_val = run_compiled_scalar_executable(&exe_path).map_err(|e| e.to_string())?;
+        let aot_us = t_aot.elapsed().as_secs_f64() * 1e6;
+        if !scalar_outputs_equivalent(summary.output_elem, tier0_scalar, aot_val) {
+            return Err(format!(
+                "[RUL RUN ERROR] differential equivalence failed ({:?}): Tier0 Oracle=0x{:016x}, Native ELF64=0x{:016x}",
+                summary.output_elem,
+                tier0_scalar.to_bits(),
+                aot_val.to_bits()
+            ));
+        }
+        let bits = tier0_scalar.to_bits();
+        match summary.output_elem {
+            ElemType::I64 => {
+                let out_i64 = i64::from_ne_bytes(bits.to_ne_bytes());
+                println!(
+                    "[RUL RUN OK] Output_i64={out_i64} (bits=0x{bits:016x}, Native ELF64 in {aot_us:.1} us)"
+                );
+            }
+            ElemType::BoolMask => {
+                let out_bool = bits != 0;
+                println!(
+                    "[RUL RUN OK] Output_bool={out_bool} (bits=0x{bits:016x}, Native ELF64 in {aot_us:.1} us)"
+                );
+            }
+            ElemType::F64 => {
+                println!(
+                    "[RUL RUN OK] Output={tier0_scalar:.6} (bits=0x{bits:016x}, Native ELF64 in {aot_us:.1} us)"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let arena_file = prepare_aot_arena_file(&cols, Path::new("data"), is_synthetic)?;
     let tier0 = execute_tier0_interpreter(&prog, &refs).map_err(|e| e.to_string())?;
     let tier2 = execute_tier2_fused(&prog, &refs).map_err(|e| e.to_string())?;
 
@@ -574,6 +628,46 @@ mod tests {
         assert!(!scalars_equivalent(f64::INFINITY, 1.0));
         assert!(scalars_equivalent(1000.0, 1000.0 + 1e-7));
         assert!(!scalars_equivalent(0.874_586, 20_726_104.0));
+    }
+
+    #[test]
+    fn test_scalar_outputs_equivalent_strict_i64_and_mask_bits() {
+        let neg_one = f64::from_bits(u64::from_ne_bytes((-1_i64).to_ne_bytes()));
+        let neg_two = f64::from_bits(u64::from_ne_bytes((-2_i64).to_ne_bytes()));
+        assert!(neg_one.is_nan() && neg_two.is_nan());
+        assert!(scalar_outputs_equivalent(ElemType::I64, neg_one, neg_one));
+        assert!(!scalar_outputs_equivalent(ElemType::I64, neg_one, neg_two));
+
+        let pos_one = f64::from_bits(1_u64);
+        let pos_two = f64::from_bits(2_u64);
+        let pos_large_subnormal = f64::from_bits(999_999_999_u64);
+        assert!(scalar_outputs_equivalent(ElemType::I64, pos_one, pos_one));
+        assert!(!scalar_outputs_equivalent(ElemType::I64, pos_one, pos_two));
+        assert!(!scalar_outputs_equivalent(
+            ElemType::I64,
+            pos_one,
+            pos_large_subnormal
+        ));
+
+        let mask_false = f64::from_bits(0_u64);
+        let mask_true = f64::from_bits(1_u64);
+        assert!(scalar_outputs_equivalent(
+            ElemType::BoolMask,
+            mask_true,
+            mask_true
+        ));
+        assert!(!scalar_outputs_equivalent(
+            ElemType::BoolMask,
+            mask_false,
+            mask_true
+        ));
+
+        assert!(scalar_outputs_equivalent(
+            ElemType::F64,
+            100.0,
+            100.0 + 1e-11
+        ));
+        assert!(scalar_outputs_equivalent(ElemType::F64, f64::NAN, f64::NAN));
     }
 
     #[test]

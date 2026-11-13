@@ -43,7 +43,7 @@ Every Pull Request to `rul-lang/rul` must preserve the following invariants acro
 
 | Module | Responsibility |
 | :--- | :--- |
-| [`src/bytecode.rs`](./src/bytecode.rs) | 64-byte `RulHeader`, 16-byte `ArenaDescriptor`, 16-byte `ProofEntry`, and 16-byte (128-bit) `NodeFrame` across the 29-opcode ISA. |
+| [`src/bytecode.rs`](./src/bytecode.rs) | 64-byte `RulHeader`, 16-byte `ArenaDescriptor`, 16-byte `ProofEntry`, and 16-byte (128-bit) `NodeFrame` across the 40-opcode ISA (30 columnar dataflow opcodes plus 10 structured control-flow and scalar-local opcodes). |
 | [`src/verifier.rs`](./src/verifier.rs) | Single-pass $O(N)$ static verifier enforcing SSA dominance, `AffineConsume`/`ReadLease`, `ProofEntry` bounds, and `CapabilityMask`. |
 | [`src/engine.rs`](./src/engine.rs) | Tier 0 Oracle, Tier 1 Vector Stencil, Tier 2 L1-Tile Fuser + MultiCore + `ArenaZoneMap`, `autotune_schedule`, and `trace_program`. |
 | [`src/aot.rs`](./src/aot.rs) | Zero-dependency Copy-and-Patch `x86_64` AVX2 (`YMM`) + SSE2 (`XMM`) standalone Linux `ELF64` AOT compiler. |

@@ -25,8 +25,10 @@ pub const CAP_NET_RING: u64 = 0x01;
 pub const CAP_STORAGE_DMA: u64 = 0x02;
 /// Capability bit: Heterogeneous GPU/NPU queue dispatch allowed.
 pub const CAP_GPU_DISPATCH: u64 = 0x04;
+/// Capability bit: Unrestricted unbounded loops allowed without a static `LoopBound` proof.
+pub const CAP_DIVERGE: u64 = 0x08;
 
-/// Core opcodes of the Rul v0.1 binary instruction set.
+/// Core opcodes of the Rul binary instruction set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Opcode {
@@ -38,6 +40,12 @@ pub enum Opcode {
     ArenaSlice = 0x03,
     /// In-place linear mutation of a mutable arena (`in_a = target_arena`, `in_b = value_node`).
     ArenaMutate = 0x04,
+    /// Load a 64-bit two's-complement signed integer scalar constant (`in_a = low32`, `in_b = high32`).
+    ConstI64 = 0x05,
+    /// Read a definitely-initialized typed scalar local slot (`in_a = slot` in `0..64`, `in_b = 0`).
+    LocalGet = 0x06,
+    /// Write a scalar value into a typed local slot (`in_a = slot` in `0..64`, `in_b = value_node`).
+    LocalSet = 0x07,
     /// Branchless elementwise addition (`out[i] = a[i] + b[i]`).
     Add = 0x10,
     /// Branchless elementwise subtraction (`out[i] = a[i] - b[i]`).
@@ -90,19 +98,36 @@ pub enum Opcode {
     RingEnqueue = 0x30,
     /// Output contract assertion checking non-NaN and finite bounds on `in_a`.
     AssertContract = 0x40,
+    /// Structured forward-exit block header (`optional proof_idx -> BlockSig`).
+    Block = 0x50,
+    /// Structured backward-branch loop header (`proof_idx -> LoopBound`, or `0` with [`CAP_DIVERGE`]).
+    Loop = 0x51,
+    /// Structured conditional block header (`in_a = cond_node`, `optional proof_idx -> BlockSig`).
+    If = 0x52,
+    /// Alternate branch delimiter for an enclosing [`Opcode::If`] (`in_a = optional_then_result`, `in_b = has_result`).
+    Else = 0x53,
+    /// Structured block/loop/conditional terminator (`in_a = optional_result`, `in_b = has_result`).
+    End = 0x54,
+    /// Unconditional relative structured branch (`in_a = relative_depth`).
+    Br = 0x55,
+    /// Conditional relative structured branch (`in_a = cond_node`, `in_b = relative_depth`).
+    BrIf = 0x56,
 }
 
 impl Opcode {
     /// Decodes a raw byte into an [`Opcode`].
     ///
     /// # Errors
-    /// Returns [`RulFormatError::UnknownOpcode`] if the byte is not a valid v0.1 opcode.
+    /// Returns [`RulFormatError::UnknownOpcode`] if the byte is not a valid opcode.
     pub const fn from_u8(byte: u8) -> Result<Self, RulFormatError> {
         match byte {
             0x01 => Ok(Self::ArenaInput),
             0x02 => Ok(Self::ConstF64),
             0x03 => Ok(Self::ArenaSlice),
             0x04 => Ok(Self::ArenaMutate),
+            0x05 => Ok(Self::ConstI64),
+            0x06 => Ok(Self::LocalGet),
+            0x07 => Ok(Self::LocalSet),
             0x10 => Ok(Self::Add),
             0x11 => Ok(Self::Sub),
             0x12 => Ok(Self::Mul),
@@ -129,8 +154,33 @@ impl Opcode {
             0x27 => Ok(Self::Fma),
             0x30 => Ok(Self::RingEnqueue),
             0x40 => Ok(Self::AssertContract),
+            0x50 => Ok(Self::Block),
+            0x51 => Ok(Self::Loop),
+            0x52 => Ok(Self::If),
+            0x53 => Ok(Self::Else),
+            0x54 => Ok(Self::End),
+            0x55 => Ok(Self::Br),
+            0x56 => Ok(Self::BrIf),
             other => Err(RulFormatError::UnknownOpcode(other)),
         }
+    }
+
+    /// Returns `true` if this opcode belongs to the v0.5 structured control-flow or typed scalar local ISA.
+    #[must_use]
+    pub const fn is_structured_or_local(self) -> bool {
+        matches!(
+            self,
+            Self::ConstI64
+                | Self::LocalGet
+                | Self::LocalSet
+                | Self::Block
+                | Self::Loop
+                | Self::If
+                | Self::Else
+                | Self::End
+                | Self::Br
+                | Self::BrIf
+        )
     }
 }
 
@@ -179,6 +229,24 @@ impl TypeLane {
         elem: ElemType::F64,
         width: SimdWidth::Scalar,
     };
+
+    /// Standard scalar `i64` type (`i64x1`).
+    pub const I64_SCALAR: Self = Self {
+        elem: ElemType::I64,
+        width: SimdWidth::Scalar,
+    };
+
+    /// Alias for [`Self::I64_SCALAR`] (`i64x1`).
+    pub const I64X1: Self = Self::I64_SCALAR;
+
+    /// Standard scalar boolean mask type (`maskx1`).
+    pub const MASK_SCALAR: Self = Self {
+        elem: ElemType::BoolMask,
+        width: SimdWidth::Scalar,
+    };
+
+    /// Alias for [`Self::MASK_SCALAR`] (`maskx1`).
+    pub const MASKX1: Self = Self::MASK_SCALAR;
 
     /// Standard 8-lane boolean mask type (`maskx8`).
     pub const MASKX8: Self = Self {
@@ -433,6 +501,10 @@ pub enum ProofRuleKind {
     SliceBounds = 1,
     /// Proves that all indices in an index arena are `< target_arena.element_count`.
     GatherIndexInBounds = 2,
+    /// Declares structured block signature (`target_arena` version transition `bound_lo -> bound_hi` and optional scalar result `TypeLane` in `witness_node`).
+    BlockSig = 3,
+    /// Declares a static upper bound (`1 <= bound_hi <= 1_000_000`) on back-edge iterations of a [`Opcode::Loop`] without [`CAP_DIVERGE`].
+    LoopBound = 4,
 }
 
 impl ProofRuleKind {
@@ -440,6 +512,8 @@ impl ProofRuleKind {
         match raw {
             1 => Ok(Self::SliceBounds),
             2 => Ok(Self::GatherIndexInBounds),
+            3 => Ok(Self::BlockSig),
+            4 => Ok(Self::LoopBound),
             other => Err(RulFormatError::InvalidProofRule(other)),
         }
     }
@@ -542,6 +616,41 @@ impl NodeFrame {
         f64::from_bits(bits)
     }
 
+    /// Encodes a [`Opcode::ConstI64`] frame from a 64-bit signed integer value.
+    #[must_use]
+    pub const fn const_i64(value: i64, schedule: ScheduleHint) -> Self {
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "splitting 64-bit two's-complement integer into exact low/high u32 halves"
+        )]
+        let (low, high) = {
+            let bits = value as u64;
+            ((bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32)
+        };
+        Self {
+            opcode: Opcode::ConstI64,
+            type_lane: TypeLane::I64_SCALAR,
+            schedule,
+            proof_idx: 0,
+            token_op: TokenOp::PURE,
+            in_a: low,
+            in_b: high,
+        }
+    }
+
+    /// Extracts the `i64` constant stored in `in_a` and `in_b`.
+    #[must_use]
+    pub const fn decode_const_i64(self) -> i64 {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "reconstructing 64-bit two's-complement integer from low/high u32 halves"
+        )]
+        {
+            let bits = (self.in_a as u64) | ((self.in_b as u64) << 32);
+            bits as i64
+        }
+    }
+
     /// Packs the second (`in_b`) and third (`in_c`) 16-bit node indices into the `in_b` field of an [`Opcode::Fma`] frame.
     #[must_use]
     pub const fn encode_fma_bc(in_b: u16, in_c: u16) -> u32 {
@@ -632,6 +741,14 @@ pub struct RulProgram {
 }
 
 impl RulProgram {
+    /// Returns `true` if any node in the program uses structured control flow, typed locals, or `ConstI64`.
+    #[must_use]
+    pub fn uses_structured_control_or_locals(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| node.opcode.is_structured_or_local())
+    }
+
     /// Computes the deterministic 64-bit FNV-1a content hash of the program body.
     #[must_use]
     pub fn compute_graph_hash(&self) -> u64 {
