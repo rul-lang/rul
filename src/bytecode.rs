@@ -17,6 +17,12 @@ pub const RL_FRAME_SIZE: usize = 16;
 /// Maximum number of descriptors or nodes permitted in a bounded `.rl` load.
 pub const MAX_SECTION_ITEMS: u32 = 1_000_000;
 
+/// Maximum number of statically declared growable region slots (`0..64`).
+pub const MAX_REGION_SLOTS: usize = 64;
+
+/// Maximum permitted byte capacity of a single declared region (`256 MiB`).
+pub const MAX_REGION_BYTES: usize = 256 * 1024 * 1024;
+
 /// Capability bit: Pure compute only (no external I/O allowed).
 pub const CAP_NONE: u64 = 0x00;
 /// Capability bit: Lock-free network ring enqueue/dequeue allowed.
@@ -94,8 +100,28 @@ pub enum Opcode {
     MaskOr = 0x26,
     /// Branchless elementwise IEEE-754 fused multiply-add (`out[i] = a[i] * b[i] + c[i]` with single rounding; `in_a = a`, `in_b = (b & 0xFFFF) | (c << 16)`).
     Fma = 0x27,
+    /// Scalar boolean mask negation (`out = !a`, `in_a = mask_node`, `in_b = 0`).
+    MaskNot = 0x28,
+    /// Explicit scalar primitive cast (`in_a = src_node`, `in_b = 0`, target type from `type_lane.elem`).
+    Cast = 0x29,
+    /// Scalar integer bitwise AND (`I64` or `U8`).
+    BitAnd = 0x2A,
+    /// Scalar integer bitwise OR (`I64` or `U8`).
+    BitOr = 0x2B,
+    /// Scalar integer bitwise XOR (`I64` or `U8`).
+    BitXor = 0x2C,
+    /// Scalar integer shift left (`I64` masks count `& 63`; `U8` masks count `& 7`).
+    Shl = 0x2D,
+    /// Scalar integer logical (unsigned) shift right (`I64` masks count `& 63`; `U8` masks count `& 7`).
+    ShrU = 0x2E,
+    /// Scalar integer checked remainder (`I64` signed, `U8` unsigned; traps on div-by-zero or `i64::MIN % -1`).
+    Rem = 0x2F,
     /// Enqueue scalar/column output to a hardware NIC ring (requires [`CAP_NET_RING`]).
     RingEnqueue = 0x30,
+    /// Scalar `I64` arithmetic (signed) shift right (count masked `& 63`).
+    ShrS = 0x38,
+    /// Scalar `I64` unsigned less-than comparison (`(a as u64) < (b as u64)` yielding `BoolMask`).
+    CmpLtU = 0x39,
     /// Output contract assertion checking non-NaN and finite bounds on `in_a`.
     AssertContract = 0x40,
     /// Structured forward-exit block header (`optional proof_idx -> BlockSig`).
@@ -112,6 +138,18 @@ pub enum Opcode {
     Br = 0x55,
     /// Conditional relative structured branch (`in_a = cond_node`, `in_b = relative_depth`).
     BrIf = 0x56,
+    /// Reset a declared region to `len` zeroed elements (`in_a = slot`, `in_b = len_node`; void).
+    RegionNew = 0x60,
+    /// Append `add_len` zeroed elements to a declared region (`in_a = slot`, `in_b = add_len_node`; yields new length as `I64`).
+    RegionGrow = 0x61,
+    /// Query current element length of a declared region (`in_a = slot`, `in_b = 0`; yields `I64`).
+    RegionLen = 0x62,
+    /// Load one element from a declared region (`in_a = slot`, `in_b = idx_node`; bounds-checked unless `proof_idx > 0`).
+    RegionLoad = 0x63,
+    /// Store one element into a declared region (`in_a = slot`, `in_b = (idx: u16) | ((val: u16) << 16)`; void).
+    RegionStore = 0x64,
+    /// Release a declared region's mapping and set length to `0` (`in_a = slot`, `in_b = 0`; requires `min_len == 0`; void).
+    RegionFree = 0x65,
 }
 
 impl Opcode {
@@ -152,7 +190,17 @@ impl Opcode {
             0x25 => Ok(Self::MaskAnd),
             0x26 => Ok(Self::MaskOr),
             0x27 => Ok(Self::Fma),
+            0x28 => Ok(Self::MaskNot),
+            0x29 => Ok(Self::Cast),
+            0x2A => Ok(Self::BitAnd),
+            0x2B => Ok(Self::BitOr),
+            0x2C => Ok(Self::BitXor),
+            0x2D => Ok(Self::Shl),
+            0x2E => Ok(Self::ShrU),
+            0x2F => Ok(Self::Rem),
             0x30 => Ok(Self::RingEnqueue),
+            0x38 => Ok(Self::ShrS),
+            0x39 => Ok(Self::CmpLtU),
             0x40 => Ok(Self::AssertContract),
             0x50 => Ok(Self::Block),
             0x51 => Ok(Self::Loop),
@@ -161,11 +209,17 @@ impl Opcode {
             0x54 => Ok(Self::End),
             0x55 => Ok(Self::Br),
             0x56 => Ok(Self::BrIf),
+            0x60 => Ok(Self::RegionNew),
+            0x61 => Ok(Self::RegionGrow),
+            0x62 => Ok(Self::RegionLen),
+            0x63 => Ok(Self::RegionLoad),
+            0x64 => Ok(Self::RegionStore),
+            0x65 => Ok(Self::RegionFree),
             other => Err(RulFormatError::UnknownOpcode(other)),
         }
     }
 
-    /// Returns `true` if this opcode belongs to the v0.5 structured control-flow or typed scalar local ISA.
+    /// Returns `true` if this opcode belongs to the v0.5 structured control-flow, typed scalar, or declared region ISA.
     #[must_use]
     pub const fn is_structured_or_local(self) -> bool {
         matches!(
@@ -173,6 +227,16 @@ impl Opcode {
             Self::ConstI64
                 | Self::LocalGet
                 | Self::LocalSet
+                | Self::MaskNot
+                | Self::Cast
+                | Self::BitAnd
+                | Self::BitOr
+                | Self::BitXor
+                | Self::Shl
+                | Self::ShrU
+                | Self::Rem
+                | Self::ShrS
+                | Self::CmpLtU
                 | Self::Block
                 | Self::Loop
                 | Self::If
@@ -180,6 +244,26 @@ impl Opcode {
                 | Self::End
                 | Self::Br
                 | Self::BrIf
+                | Self::RegionNew
+                | Self::RegionGrow
+                | Self::RegionLen
+                | Self::RegionLoad
+                | Self::RegionStore
+                | Self::RegionFree
+        )
+    }
+
+    /// Returns `true` if this opcode operates on a statically declared growable region.
+    #[must_use]
+    pub const fn is_region_op(self) -> bool {
+        matches!(
+            self,
+            Self::RegionNew
+                | Self::RegionGrow
+                | Self::RegionLen
+                | Self::RegionLoad
+                | Self::RegionStore
+                | Self::RegionFree
         )
     }
 }
@@ -194,6 +278,33 @@ pub enum ElemType {
     I64 = 0x2,
     /// Predication boolean mask (`bool` / lane mask).
     BoolMask = 0x3,
+    /// 8-bit unsigned wrapping byte (`u8`).
+    U8 = 0x5,
+}
+
+impl ElemType {
+    /// Decodes a raw `u8` tag into an [`ElemType`].
+    ///
+    /// # Errors
+    /// Returns [`RulFormatError::InvalidTypeLane`] if the tag is unrecognized.
+    pub const fn from_u8(raw: u8) -> Result<Self, RulFormatError> {
+        match raw {
+            0x1 => Ok(Self::F64),
+            0x2 => Ok(Self::I64),
+            0x3 => Ok(Self::BoolMask),
+            0x5 => Ok(Self::U8),
+            other => Err(RulFormatError::InvalidTypeLane(other)),
+        }
+    }
+
+    /// Returns the element byte width inside a declared region (`8` for `F64`/`I64`, `1` for `U8`/`BoolMask`).
+    #[must_use]
+    pub const fn region_elem_bytes(self) -> usize {
+        match self {
+            Self::F64 | Self::I64 => 8,
+            Self::U8 | Self::BoolMask => 1,
+        }
+    }
 }
 
 /// SIMD vector lane width encoded in the low nibble of [`TypeLane`].
@@ -239,6 +350,15 @@ impl TypeLane {
     /// Alias for [`Self::I64_SCALAR`] (`i64x1`).
     pub const I64X1: Self = Self::I64_SCALAR;
 
+    /// Standard scalar `u8` type (`u8x1`).
+    pub const U8_SCALAR: Self = Self {
+        elem: ElemType::U8,
+        width: SimdWidth::Scalar,
+    };
+
+    /// Alias for [`Self::U8_SCALAR`] (`u8x1`).
+    pub const U8X1: Self = Self::U8_SCALAR;
+
     /// Standard scalar boolean mask type (`maskx1`).
     pub const MASK_SCALAR: Self = Self {
         elem: ElemType::BoolMask,
@@ -275,6 +395,7 @@ impl TypeLane {
             0x1 => ElemType::F64,
             0x2 => ElemType::I64,
             0x3 => ElemType::BoolMask,
+            0x5 => ElemType::U8,
             _ => return Err(RulFormatError::InvalidTypeLane(byte)),
         };
         let width = match byte & 0x0F {
@@ -493,6 +614,31 @@ impl ArenaDescriptor {
     }
 }
 
+/// Role of a statically declared region encoded in `ProofEntry.witness_node >> 8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RegionRole {
+    /// Ordinary program-global growable region (`0`).
+    Plain = 0,
+    /// Declarative byte input region pre-filled from stdin / caller buffer (`1`; must be `U8` with `min_len == 0`).
+    Input = 1,
+    /// Declarative byte output region flushed to stdout / returned bytes on success (`2`; must be `U8`).
+    Output = 2,
+}
+
+impl RegionRole {
+    /// Decodes a raw `u8` role tag into a [`RegionRole`].
+    #[must_use]
+    pub const fn from_u8(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Plain),
+            1 => Some(Self::Input),
+            2 => Some(Self::Output),
+            _ => None,
+        }
+    }
+}
+
 /// Kind of refinement proof stored in the [`ProofEntry`] sidecar table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -505,6 +651,10 @@ pub enum ProofRuleKind {
     BlockSig = 3,
     /// Declares a static upper bound (`1 <= bound_hi <= 1_000_000`) on back-edge iterations of a [`Opcode::Loop`] without [`CAP_DIVERGE`].
     LoopBound = 4,
+    /// Declares a statically typed, bounded growable region (`target_arena = slot`, `bound_lo = min_len`, `bound_hi = max_len`, `witness_node = elem | (role << 8)`).
+    RegionDecl = 6,
+    /// Certifies that a `RegionLoad` or `RegionStore` index is `< bound_hi <= min_len` for `target_arena = slot`.
+    RegionIndexInBounds = 7,
 }
 
 impl ProofRuleKind {
@@ -514,6 +664,8 @@ impl ProofRuleKind {
             2 => Ok(Self::GatherIndexInBounds),
             3 => Ok(Self::BlockSig),
             4 => Ok(Self::LoopBound),
+            6 => Ok(Self::RegionDecl),
+            7 => Ok(Self::RegionIndexInBounds),
             other => Err(RulFormatError::InvalidProofRule(other)),
         }
     }
@@ -535,6 +687,44 @@ pub struct ProofEntry {
 }
 
 impl ProofEntry {
+    /// Constructs a [`ProofRuleKind::RegionDecl`] entry encoding `(elem, role)` in `witness_node`.
+    #[must_use]
+    pub const fn region_decl(
+        slot: u16,
+        min_len: u32,
+        max_len: u32,
+        elem: ElemType,
+        role: RegionRole,
+    ) -> Self {
+        Self {
+            rule_kind: ProofRuleKind::RegionDecl,
+            target_arena: slot,
+            bound_lo: min_len,
+            bound_hi: max_len,
+            witness_node: (elem as u32) | ((role as u32) << 8),
+        }
+    }
+
+    /// Decodes `(ElemType, RegionRole)` from a [`ProofRuleKind::RegionDecl`] `witness_node` field.
+    ///
+    /// Returns `None` if upper bits are non-zero, the element type is not in `{F64, I64, U8}`, or the role is unknown.
+    #[must_use]
+    pub const fn decode_region_decl_witness(witness_node: u32) -> Option<(ElemType, RegionRole)> {
+        if (witness_node >> 16) != 0 {
+            return None;
+        }
+        let elem = match (witness_node & 0xFF) as u8 {
+            0x1 => ElemType::F64,
+            0x2 => ElemType::I64,
+            0x5 => ElemType::U8,
+            _ => return None,
+        };
+        let Some(role) = RegionRole::from_u8(((witness_node >> 8) & 0xFF) as u8) else {
+            return None;
+        };
+        Some((elem, role))
+    }
+
     /// Encodes the proof entry into 16 bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; RL_FRAME_SIZE] {
@@ -651,16 +841,28 @@ impl NodeFrame {
         }
     }
 
+    /// Packs two 16-bit node indices `(lo, hi)` into a 32-bit operand field (`Fma` `(b, c)` or `RegionStore` `(idx, val)`).
+    #[must_use]
+    pub const fn encode_u16_pair(lo: u16, hi: u16) -> u32 {
+        (lo as u32) | ((hi as u32) << 16)
+    }
+
+    /// Unpacks two 16-bit node indices `(lo, hi)` from `self.in_b`.
+    #[must_use]
+    pub const fn decode_u16_pair(self) -> (u32, u32) {
+        (self.in_b & 0xFFFF, self.in_b >> 16)
+    }
+
     /// Packs the second (`in_b`) and third (`in_c`) 16-bit node indices into the `in_b` field of an [`Opcode::Fma`] frame.
     #[must_use]
     pub const fn encode_fma_bc(in_b: u16, in_c: u16) -> u32 {
-        (in_b as u32) | ((in_c as u32) << 16)
+        Self::encode_u16_pair(in_b, in_c)
     }
 
     /// Unpacks the `(in_b, in_c)` node indices from the `in_b` field of an [`Opcode::Fma`] frame.
     #[must_use]
     pub const fn decode_fma_bc(self) -> (u32, u32) {
-        (self.in_b & 0xFFFF, self.in_b >> 16)
+        self.decode_u16_pair()
     }
 
     /// Encodes a ternary [`Opcode::Fma`] frame (`a * b + c` with single IEEE-754 rounding).
@@ -741,12 +943,53 @@ pub struct RulProgram {
 }
 
 impl RulProgram {
-    /// Returns `true` if any node in the program uses structured control flow, typed locals, or `ConstI64`.
+    /// Returns `true` if any node or proof uses structured control flow, typed scalar ops, locals, or declared regions.
     #[must_use]
     pub fn uses_structured_control_or_locals(&self) -> bool {
         self.nodes
             .iter()
-            .any(|node| node.opcode.is_structured_or_local())
+            .any(|node| node.opcode.is_structured_or_local() || node.type_lane.elem == ElemType::U8)
+            || self.proofs.iter().any(|proof| {
+                matches!(
+                    proof.rule_kind,
+                    ProofRuleKind::RegionDecl | ProofRuleKind::RegionIndexInBounds
+                )
+            })
+    }
+
+    /// Returns `true` if any proof entry declares an input or output byte region.
+    #[must_use]
+    pub fn has_io_regions(&self) -> bool {
+        self.input_region_max_len().is_some() || self.has_output_region()
+    }
+
+    /// Returns the declared `max_len` of the program's `RegionRole::Input` region, if any.
+    #[must_use]
+    pub fn input_region_max_len(&self) -> Option<u32> {
+        self.proofs.iter().find_map(|proof| {
+            if proof.rule_kind == ProofRuleKind::RegionDecl
+                && matches!(
+                    ProofEntry::decode_region_decl_witness(proof.witness_node),
+                    Some((_, RegionRole::Input))
+                )
+            {
+                Some(proof.bound_hi)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Returns `true` if any proof entry declares an output byte region.
+    #[must_use]
+    pub fn has_output_region(&self) -> bool {
+        self.proofs.iter().any(|proof| {
+            proof.rule_kind == ProofRuleKind::RegionDecl
+                && matches!(
+                    ProofEntry::decode_region_decl_witness(proof.witness_node),
+                    Some((_, RegionRole::Output))
+                )
+        })
     }
 
     /// Computes the deterministic 64-bit FNV-1a content hash of the program body.

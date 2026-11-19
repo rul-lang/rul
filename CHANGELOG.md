@@ -2,7 +2,20 @@
 
 All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Tier execution engine, and `ELF64` AOT compiler are documented in this file.
 
-## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`) & `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`)
+## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`), `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`) & `v0-5-tc-core-2` (`I64`/`U8` Arithmetic, Declared Regions & Byte I/O)
+
+### Added (`v0-5-tc-core-2` — 56-Opcode ISA: `U8`, `I64`/`U8` Bitwise & Checked Div/Rem, Declared Growable Regions, Byte I/O Regions & Proof-Based Bounds Elision)
+- **Unsigned byte type & scalar integer/cast/mask ops (`src/bytecode.rs`, `src/verifier.rs`, `src/engine.rs`, `src/aot.rs`)**:
+  - Added `ElemType::U8 = 0x5` (`u8x1` in `.rls`), `MaskNot = 0x28`, `Cast = 0x29`, `BitAnd = 0x2A`, `BitOr = 0x2B`, `BitXor = 0x2C`, `Shl = 0x2D`, `ShrU = 0x2E`, `Rem = 0x2F`, `ShrS = 0x38`, and `CmpLtU = 0x39`.
+  - Extended `Add`/`Sub`/`Mul`/`Div`/`CmpGt`/`CmpLt`/`CmpEq`/`SelectZero` to scalar `U8` (wrapping modulo 256, unsigned compare/div/rem, shifts masked `& 7`) and `Div`/`Rem` to checked signed `I64` (shifts masked `& 63`).
+  - Fail-closed equivalence across `Tier 0` and `ELF64` AOT on integer division/remainder by zero or `i64::MIN / -1` (`ExecError::IntegerDivisionError` / `AOT_EXIT_INT_DIV_ERR = 72`) and on `NaN` or out-of-range float-to-integer `Cast` (`ExecError::CastOutOfRange` / `AOT_EXIT_CAST_ERR = 73`).
+  - Added `TypedScalar` / `RuntimeValue::TypedScalar` in `Tier 0` so non-`F64` scalar outputs report `(ElemType, bits)` directly instead of smuggling through `f64::from_bits`.
+- **Statically declared growable regions & byte I/O (`ProofRuleKind::RegionDecl = 6`, `RegionIndexInBounds = 7`)**:
+  - Added `RegionNew = 0x60`, `RegionGrow = 0x61`, `RegionLen = 0x62`, `RegionLoad = 0x63`, `RegionStore = 0x64`, and `RegionFree = 0x65` over `U8`, `I64`, and `F64` across up to 64 program-global region slots (`MAX_REGION_BYTES = 256 MiB`).
+  - Verified declarations in one linear pre-scan of the proof table and checked every region opcode in `O(1)` (`tok=pure`), enforcing `min_len <= len <= max_len` (`ExecError::RegionAllocationFailed` / `AOT_EXIT_REGION_OOM = 74`), zero-initialization on startup/`RegionNew`/`RegionGrow`, and unsigned runtime bounds checks (`ExecError::RegionBoundsOutOfRange` / `AOT_EXIT_GATHER_OOB = 71`).
+  - Added `RegionIndexInBounds` proof-based bounds-check elision for `ConstI64` and `BitAnd(_, ConstI64)` indices strictly below `bound_hi <= min_len`, preserving `VerifiedSummary.zero_runtime_bounds_checks = true` when all accesses are proven.
+  - Added declarative byte input (`u8:input`, pre-filled from stdin / caller slice) and output (`u8:output`, flushed to stdout / returned bytes with zero stdout on fail-closed exit) regions, plus `SYS_mmap`/`SYS_mremap`/`SYS_munmap`/`SYS_read`/`SYS_write` lowering in `src/aot.rs` and stdin/stdout forwarding in `rul run`.
+- **`.rls` assembler/decompiler (`src/transpiler.rs`)**: Lossless round-trip for `u8x1`, all 16 new opcodes, `region_decl` (`<elem>:<role>`), and `region_index_in_bounds`.
 
 ### Added (`v0-5-tc-core-1` — 40-Opcode ISA: Structured Control Flow, Typed Scalar Locals & `CAP_DIVERGE`)
 - **Termination capability `CAP_DIVERGE = 0x08` (`src/bytecode.rs`, `src/verifier.rs`)**:

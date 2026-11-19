@@ -10,7 +10,7 @@ use std::fmt::{self, Write as _};
 
 use crate::bytecode::{
     ArenaDescriptor, ElemType, ExecPolicy, NodeFrame, Opcode, ProofEntry, ProofRuleKind,
-    RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane, CAP_DIVERGE,
+    RegionRole, RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane, CAP_DIVERGE,
     CAP_GPU_DISPATCH, CAP_NET_RING, CAP_NONE, CAP_STORAGE_DMA,
 };
 
@@ -394,6 +394,9 @@ pub fn disassemble_rl(program: &RulProgram) -> String {
         } else if frame.opcode == Opcode::Fma {
             let (b, c) = frame.decode_fma_bc();
             format!("in_a={}, in_b={b}, in_c={c}", frame.in_a)
+        } else if frame.opcode == Opcode::RegionStore {
+            let (idx_node, val_node) = frame.decode_u16_pair();
+            format!("slot={}, idx={idx_node}, val={val_node}", frame.in_a)
         } else {
             format!("in_a={}, in_b={}", frame.in_a, frame.in_b)
         };
@@ -474,16 +477,37 @@ pub fn program_to_rls(program: &RulProgram) -> String {
             ProofRuleKind::GatherIndexInBounds => "gather_bounds",
             ProofRuleKind::BlockSig => "block_sig",
             ProofRuleKind::LoopBound => "loop_bound",
+            ProofRuleKind::RegionDecl => "region_decl",
+            ProofRuleKind::RegionIndexInBounds => "region_index_in_bounds",
+        };
+        let witness_str = if proof.rule_kind == ProofRuleKind::RegionDecl {
+            if let Some((elem, role)) = ProofEntry::decode_region_decl_witness(proof.witness_node) {
+                let elem_s = match elem {
+                    ElemType::F64 => "f64",
+                    ElemType::I64 => "i64",
+                    ElemType::U8 => "u8",
+                    ElemType::BoolMask => "bool",
+                };
+                let role_s = match role {
+                    RegionRole::Plain => "plain",
+                    RegionRole::Input => "input",
+                    RegionRole::Output => "output",
+                };
+                format!("{elem_s}:{role_s}")
+            } else {
+                proof.witness_node.to_string()
+            }
+        } else {
+            proof.witness_node.to_string()
         };
         let _ = writeln!(
             out,
-            "proof {} rule={} target={} lo={} hi={} witness={}",
+            "proof {} rule={} target={} lo={} hi={} witness={witness_str}",
             idx + 1,
             rule_str,
             proof.target_arena,
             proof.bound_lo,
             proof.bound_hi,
-            proof.witness_node
         );
     }
 
@@ -517,9 +541,23 @@ pub fn program_to_rls(program: &RulProgram) -> String {
                 "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={a_ref} b={b_ref} c={c_ref}",
                 frame.schedule.fusion_group, frame.proof_idx
             );
+        } else if frame.opcode == Opcode::RegionStore {
+            let (idx_node, val_node) = frame.decode_u16_pair();
+            let b_ref = format_node_ref(frame.opcode, false, idx_node);
+            let c_ref = format_node_ref(frame.opcode, false, val_node);
+            let _ = writeln!(
+                out,
+                "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={} b={b_ref} c={c_ref}",
+                frame.schedule.fusion_group, frame.proof_idx, frame.in_a
+            );
         } else if matches!(
             frame.opcode,
-            Opcode::ArenaInput | Opcode::ArenaMutate | Opcode::LocalSet
+            Opcode::ArenaInput
+                | Opcode::ArenaMutate
+                | Opcode::LocalSet
+                | Opcode::RegionNew
+                | Opcode::RegionGrow
+                | Opcode::RegionLoad
         ) {
             let b_ref = format_node_ref(frame.opcode, false, frame.in_b);
             let _ = writeln!(
@@ -529,7 +567,12 @@ pub fn program_to_rls(program: &RulProgram) -> String {
             );
         } else if matches!(
             frame.opcode,
-            Opcode::LocalGet | Opcode::Block | Opcode::Loop | Opcode::Br
+            Opcode::LocalGet
+                | Opcode::Block
+                | Opcode::Loop
+                | Opcode::Br
+                | Opcode::RegionLen
+                | Opcode::RegionFree
         ) {
             let _ = writeln!(
                 out,
@@ -766,6 +809,10 @@ fn parse_proof_line<'a>(
                     }
                     "block_sig" | "BlockSig" | "3" => ProofRuleKind::BlockSig,
                     "loop_bound" | "LoopBound" | "4" => ProofRuleKind::LoopBound,
+                    "region_decl" | "RegionDecl" | "6" => ProofRuleKind::RegionDecl,
+                    "region_index_in_bounds" | "RegionIndexInBounds" | "7" => {
+                        ProofRuleKind::RegionIndexInBounds
+                    }
                     _ => {
                         return Err(RlsError::LineParse {
                             line: line_no,
@@ -800,6 +847,30 @@ fn parse_proof_line<'a>(
                     })?
                 } else if v == "void" {
                     0
+                } else if let Some((elem_str, role_str)) = v.split_once(':') {
+                    let elem = match elem_str {
+                        "f64" | "F64" => ElemType::F64,
+                        "i64" | "I64" => ElemType::I64,
+                        "u8" | "U8" => ElemType::U8,
+                        _ => {
+                            return Err(RlsError::LineParse {
+                                line: line_no,
+                                message: format!("unknown region element type '{elem_str}'"),
+                            })
+                        }
+                    };
+                    let role = match role_str {
+                        "plain" | "Plain" => RegionRole::Plain,
+                        "input" | "Input" => RegionRole::Input,
+                        "output" | "Output" => RegionRole::Output,
+                        _ => {
+                            return Err(RlsError::LineParse {
+                                line: line_no,
+                                message: format!("unknown region role '{role_str}'"),
+                            })
+                        }
+                    };
+                    (elem as u32) | ((role as u32) << 8)
                 } else {
                     let tl = parse_type_lane(line_no, v)?;
                     u32::from(tl.to_u8())
@@ -974,6 +1045,12 @@ fn parse_node_line<'a>(
                     | Opcode::Block
                     | Opcode::Loop
                     | Opcode::Br
+                    | Opcode::RegionNew
+                    | Opcode::RegionGrow
+                    | Opcode::RegionLen
+                    | Opcode::RegionLoad
+                    | Opcode::RegionStore
+                    | Opcode::RegionFree
             ) {
                 a_str.parse::<u32>().map_err(|_e| RlsError::LineParse {
                     line: line_no,
@@ -986,20 +1063,20 @@ fn parse_node_line<'a>(
             0
         };
 
-        let in_b = if opcode == Opcode::Fma {
+        let in_b = if matches!(opcode, Opcode::Fma | Opcode::RegionStore) {
             if raw_a.is_none() {
                 return Err(RlsError::LineParse {
                     line: line_no,
-                    message: "Fma requires a=<node>, b=<node>, and c=<node>".to_owned(),
+                    message: format!("{opcode:?} requires a=, b=, and c="),
                 });
             }
             let b_str = raw_b.ok_or_else(|| RlsError::LineParse {
                 line: line_no,
-                message: "Fma requires a=<node>, b=<node>, and c=<node>".to_owned(),
+                message: format!("{opcode:?} requires a=, b=, and c="),
             })?;
             let c_str = raw_c.ok_or_else(|| RlsError::LineParse {
                 line: line_no,
-                message: "Fma requires a=<node>, b=<node>, and c=<node>".to_owned(),
+                message: format!("{opcode:?} requires a=, b=, and c="),
             })?;
             let b_idx = resolve_sym_or_u32(line_no, b_str, symbols)?;
             let c_idx = resolve_sym_or_u32(line_no, c_str, symbols)?;
@@ -1015,7 +1092,7 @@ fn parse_node_line<'a>(
                     node_idx: c_idx,
                 })
             })?;
-            NodeFrame::encode_fma_bc(b16, c16)
+            NodeFrame::encode_u16_pair(b16, c16)
         } else if let Some(b_str) = raw_b {
             if matches!(
                 opcode,
@@ -1027,6 +1104,8 @@ fn parse_node_line<'a>(
                     | Opcode::End
                     | Opcode::Br
                     | Opcode::BrIf
+                    | Opcode::RegionLen
+                    | Opcode::RegionFree
             ) {
                 b_str.parse::<u32>().map_err(|_e| RlsError::LineParse {
                     line: line_no,
@@ -1156,6 +1235,9 @@ fn format_type_lane(lane: TypeLane) -> &'static str {
         (ElemType::BoolMask, SimdWidth::Scalar) => "maskx1",
         (ElemType::BoolMask, SimdWidth::Lane4) => "maskx4",
         (ElemType::BoolMask, SimdWidth::Lane8) => "maskx8",
+        (ElemType::U8, SimdWidth::Scalar) => "u8x1",
+        (ElemType::U8, SimdWidth::Lane4) => "u8x4",
+        (ElemType::U8, SimdWidth::Lane8) => "u8x8",
     }
 }
 
@@ -1185,6 +1267,15 @@ fn parse_type_lane(line_no: usize, raw: &str) -> Result<TypeLane, RlsError> {
             width: SimdWidth::Lane4,
         },
         "maskx8" => TypeLane::MASKX8,
+        "u8x1" | "u8" => TypeLane::U8_SCALAR,
+        "u8x4" => TypeLane {
+            elem: ElemType::U8,
+            width: SimdWidth::Lane4,
+        },
+        "u8x8" => TypeLane {
+            elem: ElemType::U8,
+            width: SimdWidth::Lane8,
+        },
         _ => {
             return Err(RlsError::LineParse {
                 line: line_no,
@@ -1228,7 +1319,17 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::MaskAnd => "MaskAnd",
         Opcode::MaskOr => "MaskOr",
         Opcode::Fma => "Fma",
+        Opcode::MaskNot => "MaskNot",
+        Opcode::Cast => "Cast",
+        Opcode::BitAnd => "BitAnd",
+        Opcode::BitOr => "BitOr",
+        Opcode::BitXor => "BitXor",
+        Opcode::Shl => "Shl",
+        Opcode::ShrU => "ShrU",
+        Opcode::Rem => "Rem",
         Opcode::RingEnqueue => "RingEnqueue",
+        Opcode::ShrS => "ShrS",
+        Opcode::CmpLtU => "CmpLtU",
         Opcode::AssertContract => "AssertContract",
         Opcode::Block => "Block",
         Opcode::Loop => "Loop",
@@ -1237,6 +1338,12 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::End => "End",
         Opcode::Br => "Br",
         Opcode::BrIf => "BrIf",
+        Opcode::RegionNew => "RegionNew",
+        Opcode::RegionGrow => "RegionGrow",
+        Opcode::RegionLen => "RegionLen",
+        Opcode::RegionLoad => "RegionLoad",
+        Opcode::RegionStore => "RegionStore",
+        Opcode::RegionFree => "RegionFree",
     }
 }
 
@@ -1273,7 +1380,17 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "MaskAnd" => Opcode::MaskAnd,
         "MaskOr" => Opcode::MaskOr,
         "Fma" => Opcode::Fma,
+        "MaskNot" => Opcode::MaskNot,
+        "Cast" => Opcode::Cast,
+        "BitAnd" => Opcode::BitAnd,
+        "BitOr" => Opcode::BitOr,
+        "BitXor" => Opcode::BitXor,
+        "Shl" => Opcode::Shl,
+        "ShrU" => Opcode::ShrU,
+        "Rem" => Opcode::Rem,
         "RingEnqueue" => Opcode::RingEnqueue,
+        "ShrS" => Opcode::ShrS,
+        "CmpLtU" => Opcode::CmpLtU,
         "AssertContract" => Opcode::AssertContract,
         "Block" => Opcode::Block,
         "Loop" => Opcode::Loop,
@@ -1282,6 +1399,12 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "End" => Opcode::End,
         "Br" => Opcode::Br,
         "BrIf" => Opcode::BrIf,
+        "RegionNew" => Opcode::RegionNew,
+        "RegionGrow" => Opcode::RegionGrow,
+        "RegionLen" => Opcode::RegionLen,
+        "RegionLoad" => Opcode::RegionLoad,
+        "RegionStore" => Opcode::RegionStore,
+        "RegionFree" => Opcode::RegionFree,
         _ => {
             return Err(RlsError::LineParse {
                 line: line_no,
@@ -1380,6 +1503,8 @@ fn format_node_ref(opcode: Opcode, is_a: bool, idx: u32) -> String {
                 | Opcode::ReduceSum
                 | Opcode::ReduceMax
                 | Opcode::ReduceMin
+                | Opcode::MaskNot
+                | Opcode::Cast
                 | Opcode::RingEnqueue
                 | Opcode::AssertContract
         )

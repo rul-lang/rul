@@ -11,8 +11,9 @@
 use std::fmt;
 
 use crate::bytecode::{
-    ElemType, NodeFrame, Opcode, ProofRuleKind, RulProgram, SimdWidth, TokenMode, TypeLane,
-    CAP_DIVERGE, CAP_NET_RING, MAX_SECTION_ITEMS,
+    ElemType, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram, SimdWidth,
+    TokenMode, TypeLane, CAP_DIVERGE, CAP_NET_RING, MAX_REGION_BYTES, MAX_REGION_SLOTS,
+    MAX_SECTION_ITEMS,
 };
 
 /// Shape and static length inferred in $O(1)$ per node during the single-pass scan.
@@ -161,6 +162,15 @@ pub enum VerifyErrorKind {
     },
     /// Malformed structured control-flow construct (`Block`/`Loop`/`If`/`Else`/`End`/`Br`/`BrIf`).
     InvalidControlFlow(&'static str),
+    /// Invalid [`ProofRuleKind::RegionDecl`] entry in the proof table.
+    InvalidRegionDecl {
+        /// Declared region slot (`0..64`).
+        slot: u16,
+        /// Reason the declaration was rejected.
+        reason: &'static str,
+    },
+    /// Region opcode referenced an undeclared or out-of-range region slot.
+    UnknownRegion(u32),
 }
 
 impl fmt::Display for VerifyDiagnostic {
@@ -182,6 +192,8 @@ struct NodeMeta {
     elem: ElemType,
     origin_arena: Option<u16>,
     is_void: bool,
+    const_i64: Option<i64>,
+    nonneg_upper_bound: Option<u64>,
 }
 
 impl NodeMeta {
@@ -190,7 +202,29 @@ impl NodeMeta {
         elem: ElemType::I64,
         origin_arena: None,
         is_void: true,
+        const_i64: None,
+        nonneg_upper_bound: None,
     };
+
+    const fn value(shape: ValueShape, elem: ElemType, origin_arena: Option<u16>) -> Self {
+        Self {
+            shape,
+            elem,
+            origin_arena,
+            is_void: false,
+            const_i64: None,
+            nonneg_upper_bound: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionDeclInfo {
+    slot: u16,
+    min_len: u32,
+    max_len: u32,
+    elem: ElemType,
+    role: RegionRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +271,133 @@ struct VerifierState {
     version_bumps: u64,
     node_visible: Vec<bool>,
     control_stack: Vec<ControlFrame>,
+    regions: [Option<RegionDeclInfo>; MAX_REGION_SLOTS],
+    has_unproven_region_access: bool,
+}
+
+fn scan_region_decls(
+    program: &RulProgram,
+) -> Result<[Option<RegionDeclInfo>; MAX_REGION_SLOTS], VerifyDiagnostic> {
+    let mut regions: [Option<RegionDeclInfo>; MAX_REGION_SLOTS] = [None; MAX_REGION_SLOTS];
+    let mut has_input = false;
+    let mut has_output = false;
+
+    for proof in &program.proofs {
+        if proof.rule_kind != ProofRuleKind::RegionDecl {
+            continue;
+        }
+        let slot = proof.target_arena;
+        let slot_idx = usize::from(slot);
+        let Some(slot_entry) = regions.get_mut(slot_idx) else {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidRegionDecl {
+                    slot,
+                    reason: "region slot must be < 64",
+                },
+            });
+        };
+        if slot_entry.is_some() {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidRegionDecl {
+                    slot,
+                    reason: "duplicate RegionDecl for slot",
+                },
+            });
+        }
+        if proof.bound_lo > proof.bound_hi {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidRegionDecl {
+                    slot,
+                    reason: "region min_len exceeds max_len",
+                },
+            });
+        }
+        let Some((elem, role)) = ProofEntry::decode_region_decl_witness(proof.witness_node) else {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidRegionDecl {
+                    slot,
+                    reason: "unsupported region element type or role",
+                },
+            });
+        };
+        let max_bytes = u64::from(proof.bound_hi).saturating_mul(elem.region_elem_bytes() as u64);
+        if max_bytes > (MAX_REGION_BYTES as u64) {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidRegionDecl {
+                    slot,
+                    reason: "region max_len bytes exceeds MAX_REGION_BYTES (256 MiB)",
+                },
+            });
+        }
+        match role {
+            RegionRole::Plain => {}
+            RegionRole::Input => {
+                if elem != ElemType::U8 {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidRegionDecl {
+                            slot,
+                            reason: "input region must have element type U8",
+                        },
+                    });
+                }
+                if proof.bound_lo != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidRegionDecl {
+                            slot,
+                            reason: "input region must have min_len == 0",
+                        },
+                    });
+                }
+                if has_input {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidRegionDecl {
+                            slot,
+                            reason: "at most one input region may be declared",
+                        },
+                    });
+                }
+                has_input = true;
+            }
+            RegionRole::Output => {
+                if elem != ElemType::U8 {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidRegionDecl {
+                            slot,
+                            reason: "output region must have element type U8",
+                        },
+                    });
+                }
+                if has_output {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidRegionDecl {
+                            slot,
+                            reason: "at most one output region may be declared",
+                        },
+                    });
+                }
+                has_output = true;
+            }
+        }
+        *slot_entry = Some(RegionDeclInfo {
+            slot,
+            min_len: proof.bound_lo,
+            max_len: proof.bound_hi,
+            elem,
+            role,
+        });
+    }
+
+    Ok(regions)
 }
 
 /// Verifies an [`RulProgram`] in a single forward pass ($O(N)$ time and $O(N)$ state).
@@ -253,6 +414,9 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         });
     }
 
+    // One linear pre-scan of the proof table to index statically declared regions.
+    let regions = scan_region_decls(program)?;
+
     // Track live AffineToken version per Arena.
     let mut arena_versions: Vec<u16> = program.arenas.iter().map(|a| a.initial_version).collect();
 
@@ -266,6 +430,8 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         version_bumps: 0,
         node_visible: Vec::with_capacity(node_count),
         control_stack: Vec::new(),
+        regions,
+        has_unproven_region_access: false,
     };
     let mut max_fusion_group: u8 = 0;
     let mut has_gather = false;
@@ -335,7 +501,7 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         fusion_groups: usize::from(max_fusion_group),
         output_shape: output_meta.shape,
         output_elem: output_meta.elem,
-        zero_runtime_bounds_checks: !has_gather,
+        zero_runtime_bounds_checks: !has_gather && !state.has_unproven_region_access,
     })
 }
 
@@ -803,6 +969,62 @@ fn unify_elementwise_shapes(
     }
 }
 
+fn lookup_region_decl(
+    node_idx: u32,
+    slot: u32,
+    regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS],
+) -> Result<RegionDeclInfo, VerifyDiagnostic> {
+    let slot_idx = usize::try_from(slot).unwrap_or(usize::MAX);
+    regions
+        .get(slot_idx)
+        .and_then(|opt| *opt)
+        .ok_or(VerifyDiagnostic {
+            node_idx,
+            kind: VerifyErrorKind::UnknownRegion(slot),
+        })
+}
+
+fn verify_region_index_proof(
+    program: &RulProgram,
+    node_idx: u32,
+    proof_idx: u8,
+    decl: RegionDeclInfo,
+    idx_meta: NodeMeta,
+) -> Result<(), VerifyDiagnostic> {
+    let err = |bound_hi: u32| VerifyDiagnostic {
+        node_idx,
+        kind: VerifyErrorKind::InvalidRefinementProof {
+            proof_idx,
+            bound_hi,
+            arena_len: decl.min_len,
+        },
+    };
+    let proof = program
+        .proofs
+        .get(usize::from(proof_idx.saturating_sub(1)))
+        .ok_or_else(|| err(0))?;
+    if proof.rule_kind != ProofRuleKind::RegionIndexInBounds
+        || proof.target_arena != decl.slot
+        || proof.bound_lo != 0
+        || proof.witness_node != 0
+        || proof.bound_hi == 0
+        || proof.bound_hi > decl.min_len
+    {
+        return Err(err(proof.bound_hi));
+    }
+    let Some(upper) = idx_meta.nonneg_upper_bound else {
+        return Err(err(proof.bound_hi));
+    };
+    if upper >= u64::from(proof.bound_hi) {
+        return Err(err(proof.bound_hi));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass O(N) opcode semantic verifier"
+)]
 fn verify_node_semantics(
     program: &RulProgram,
     frame: &NodeFrame,
@@ -828,19 +1050,22 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::MissingArenaToken(expected_id),
                 });
             }
-            Ok(NodeMeta {
-                shape: ValueShape::Column(arena.element_count),
-                elem: arena.type_lane.elem,
-                origin_arena: Some(expected_id),
-                is_void: false,
-            })
+            if arena.type_lane.elem == ElemType::U8 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::F64,
+                        actual: ElemType::U8,
+                    },
+                });
+            }
+            Ok(NodeMeta::value(
+                ValueShape::Column(arena.element_count),
+                arena.type_lane.elem,
+                Some(expected_id),
+            ))
         }
-        Opcode::ConstF64 => Ok(NodeMeta {
-            shape: ValueShape::Scalar,
-            elem: ElemType::F64,
-            origin_arena: None,
-            is_void: false,
-        }),
+        Opcode::ConstF64 => Ok(NodeMeta::value(ValueShape::Scalar, ElemType::F64, None)),
         Opcode::ConstI64 => {
             require_pure_token(node_idx, frame)?;
             if frame.proof_idx != 0 {
@@ -867,11 +1092,14 @@ fn verify_node_semantics(
                     },
                 });
             }
+            let c = frame.decode_const_i64();
             Ok(NodeMeta {
                 shape: ValueShape::Scalar,
                 elem: ElemType::I64,
                 origin_arena: None,
                 is_void: false,
+                const_i64: Some(c),
+                nonneg_upper_bound: u64::try_from(c).ok(),
             })
         }
         Opcode::LocalGet => {
@@ -923,12 +1151,7 @@ fn verify_node_semantics(
                     },
                 });
             }
-            Ok(NodeMeta {
-                shape: ValueShape::Scalar,
-                elem,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(ValueShape::Scalar, elem, None))
         }
         Opcode::LocalSet => {
             require_pure_token(node_idx, frame)?;
@@ -989,12 +1212,7 @@ fn verify_node_semantics(
                 *slot_entry = Some(val_meta.elem);
             }
             state.local_init |= 1_u64 << slot;
-            Ok(NodeMeta {
-                shape: ValueShape::Scalar,
-                elem: val_meta.elem,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(ValueShape::Scalar, val_meta.elem, None))
         }
         Opcode::ArenaSlice => {
             let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
@@ -1051,12 +1269,11 @@ fn verify_node_semantics(
                 });
             }
             let slice_len = proof.bound_hi - proof.bound_lo;
-            Ok(NodeMeta {
-                shape: ValueShape::Column(slice_len),
-                elem: src_meta.elem,
-                origin_arena: src_meta.origin_arena,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(
+                ValueShape::Column(slice_len),
+                src_meta.elem,
+                src_meta.origin_arena,
+            ))
         }
         Opcode::ArenaMutate => {
             let arena = program
@@ -1090,17 +1307,13 @@ fn verify_node_semantics(
                 ValueShape::Column(arena.element_count),
                 val_meta.shape,
             )?;
-            Ok(NodeMeta {
-                shape: unified,
-                elem: val_meta.elem,
-                origin_arena: Some(expected_id),
-                is_void: false,
-            })
+            Ok(NodeMeta::value(unified, val_meta.elem, Some(expected_id)))
         }
-        Opcode::Add | Opcode::Sub | Opcode::Mul => {
+        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
             let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
-            if meta_a.elem == ElemType::I64 && meta_b.elem == ElemType::I64 {
+            if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) && meta_a.elem == meta_b.elem {
+                let int_elem = meta_a.elem;
                 if meta_a.shape != ValueShape::Scalar || meta_b.shape != ValueShape::Scalar {
                     return Err(VerifyDiagnostic {
                         node_idx,
@@ -1114,11 +1327,11 @@ fn verify_node_semantics(
                         },
                     });
                 }
-                if frame.type_lane.elem != ElemType::I64 {
+                if frame.type_lane.elem != int_elem {
                     return Err(VerifyDiagnostic {
                         node_idx,
                         kind: VerifyErrorKind::ElementTypeMismatch {
-                            expected: ElemType::I64,
+                            expected: int_elem,
                             actual: frame.type_lane.elem,
                         },
                     });
@@ -1132,16 +1345,11 @@ fn verify_node_semantics(
                         },
                     });
                 }
-                return Ok(NodeMeta {
-                    shape: ValueShape::Scalar,
-                    elem: ElemType::I64,
-                    origin_arena: None,
-                    is_void: false,
-                });
+                return Ok(NodeMeta::value(ValueShape::Scalar, int_elem, None));
             }
             if meta_a.elem != ElemType::F64 || meta_b.elem != ElemType::F64 {
-                let (expected, actual) = if meta_a.elem == ElemType::I64 {
-                    (ElemType::I64, meta_b.elem)
+                let (expected, actual) = if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) {
+                    (meta_a.elem, meta_b.elem)
                 } else {
                     (
                         ElemType::F64,
@@ -1158,14 +1366,9 @@ fn verify_node_semantics(
                 });
             }
             let shape = unify_elementwise_shapes(node_idx, meta_a.shape, meta_b.shape)?;
-            Ok(NodeMeta {
-                shape,
-                elem: ElemType::F64,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(shape, ElemType::F64, None))
         }
-        Opcode::Div | Opcode::Min | Opcode::Max => {
+        Opcode::Min | Opcode::Max => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
             let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
             if meta_a.elem != ElemType::F64 || meta_b.elem != ElemType::F64 {
@@ -1182,12 +1385,7 @@ fn verify_node_semantics(
                 });
             }
             let shape = unify_elementwise_shapes(node_idx, meta_a.shape, meta_b.shape)?;
-            Ok(NodeMeta {
-                shape,
-                elem: ElemType::F64,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(shape, ElemType::F64, None))
         }
         Opcode::Fma => {
             let (in_b, in_c) = frame.decode_fma_bc();
@@ -1207,12 +1405,7 @@ fn verify_node_semantics(
             }
             let shape_ab = unify_elementwise_shapes(node_idx, meta_a.shape, meta_b.shape)?;
             let shape = unify_elementwise_shapes(node_idx, shape_ab, meta_c.shape)?;
-            Ok(NodeMeta {
-                shape,
-                elem: ElemType::F64,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(shape, ElemType::F64, None))
         }
         Opcode::Abs | Opcode::Sqrt | Opcode::Floor | Opcode::Ceil | Opcode::Ln | Opcode::Exp => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
@@ -1225,17 +1418,12 @@ fn verify_node_semantics(
                     },
                 });
             }
-            Ok(NodeMeta {
-                shape: meta_a.shape,
-                elem: ElemType::F64,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(meta_a.shape, ElemType::F64, None))
         }
         Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
             let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
-            if meta_a.elem == ElemType::I64 && meta_b.elem == ElemType::I64 {
+            if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) && meta_a.elem == meta_b.elem {
                 if meta_a.shape != ValueShape::Scalar || meta_b.shape != ValueShape::Scalar {
                     return Err(VerifyDiagnostic {
                         node_idx,
@@ -1267,16 +1455,15 @@ fn verify_node_semantics(
                         },
                     });
                 }
-                return Ok(NodeMeta {
-                    shape: ValueShape::Scalar,
-                    elem: ElemType::BoolMask,
-                    origin_arena: None,
-                    is_void: false,
-                });
+                return Ok(NodeMeta::value(
+                    ValueShape::Scalar,
+                    ElemType::BoolMask,
+                    None,
+                ));
             }
             if meta_a.elem != ElemType::F64 || meta_b.elem != ElemType::F64 {
-                let (expected, actual) = if meta_a.elem == ElemType::I64 {
-                    (ElemType::I64, meta_b.elem)
+                let (expected, actual) = if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) {
+                    (meta_a.elem, meta_b.elem)
                 } else {
                     (
                         ElemType::F64,
@@ -1293,12 +1480,310 @@ fn verify_node_semantics(
                 });
             }
             let shape = unify_elementwise_shapes(node_idx, meta_a.shape, meta_b.shape)?;
+            Ok(NodeMeta::value(shape, ElemType::BoolMask, None))
+        }
+        Opcode::CmpLtU => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("CmpLtU requires proof_idx == 0"),
+                });
+            }
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            if meta_a.elem != ElemType::I64 || meta_b.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: if meta_a.elem != ElemType::I64 {
+                            meta_a.elem
+                        } else {
+                            meta_b.elem
+                        },
+                    },
+                });
+            }
+            if meta_a.shape != ValueShape::Scalar || meta_b.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: meta_a.shape,
+                        right: if meta_a.shape != ValueShape::Scalar {
+                            ValueShape::Scalar
+                        } else {
+                            meta_b.shape
+                        },
+                    },
+                });
+            }
+            if frame.type_lane.elem != ElemType::BoolMask {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::BoolMask,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            Ok(NodeMeta::value(
+                ValueShape::Scalar,
+                ElemType::BoolMask,
+                None,
+            ))
+        }
+        Opcode::Rem
+        | Opcode::BitAnd
+        | Opcode::BitOr
+        | Opcode::BitXor
+        | Opcode::Shl
+        | Opcode::ShrU => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "integer bitwise/shift/rem opcode requires proof_idx == 0",
+                    ),
+                });
+            }
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            if !matches!(meta_a.elem, ElemType::I64 | ElemType::U8) || meta_a.elem != meta_b.elem {
+                let (expected, actual) = if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) {
+                    (meta_a.elem, meta_b.elem)
+                } else {
+                    (ElemType::I64, meta_a.elem)
+                };
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch { expected, actual },
+                });
+            }
+            let int_elem = meta_a.elem;
+            if meta_a.shape != ValueShape::Scalar || meta_b.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: meta_a.shape,
+                        right: if meta_a.shape != ValueShape::Scalar {
+                            ValueShape::Scalar
+                        } else {
+                            meta_b.shape
+                        },
+                    },
+                });
+            }
+            if frame.type_lane.elem != int_elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: int_elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            let nonneg_upper_bound = if frame.opcode == Opcode::BitAnd && int_elem == ElemType::I64
+            {
+                match (
+                    meta_a.const_i64.and_then(|v| u64::try_from(v).ok()),
+                    meta_b.const_i64.and_then(|v| u64::try_from(v).ok()),
+                ) {
+                    (Some(x), Some(y)) => Some(x.min(y)),
+                    (Some(x), None) => Some(x),
+                    (None, Some(y)) => Some(y),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
             Ok(NodeMeta {
-                shape,
-                elem: ElemType::BoolMask,
+                shape: ValueShape::Scalar,
+                elem: int_elem,
                 origin_arena: None,
                 is_void: false,
+                const_i64: None,
+                nonneg_upper_bound,
             })
+        }
+        Opcode::ShrS => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("ShrS requires proof_idx == 0"),
+                });
+            }
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            if meta_a.elem != ElemType::I64 || meta_b.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: if meta_a.elem != ElemType::I64 {
+                            meta_a.elem
+                        } else {
+                            meta_b.elem
+                        },
+                    },
+                });
+            }
+            if meta_a.shape != ValueShape::Scalar || meta_b.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: meta_a.shape,
+                        right: if meta_a.shape != ValueShape::Scalar {
+                            ValueShape::Scalar
+                        } else {
+                            meta_b.shape
+                        },
+                    },
+                });
+            }
+            if frame.type_lane.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            Ok(NodeMeta::value(ValueShape::Scalar, ElemType::I64, None))
+        }
+        Opcode::MaskNot => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "MaskNot requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            if meta_a.elem != ElemType::BoolMask {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::BoolMask,
+                        actual: meta_a.elem,
+                    },
+                });
+            }
+            if meta_a.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: meta_a.shape,
+                    },
+                });
+            }
+            if frame.type_lane.elem != ElemType::BoolMask {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::BoolMask,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            Ok(NodeMeta::value(
+                ValueShape::Scalar,
+                ElemType::BoolMask,
+                None,
+            ))
+        }
+        Opcode::Cast => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "Cast requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            if src_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: src_meta.shape,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            let dst_elem = frame.type_lane.elem;
+            let valid_pair = matches!(
+                (src_meta.elem, dst_elem),
+                (ElemType::I64, ElemType::U8)
+                    | (ElemType::U8, ElemType::I64)
+                    | (ElemType::F64, ElemType::I64)
+                    | (ElemType::F64, ElemType::U8)
+                    | (ElemType::I64, ElemType::F64)
+                    | (ElemType::U8, ElemType::F64)
+                    | (ElemType::BoolMask, ElemType::I64)
+            );
+            if !valid_pair {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: dst_elem,
+                        actual: src_meta.elem,
+                    },
+                });
+            }
+            Ok(NodeMeta::value(ValueShape::Scalar, dst_elem, None))
         }
         Opcode::MaskAnd | Opcode::MaskOr => {
             let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
@@ -1317,12 +1802,7 @@ fn verify_node_semantics(
                 });
             }
             let shape = unify_elementwise_shapes(node_idx, meta_a.shape, meta_b.shape)?;
-            Ok(NodeMeta {
-                shape,
-                elem: ElemType::BoolMask,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(shape, ElemType::BoolMask, None))
         }
         Opcode::SelectZero => {
             let mask_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
@@ -1337,12 +1817,7 @@ fn verify_node_semantics(
                 });
             }
             let shape = unify_elementwise_shapes(node_idx, mask_meta.shape, val_meta.shape)?;
-            Ok(NodeMeta {
-                shape,
-                elem: val_meta.elem,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(shape, val_meta.elem, None))
         }
         Opcode::FilterCompact => {
             let mask_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
@@ -1361,15 +1836,14 @@ fn verify_node_semantics(
                 ValueShape::Column(n) | ValueShape::Compacted { max_len: n, .. } => n,
                 ValueShape::Scalar => 1,
             };
-            Ok(NodeMeta {
-                shape: ValueShape::Compacted {
+            Ok(NodeMeta::value(
+                ValueShape::Compacted {
                     max_len,
                     mask_node: frame.in_a,
                 },
-                elem: val_meta.elem,
-                origin_arena: None,
-                is_void: false,
-            })
+                val_meta.elem,
+                None,
+            ))
         }
         Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin => {
             let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
@@ -1382,12 +1856,7 @@ fn verify_node_semantics(
                     },
                 });
             }
-            Ok(NodeMeta {
-                shape: ValueShape::Scalar,
-                elem: ElemType::F64,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(ValueShape::Scalar, ElemType::F64, None))
         }
         Opcode::Gather => {
             let target_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
@@ -1454,12 +1923,7 @@ fn verify_node_semantics(
                     },
                 });
             }
-            Ok(NodeMeta {
-                shape: idx_meta.shape,
-                elem: target_meta.elem,
-                origin_arena: None,
-                is_void: false,
-            })
+            Ok(NodeMeta::value(idx_meta.shape, target_meta.elem, None))
         }
         Opcode::RingEnqueue => {
             if (program.capability_mask & CAP_NET_RING) == 0 {
@@ -1472,11 +1936,19 @@ fn verify_node_semantics(
                 });
             }
             let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            Ok(src_meta)
+            Ok(NodeMeta::value(
+                src_meta.shape,
+                src_meta.elem,
+                src_meta.origin_arena,
+            ))
         }
         Opcode::AssertContract => {
             let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            Ok(src_meta)
+            Ok(NodeMeta::value(
+                src_meta.shape,
+                src_meta.elem,
+                src_meta.origin_arena,
+            ))
         }
         Opcode::Block => {
             require_pure_token(node_idx, frame)?;
@@ -1787,12 +2259,7 @@ fn verify_node_semantics(
                         },
                     });
                 }
-                NodeMeta {
-                    shape: ValueShape::Scalar,
-                    elem: res_tl.elem,
-                    origin_arena: None,
-                    is_void: false,
-                }
+                NodeMeta::value(ValueShape::Scalar, res_tl.elem, None)
             } else {
                 if frame.in_a != 0 || frame.in_b != 0 {
                     return Err(VerifyDiagnostic {
@@ -2090,6 +2557,287 @@ fn verify_node_semantics(
                         )?;
                     }
                 }
+            }
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::RegionNew => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("RegionNew requires proof_idx == 0"),
+                });
+            }
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            let len_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            if len_meta.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: len_meta.elem,
+                    },
+                });
+            }
+            if len_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: len_meta.shape,
+                    },
+                });
+            }
+            if frame.type_lane.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::RegionGrow => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("RegionGrow requires proof_idx == 0"),
+                });
+            }
+            let _decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            let add_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            if add_meta.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: add_meta.elem,
+                    },
+                });
+            }
+            if add_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: add_meta.shape,
+                    },
+                });
+            }
+            if frame.type_lane.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            Ok(NodeMeta::value(ValueShape::Scalar, ElemType::I64, None))
+        }
+        Opcode::RegionLen => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "RegionLen requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let _decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            if frame.type_lane.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            Ok(NodeMeta::value(ValueShape::Scalar, ElemType::I64, None))
+        }
+        Opcode::RegionLoad => {
+            require_pure_token(node_idx, frame)?;
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            let idx_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            if idx_meta.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: idx_meta.elem,
+                    },
+                });
+            }
+            if idx_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: idx_meta.shape,
+                    },
+                });
+            }
+            if frame.type_lane.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            if frame.proof_idx == 0 {
+                state.has_unproven_region_access = true;
+            } else {
+                verify_region_index_proof(program, node_idx, frame.proof_idx, decl, idx_meta)?;
+            }
+            Ok(NodeMeta::value(ValueShape::Scalar, decl.elem, None))
+        }
+        Opcode::RegionStore => {
+            require_pure_token(node_idx, frame)?;
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            let (idx_node, val_node) = frame.decode_u16_pair();
+            let idx_meta = get_prior_meta(node_idx, idx_node, metas, &state.node_visible)?;
+            if idx_meta.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: idx_meta.elem,
+                    },
+                });
+            }
+            if idx_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: idx_meta.shape,
+                    },
+                });
+            }
+            let val_meta = get_prior_meta(node_idx, val_node, metas, &state.node_visible)?;
+            if val_meta.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: val_meta.elem,
+                    },
+                });
+            }
+            if val_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: val_meta.shape,
+                    },
+                });
+            }
+            if frame.type_lane.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            if frame.proof_idx == 0 {
+                state.has_unproven_region_access = true;
+            } else {
+                verify_region_index_proof(program, node_idx, frame.proof_idx, decl, idx_meta)?;
+            }
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::RegionFree => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "RegionFree requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            if decl.min_len != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidRegionDecl {
+                        slot: decl.slot,
+                        reason: "RegionFree is only permitted when min_len == 0",
+                    },
+                });
+            }
+            if frame.type_lane.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
             }
             Ok(NodeMeta::VOID)
         }

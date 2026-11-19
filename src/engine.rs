@@ -10,7 +10,10 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::Instant;
 
-use crate::bytecode::{ElemType, ExecPolicy, NodeFrame, Opcode, RulProgram, ScheduleHint};
+use crate::bytecode::{
+    ElemType, ExecPolicy, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram,
+    ScheduleHint, MAX_REGION_SLOTS,
+};
 use crate::verifier::{verify_program, VerifyDiagnostic};
 
 /// L1-Cache Tile width (`1,024` `f64` elements = `8 KB`, fitting comfortably inside 32–48 KB L1d).
@@ -48,15 +51,125 @@ impl ArenaZoneMap {
     }
 }
 
+/// Typed scalar output pairing its static [`ElemType`] with its exact 64-bit little-endian bit pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypedScalar {
+    /// Element primitive type (`F64`, `I64`, `BoolMask`, or `U8`).
+    pub elem: ElemType,
+    /// Raw 64-bit little-endian bit pattern.
+    pub bits: u64,
+}
+
+impl TypedScalar {
+    /// Constructs a [`TypedScalar`] holding an `f64`.
+    #[must_use]
+    pub const fn f64(val: f64) -> Self {
+        Self {
+            elem: ElemType::F64,
+            bits: val.to_bits(),
+        }
+    }
+
+    /// Constructs a [`TypedScalar`] holding an `i64`.
+    #[must_use]
+    pub const fn i64(val: i64) -> Self {
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "preserving exact two's-complement 64-bit pattern of i64"
+        )]
+        let bits = val as u64;
+        Self {
+            elem: ElemType::I64,
+            bits,
+        }
+    }
+
+    /// Constructs a [`TypedScalar`] holding a zero-extended `u8`.
+    #[must_use]
+    pub const fn u8(val: u8) -> Self {
+        Self {
+            elem: ElemType::U8,
+            bits: val as u64,
+        }
+    }
+
+    /// Constructs a [`TypedScalar`] holding a `BoolMask` (`0` or `1`).
+    #[must_use]
+    pub const fn bool_mask(val: bool) -> Self {
+        Self {
+            elem: ElemType::BoolMask,
+            bits: val as u64,
+        }
+    }
+
+    /// Returns the value as `f64` if `self.elem == ElemType::F64`.
+    #[must_use]
+    pub const fn as_f64(self) -> Option<f64> {
+        if matches!(self.elem, ElemType::F64) {
+            Some(f64::from_bits(self.bits))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the value as `i64` if `self.elem == ElemType::I64`.
+    #[must_use]
+    pub const fn as_i64(self) -> Option<i64> {
+        if matches!(self.elem, ElemType::I64) {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "restoring exact two's-complement i64 from its 64-bit pattern"
+            )]
+            Some(self.bits as i64)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the value as `u8` if `self.elem == ElemType::U8`.
+    #[must_use]
+    pub const fn as_u8(self) -> Option<u8> {
+        if matches!(self.elem, ElemType::U8) {
+            Some((self.bits & 0xFF) as u8)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the value as `bool` if `self.elem == ElemType::BoolMask`.
+    #[must_use]
+    pub const fn as_bool(self) -> Option<bool> {
+        if matches!(self.elem, ElemType::BoolMask) {
+            Some(self.bits != 0)
+        } else {
+            None
+        }
+    }
+}
+
 /// Runtime value produced by evaluating a node in the `.rl` graph.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeValue {
     /// A single scalar `f64` result.
     Scalar(f64),
+    /// A typed non-`f64` scalar result (`I64`, `U8`, or `BoolMask`) with exact 64-bit pattern.
+    TypedScalar(TypedScalar),
     /// A columnar `f64` vector.
     ColumnF64(Vec<f64>),
     /// A columnar boolean mask.
     ColumnMask(Vec<bool>),
+}
+
+impl RuntimeValue {
+    /// Returns this runtime value as a [`TypedScalar`] if it is any scalar variant (`F64`, `I64`, `U8`, or `BoolMask`).
+    #[must_use]
+    pub const fn as_typed_scalar(&self) -> Option<TypedScalar> {
+        match self {
+            Self::Scalar(v) => Some(TypedScalar::f64(*v)),
+            Self::TypedScalar(ts) => Some(*ts),
+            Self::ColumnF64(_) | Self::ColumnMask(_) => None,
+        }
+    }
 }
 
 /// Internal zero-copy evaluation value used by Tier 0 and Tier 1.
@@ -65,6 +178,7 @@ enum EvalValue<'a> {
     Unused,
     Scalar(f64),
     ScalarI64(i64),
+    ScalarU8(u8),
     ScalarMask(bool),
     ColumnF64(Cow<'a, [f64]>),
     ColumnMask(Vec<bool>),
@@ -74,15 +188,9 @@ impl EvalValue<'_> {
     fn into_runtime_value(self, node_idx: u32) -> Result<RuntimeValue, ExecError> {
         match self {
             Self::Scalar(v) => Ok(RuntimeValue::Scalar(v)),
-            Self::ScalarI64(v) => {
-                #[expect(
-                    clippy::cast_sign_loss,
-                    reason = "scalar i64 output bit-pattern is plumbed losslessly via f64::from_bits(v as u64)"
-                )]
-                let raw_bits = v as u64;
-                Ok(RuntimeValue::Scalar(f64::from_bits(raw_bits)))
-            }
-            Self::ScalarMask(b) => Ok(RuntimeValue::Scalar(f64::from_bits(u64::from(b)))),
+            Self::ScalarI64(v) => Ok(RuntimeValue::TypedScalar(TypedScalar::i64(v))),
+            Self::ScalarU8(v) => Ok(RuntimeValue::TypedScalar(TypedScalar::u8(v))),
+            Self::ScalarMask(b) => Ok(RuntimeValue::TypedScalar(TypedScalar::bool_mask(b))),
             Self::ColumnF64(cow) => Ok(RuntimeValue::ColumnF64(cow.into_owned())),
             Self::ColumnMask(m) => Ok(RuntimeValue::ColumnMask(m)),
             Self::Unused => Err(ExecError::InvalidOperandState(node_idx)),
@@ -112,6 +220,8 @@ pub struct HardwareTelemetry {
 pub struct ExecutionReport {
     /// Primary scalar or columnar output value.
     pub output: RuntimeValue,
+    /// Byte output collected from the declared output region, if any.
+    pub output_bytes: Option<Vec<u8>>,
     /// Telemetry feedback for the AI Agent.
     pub telemetry: HardwareTelemetry,
 }
@@ -159,6 +269,32 @@ pub enum ExecError {
         /// Maximum permitted back-edge iterations (`bound_hi`).
         limit: u32,
     },
+    /// Checked integer division or remainder by zero or `i64::MIN / -1` (`AOT_EXIT_INT_DIV_ERR = 72`).
+    IntegerDivisionError {
+        /// Offending `Div` or `Rem` node index.
+        node_idx: u32,
+    },
+    /// Float-to-integer `Cast` received `NaN`, infinity, or an out-of-range value (`AOT_EXIT_CAST_ERR = 73`).
+    CastOutOfRange {
+        /// Offending `Cast` node index.
+        node_idx: u32,
+    },
+    /// Region allocation, reset, growth, or input pre-fill exceeded `[min_len, max_len]` or failed (`AOT_EXIT_REGION_OOM = 74`).
+    RegionAllocationFailed {
+        /// Target region slot.
+        slot: u32,
+    },
+    /// `RegionLoad` or `RegionStore` index fell outside `0..len` (`AOT_EXIT_GATHER_OOB = 71`).
+    RegionBoundsOutOfRange {
+        /// Offending `RegionLoad` or `RegionStore` node index.
+        node_idx: u32,
+        /// Target region slot.
+        slot: u32,
+        /// Observed index value.
+        index: i64,
+        /// Current region length.
+        len: usize,
+    },
 }
 
 impl fmt::Display for ExecError {
@@ -194,6 +330,25 @@ impl fmt::Display for ExecError {
             Self::LoopBoundExceeded { loop_node, limit } => write!(
                 f,
                 "loop bound exceeded at Loop node #{loop_node}: back-edge limit {limit} exhausted"
+            ),
+            Self::IntegerDivisionError { node_idx } => write!(
+                f,
+                "integer division or remainder error at node #{node_idx}"
+            ),
+            Self::CastOutOfRange { node_idx } => {
+                write!(f, "float-to-integer cast out of range at node #{node_idx}")
+            }
+            Self::RegionAllocationFailed { slot } => {
+                write!(f, "region allocation or length constraint failed for slot #{slot}")
+            }
+            Self::RegionBoundsOutOfRange {
+                node_idx,
+                slot,
+                index,
+                len,
+            } => write!(
+                f,
+                "region bounds out of range at node #{node_idx} (slot #{slot}): index={index}, len={len}"
             ),
         }
     }
@@ -270,7 +425,9 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::LocalGet
             | Opcode::Block
             | Opcode::Loop
-            | Opcode::Br => {}
+            | Opcode::Br
+            | Opcode::RegionLen
+            | Opcode::RegionFree => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt
@@ -278,6 +435,8 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Ceil
             | Opcode::Ln
             | Opcode::Exp
+            | Opcode::MaskNot
+            | Opcode::Cast
             | Opcode::ReduceSum
             | Opcode::ReduceMax
             | Opcode::ReduceMin
@@ -289,8 +448,21 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
                     *a = true;
                 }
             }
-            Opcode::ArenaMutate | Opcode::LocalSet => {
+            Opcode::ArenaMutate
+            | Opcode::LocalSet
+            | Opcode::RegionNew
+            | Opcode::RegionGrow
+            | Opcode::RegionLoad => {
                 if let Some(b) = live.get_mut(frame.in_b as usize) {
+                    *b = true;
+                }
+            }
+            Opcode::RegionStore => {
+                let (idx_node, val_node) = frame.decode_u16_pair();
+                if let Some(a) = live.get_mut(idx_node as usize) {
+                    *a = true;
+                }
+                if let Some(b) = live.get_mut(val_node as usize) {
                     *b = true;
                 }
             }
@@ -305,11 +477,19 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Sub
             | Opcode::Mul
             | Opcode::Div
+            | Opcode::Rem
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::ShrU
+            | Opcode::ShrS
             | Opcode::Min
             | Opcode::Max
             | Opcode::CmpGt
             | Opcode::CmpLt
             | Opcode::CmpEq
+            | Opcode::CmpLtU
             | Opcode::MaskAnd
             | Opcode::MaskOr
             | Opcode::SelectZero
@@ -343,13 +523,29 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
 ///
 /// Verifies the `.rl` program in $O(N)$ and evaluates each node sequentially using
 /// zero-copy `Cow<'a, [f64]>` borrows on `ArenaInput` and `ArenaSlice`, or executes
-/// structured WASM-style control flow and 64 typed scalar local slots when present.
+/// structured WASM-style control flow, 64 typed scalar local slots, and declared regions.
 ///
 /// # Errors
-/// Returns [`ExecError`] if verification, input binding, loop bounds, gather bounds, or contract assertions fail.
+/// Returns [`ExecError`] if verification, input binding, loop bounds, region bounds/allocation, integer division, casts, or contract assertions fail.
 pub fn execute_tier0_interpreter(
     program: &RulProgram,
     inputs: &[&[f64]],
+) -> Result<ExecutionReport, ExecError> {
+    execute_tier0_interpreter_with_input(program, inputs, &[])
+}
+
+/// **Tier 0 — Reference Interpreter with Caller-Supplied Byte Input Region**.
+///
+/// Pre-fills the declared `RegionRole::Input` region (if any) with `input_bytes` before node `#0`,
+/// and returns any declared `RegionRole::Output` region's bytes in [`ExecutionReport::output_bytes`].
+///
+/// # Errors
+/// Returns [`ExecError`] if verification or execution fails, including [`ExecError::RegionAllocationFailed`]
+/// if `input_bytes.len()` exceeds the input region's declared `max_len`.
+pub fn execute_tier0_interpreter_with_input(
+    program: &RulProgram,
+    inputs: &[&[f64]],
+    input_bytes: &[u8],
 ) -> Result<ExecutionReport, ExecError> {
     let t_verify = Instant::now();
     verify_program(program).map_err(ExecError::VerificationFailed)?;
@@ -358,8 +554,9 @@ pub fn execute_tier0_interpreter(
     let elements_processed = validate_inputs(program, inputs)?;
 
     let t_exec = Instant::now();
-    let (values, intermediate_bytes) = if program.uses_structured_control_or_locals() {
-        eval_structured_tier0(program, inputs)?
+    let (values, intermediate_bytes, output_bytes) = if program.uses_structured_control_or_locals()
+    {
+        eval_structured_tier0(program, inputs, input_bytes)?
     } else {
         let mut vals: Vec<EvalValue<'_>> = Vec::with_capacity(program.nodes.len());
         let mut inter_bytes = 0usize;
@@ -368,7 +565,7 @@ pub fn execute_tier0_interpreter(
             let val = eval_node_tier0(program, frame, node_idx, inputs, &vals, &mut inter_bytes)?;
             vals.push(val);
         }
-        (vals, inter_bytes)
+        (vals, inter_bytes, None)
     };
 
     let exec_ns = u64::try_from(t_exec.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -380,14 +577,193 @@ pub fn execute_tier0_interpreter(
 
     Ok(ExecutionReport {
         output,
+        output_bytes,
         telemetry: build_telemetry(verify_ns, exec_ns, elements_processed, intermediate_bytes),
     })
 }
 
+#[derive(Debug, Clone)]
+enum RegionStorage {
+    U8(Vec<u8>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+}
+
+impl RegionStorage {
+    fn alloc_zeroed(elem: ElemType, len: usize, slot: u32) -> Result<Self, ExecError> {
+        match elem {
+            ElemType::U8 => {
+                let mut v = Vec::new();
+                v.try_reserve_exact(len)
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                v.resize(len, 0);
+                Ok(Self::U8(v))
+            }
+            ElemType::I64 => {
+                let mut v = Vec::new();
+                v.try_reserve_exact(len)
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                v.resize(len, 0);
+                Ok(Self::I64(v))
+            }
+            ElemType::F64 => {
+                let mut v = Vec::new();
+                v.try_reserve_exact(len)
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                v.resize(len, 0.0);
+                Ok(Self::F64(v))
+            }
+            ElemType::BoolMask => Err(ExecError::RegionAllocationFailed { slot }),
+        }
+    }
+
+    fn alloc_u8_from_slice(bytes: &[u8], slot: u32) -> Result<Self, ExecError> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(bytes.len())
+            .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+        v.extend_from_slice(bytes);
+        Ok(Self::U8(v))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U8(v) => v.len(),
+            Self::I64(v) => v.len(),
+            Self::F64(v) => v.len(),
+        }
+    }
+
+    fn reset_zeroed(&mut self, new_len: usize, slot: u32) -> Result<(), ExecError> {
+        match self {
+            Self::U8(v) => {
+                if new_len > v.capacity() {
+                    *v = Vec::new();
+                    v.try_reserve_exact(new_len)
+                        .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                    v.resize(new_len, 0);
+                } else {
+                    v.clear();
+                    v.resize(new_len, 0);
+                }
+            }
+            Self::I64(v) => {
+                if new_len > v.capacity() {
+                    *v = Vec::new();
+                    v.try_reserve_exact(new_len)
+                        .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                    v.resize(new_len, 0);
+                } else {
+                    v.clear();
+                    v.resize(new_len, 0);
+                }
+            }
+            Self::F64(v) => {
+                if new_len > v.capacity() {
+                    *v = Vec::new();
+                    v.try_reserve_exact(new_len)
+                        .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                    v.resize(new_len, 0.0);
+                } else {
+                    v.clear();
+                    v.resize(new_len, 0.0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn grow_zeroed(&mut self, add_len: usize, slot: u32) -> Result<(), ExecError> {
+        match self {
+            Self::U8(v) => {
+                v.try_reserve(add_len)
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                v.resize(v.len() + add_len, 0);
+            }
+            Self::I64(v) => {
+                v.try_reserve(add_len)
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                v.resize(v.len() + add_len, 0);
+            }
+            Self::F64(v) => {
+                v.try_reserve(add_len)
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot })?;
+                v.resize(v.len() + add_len, 0.0);
+            }
+        }
+        Ok(())
+    }
+
+    fn free_storage(&mut self) {
+        match self {
+            Self::U8(v) => {
+                v.clear();
+                v.shrink_to_fit();
+            }
+            Self::I64(v) => {
+                v.clear();
+                v.shrink_to_fit();
+            }
+            Self::F64(v) => {
+                v.clear();
+                v.shrink_to_fit();
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Tier0Region {
+    min_len: usize,
+    max_len: usize,
+    storage: RegionStorage,
+}
+
+type StructuredTier0Output<'a> = (Vec<EvalValue<'a>>, usize, Option<Vec<u8>>);
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-function structured control-flow and declared-region reference interpreter"
+)]
 fn eval_structured_tier0<'a>(
     program: &RulProgram,
     inputs: &[&'a [f64]],
-) -> Result<(Vec<EvalValue<'a>>, usize), ExecError> {
+    input_bytes: &[u8],
+) -> Result<StructuredTier0Output<'a>, ExecError> {
+    let mut regions: [Option<Tier0Region>; MAX_REGION_SLOTS] = std::array::from_fn(|_i| None);
+    let mut output_region_slot: Option<usize> = None;
+    for proof in &program.proofs {
+        if proof.rule_kind != ProofRuleKind::RegionDecl {
+            continue;
+        }
+        let slot = usize::from(proof.target_arena);
+        let Some((elem, role)) = ProofEntry::decode_region_decl_witness(proof.witness_node) else {
+            return Err(ExecError::RegionAllocationFailed {
+                slot: u32::from(proof.target_arena),
+            });
+        };
+        let min_len = proof.bound_lo as usize;
+        let max_len = proof.bound_hi as usize;
+        let slot_u32 = u32::from(proof.target_arena);
+        let storage = if role == RegionRole::Input {
+            if input_bytes.len() > max_len {
+                return Err(ExecError::RegionAllocationFailed { slot: slot_u32 });
+            }
+            RegionStorage::alloc_u8_from_slice(input_bytes, slot_u32)?
+        } else {
+            if role == RegionRole::Output {
+                output_region_slot = Some(slot);
+            }
+            RegionStorage::alloc_zeroed(elem, min_len, slot_u32)?
+        };
+        if let Some(entry) = regions.get_mut(slot) {
+            *entry = Some(Tier0Region {
+                min_len,
+                max_len,
+                storage,
+            });
+        }
+    }
+
     let n = program.nodes.len();
     let mut if_to_else: Vec<Option<usize>> = vec![None; n];
     let mut else_to_if: Vec<usize> = vec![0; n];
@@ -626,6 +1002,182 @@ fn eval_structured_tier0<'a>(
                     pc += 1;
                 }
             }
+            Opcode::RegionNew => {
+                let slot_idx = frame.in_a as usize;
+                let len_val = values
+                    .get(frame.in_b as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let EvalValue::ScalarI64(len_i64) = *len_val else {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                };
+                let region = regions
+                    .get_mut(slot_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                let Ok(new_len) = usize::try_from(len_i64) else {
+                    return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                };
+                if new_len < region.min_len || new_len > region.max_len {
+                    return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                }
+                region.storage.reset_zeroed(new_len, frame.in_a)?;
+                pc += 1;
+            }
+            Opcode::RegionGrow => {
+                let slot_idx = frame.in_a as usize;
+                let add_val = values
+                    .get(frame.in_b as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let EvalValue::ScalarI64(add_i64) = *add_val else {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                };
+                let region = regions
+                    .get_mut(slot_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                let Ok(add_len) = usize::try_from(add_i64) else {
+                    return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                };
+                let Some(new_len) = region.storage.len().checked_add(add_len) else {
+                    return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                };
+                if new_len < region.min_len || new_len > region.max_len {
+                    return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                }
+                region.storage.grow_zeroed(add_len, frame.in_a)?;
+                let new_len_i64 = i64::try_from(new_len)
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = EvalValue::ScalarI64(new_len_i64);
+                pc += 1;
+            }
+            Opcode::RegionLen => {
+                let slot_idx = frame.in_a as usize;
+                let region = regions
+                    .get(slot_idx)
+                    .and_then(Option::as_ref)
+                    .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                let cur_len = i64::try_from(region.storage.len())
+                    .map_err(|_e| ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = EvalValue::ScalarI64(cur_len);
+                pc += 1;
+            }
+            Opcode::RegionLoad => {
+                let slot_idx = frame.in_a as usize;
+                let idx_val = values
+                    .get(frame.in_b as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let EvalValue::ScalarI64(idx_i64) = *idx_val else {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                };
+                let region = regions
+                    .get(slot_idx)
+                    .and_then(Option::as_ref)
+                    .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                let len = region.storage.len();
+                let Ok(idx_usize) = usize::try_from(idx_i64) else {
+                    return Err(ExecError::RegionBoundsOutOfRange {
+                        node_idx,
+                        slot: frame.in_a,
+                        index: idx_i64,
+                        len,
+                    });
+                };
+                let loaded = match &region.storage {
+                    RegionStorage::U8(v) => v.get(idx_usize).copied().map(EvalValue::ScalarU8),
+                    RegionStorage::I64(v) => v.get(idx_usize).copied().map(EvalValue::ScalarI64),
+                    RegionStorage::F64(v) => v.get(idx_usize).copied().map(EvalValue::Scalar),
+                }
+                .ok_or(ExecError::RegionBoundsOutOfRange {
+                    node_idx,
+                    slot: frame.in_a,
+                    index: idx_i64,
+                    len,
+                })?;
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = loaded;
+                pc += 1;
+            }
+            Opcode::RegionStore => {
+                let slot_idx = frame.in_a as usize;
+                let (idx_node, val_node) = frame.decode_u16_pair();
+                let idx_val = values
+                    .get(idx_node as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let EvalValue::ScalarI64(idx_i64) = *idx_val else {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                };
+                let store_val = values
+                    .get(val_node as usize)
+                    .cloned()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let region = regions
+                    .get_mut(slot_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                let len = region.storage.len();
+                let Ok(idx_usize) = usize::try_from(idx_i64) else {
+                    return Err(ExecError::RegionBoundsOutOfRange {
+                        node_idx,
+                        slot: frame.in_a,
+                        index: idx_i64,
+                        len,
+                    });
+                };
+                match (&mut region.storage, store_val) {
+                    (RegionStorage::U8(v), EvalValue::ScalarU8(b)) => {
+                        let dst =
+                            v.get_mut(idx_usize)
+                                .ok_or(ExecError::RegionBoundsOutOfRange {
+                                    node_idx,
+                                    slot: frame.in_a,
+                                    index: idx_i64,
+                                    len,
+                                })?;
+                        *dst = b;
+                    }
+                    (RegionStorage::I64(v), EvalValue::ScalarI64(x)) => {
+                        let dst =
+                            v.get_mut(idx_usize)
+                                .ok_or(ExecError::RegionBoundsOutOfRange {
+                                    node_idx,
+                                    slot: frame.in_a,
+                                    index: idx_i64,
+                                    len,
+                                })?;
+                        *dst = x;
+                    }
+                    (RegionStorage::F64(v), EvalValue::Scalar(x)) => {
+                        let dst =
+                            v.get_mut(idx_usize)
+                                .ok_or(ExecError::RegionBoundsOutOfRange {
+                                    node_idx,
+                                    slot: frame.in_a,
+                                    index: idx_i64,
+                                    len,
+                                })?;
+                        *dst = x;
+                    }
+                    _ => return Err(ExecError::InvalidOperandState(node_idx)),
+                }
+                pc += 1;
+            }
+            Opcode::RegionFree => {
+                let slot_idx = frame.in_a as usize;
+                let region = regions
+                    .get_mut(slot_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                region.storage.free_storage();
+                pc += 1;
+            }
             _ => {
                 let val = eval_node_tier0(
                     program,
@@ -644,7 +1196,17 @@ fn eval_structured_tier0<'a>(
         }
     }
 
-    Ok((values, intermediate_bytes))
+    let output_bytes = output_region_slot.and_then(|slot| {
+        regions
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .and_then(|r| match &mut r.storage {
+                RegionStorage::U8(v) => Some(std::mem::take(v)),
+                RegionStorage::I64(_) | RegionStorage::F64(_) => None,
+            })
+    });
+
+    Ok((values, intermediate_bytes, output_bytes))
 }
 
 fn step_branch_target(
@@ -736,7 +1298,13 @@ fn eval_node_tier0<'a>(
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             Ok(src)
         }
-        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Min | Opcode::Max => {
+        Opcode::Add
+        | Opcode::Sub
+        | Opcode::Mul
+        | Opcode::Div
+        | Opcode::Rem
+        | Opcode::Min
+        | Opcode::Max => {
             let left = values
                 .get(frame.in_a as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
@@ -744,6 +1312,52 @@ fn eval_node_tier0<'a>(
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
             eval_arith_tier0(frame.opcode, left, right, node_idx, intermediate_bytes)
+        }
+        Opcode::BitAnd
+        | Opcode::BitOr
+        | Opcode::BitXor
+        | Opcode::Shl
+        | Opcode::ShrU
+        | Opcode::ShrS => {
+            let left = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let right = values
+                .get(frame.in_b as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            eval_bitwise_tier0(frame.opcode, left, right, node_idx)
+        }
+        Opcode::MaskNot => {
+            let src = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let EvalValue::ScalarMask(b) = *src else {
+                return Err(ExecError::InvalidOperandState(node_idx));
+            };
+            Ok(EvalValue::ScalarMask(!b))
+        }
+        Opcode::Cast => {
+            let src = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            eval_cast_tier0(src, frame.type_lane.elem, node_idx)
+        }
+        Opcode::CmpLtU => {
+            let left = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let right = values
+                .get(frame.in_b as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let (EvalValue::ScalarI64(a), EvalValue::ScalarI64(b)) = (left, right) else {
+                return Err(ExecError::InvalidOperandState(node_idx));
+            };
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "CmpLtU compares 64-bit two's-complement bit patterns as unsigned u64"
+            )]
+            let res = (*a as u64) < (*b as u64);
+            Ok(EvalValue::ScalarMask(res))
         }
         Opcode::Fma => {
             let (in_b, in_c) = frame.decode_fma_bc();
@@ -783,6 +1397,14 @@ fn eval_node_tier0<'a>(
                     Ok(EvalValue::ScalarMask(cmp(*a, *b)))
                 }
                 (EvalValue::ScalarI64(a), EvalValue::ScalarI64(b)) => {
+                    let res = match frame.opcode {
+                        Opcode::CmpGt => *a > *b,
+                        Opcode::CmpLt => *a < *b,
+                        _ => *a == *b,
+                    };
+                    Ok(EvalValue::ScalarMask(res))
+                }
+                (EvalValue::ScalarU8(a), EvalValue::ScalarU8(b)) => {
                     let res = match frame.opcode {
                         Opcode::CmpGt => *a > *b,
                         Opcode::CmpLt => *a < *b,
@@ -852,6 +1474,9 @@ fn eval_node_tier0<'a>(
                 }
                 (EvalValue::ScalarMask(m), EvalValue::ScalarI64(v)) => {
                     Ok(EvalValue::ScalarI64(if *m { *v } else { 0 }))
+                }
+                (EvalValue::ScalarMask(m), EvalValue::ScalarU8(v)) => {
+                    Ok(EvalValue::ScalarU8(if *m { *v } else { 0 }))
                 }
                 (EvalValue::ScalarMask(m), EvalValue::ScalarMask(b)) => {
                     Ok(EvalValue::ScalarMask(*m && *b))
@@ -1004,7 +1629,117 @@ fn eval_node_tier0<'a>(
         | Opcode::Else
         | Opcode::End
         | Opcode::Br
-        | Opcode::BrIf => Err(ExecError::UnsupportedInColumnarTier),
+        | Opcode::BrIf
+        | Opcode::RegionNew
+        | Opcode::RegionGrow
+        | Opcode::RegionLen
+        | Opcode::RegionLoad
+        | Opcode::RegionStore
+        | Opcode::RegionFree => Err(ExecError::UnsupportedInColumnarTier),
+    }
+}
+
+fn eval_bitwise_tier0<'a>(
+    opcode: Opcode,
+    left: &EvalValue<'a>,
+    right: &EvalValue<'a>,
+    node_idx: u32,
+) -> Result<EvalValue<'a>, ExecError> {
+    match (left, right) {
+        (EvalValue::ScalarI64(a), EvalValue::ScalarI64(b)) => {
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "bitwise and logical shift operate on exact 64-bit two's-complement patterns"
+            )]
+            let (au, shift) = (*a as u64, ((*b as u64) & 63) as u32);
+            let res = match opcode {
+                Opcode::BitAnd => *a & *b,
+                Opcode::BitOr => *a | *b,
+                Opcode::BitXor => *a ^ *b,
+                Opcode::Shl => a.wrapping_shl(shift),
+                Opcode::ShrU => {
+                    #[expect(
+                        clippy::cast_possible_wrap,
+                        reason = "reinterpreting logical right-shifted u64 pattern as i64"
+                    )]
+                    let signed = (au >> shift) as i64;
+                    signed
+                }
+                Opcode::ShrS => a.wrapping_shr(shift),
+                _ => return Err(ExecError::InvalidOperandState(node_idx)),
+            };
+            Ok(EvalValue::ScalarI64(res))
+        }
+        (EvalValue::ScalarU8(a), EvalValue::ScalarU8(b)) => {
+            let shift = u32::from(*b & 7);
+            let res = match opcode {
+                Opcode::BitAnd => *a & *b,
+                Opcode::BitOr => *a | *b,
+                Opcode::BitXor => *a ^ *b,
+                Opcode::Shl => a.wrapping_shl(shift),
+                Opcode::ShrU => a.wrapping_shr(shift),
+                _ => return Err(ExecError::InvalidOperandState(node_idx)),
+            };
+            Ok(EvalValue::ScalarU8(res))
+        }
+        _ => Err(ExecError::InvalidOperandState(node_idx)),
+    }
+}
+
+fn eval_cast_tier0<'a>(
+    src: &EvalValue<'a>,
+    dst_elem: ElemType,
+    node_idx: u32,
+) -> Result<EvalValue<'a>, ExecError> {
+    match (src, dst_elem) {
+        (EvalValue::ScalarI64(v), ElemType::U8) => {
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "I64 -> U8 cast truncates to exact low 8 bits"
+            )]
+            let byte = (*v as u64 & 0xFF) as u8;
+            Ok(EvalValue::ScalarU8(byte))
+        }
+        (EvalValue::ScalarU8(v), ElemType::I64) => Ok(EvalValue::ScalarI64(i64::from(*v))),
+        (EvalValue::Scalar(x), ElemType::I64) => {
+            const MIN_F64: f64 = -9_223_372_036_854_775_808.0; // -2^63 (exact)
+            const MAX_EXCL_F64: f64 = 9_223_372_036_854_775_808.0; // +2^63 (exact)
+            if *x >= MIN_F64 && *x < MAX_EXCL_F64 {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "bounds-checked strictly within [-2^63, 2^63) before truncating toward zero"
+                )]
+                let val = x.trunc() as i64;
+                Ok(EvalValue::ScalarI64(val))
+            } else {
+                Err(ExecError::CastOutOfRange { node_idx })
+            }
+        }
+        (EvalValue::Scalar(x), ElemType::U8) => {
+            let t = x.trunc();
+            if t.is_finite() && (0.0..=255.0).contains(&t) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "bounds-checked strictly within [0.0, 255.0] after truncating toward zero"
+                )]
+                let val = t as u8;
+                Ok(EvalValue::ScalarU8(val))
+            } else {
+                Err(ExecError::CastOutOfRange { node_idx })
+            }
+        }
+        (EvalValue::ScalarI64(v), ElemType::F64) => {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "I64 -> F64 cast rounds to IEEE-754 nearest-even by specification"
+            )]
+            let f = *v as f64;
+            Ok(EvalValue::Scalar(f))
+        }
+        (EvalValue::ScalarU8(v), ElemType::F64) => Ok(EvalValue::Scalar(f64::from(*v))),
+        (EvalValue::ScalarMask(b), ElemType::I64) => Ok(EvalValue::ScalarI64(i64::from(*b))),
+        _ => Err(ExecError::InvalidOperandState(node_idx)),
     }
 }
 
@@ -1020,6 +1755,30 @@ fn eval_arith_tier0<'a>(
             Opcode::Add => Ok(EvalValue::ScalarI64(a.wrapping_add(*b))),
             Opcode::Sub => Ok(EvalValue::ScalarI64(a.wrapping_sub(*b))),
             Opcode::Mul => Ok(EvalValue::ScalarI64(a.wrapping_mul(*b))),
+            Opcode::Div => a
+                .checked_div(*b)
+                .map(EvalValue::ScalarI64)
+                .ok_or(ExecError::IntegerDivisionError { node_idx }),
+            Opcode::Rem => a
+                .checked_rem(*b)
+                .map(EvalValue::ScalarI64)
+                .ok_or(ExecError::IntegerDivisionError { node_idx }),
+            _ => Err(ExecError::InvalidOperandState(node_idx)),
+        };
+    }
+    if let (EvalValue::ScalarU8(a), EvalValue::ScalarU8(b)) = (left, right) {
+        return match opcode {
+            Opcode::Add => Ok(EvalValue::ScalarU8(a.wrapping_add(*b))),
+            Opcode::Sub => Ok(EvalValue::ScalarU8(a.wrapping_sub(*b))),
+            Opcode::Mul => Ok(EvalValue::ScalarU8(a.wrapping_mul(*b))),
+            Opcode::Div => a
+                .checked_div(*b)
+                .map(EvalValue::ScalarU8)
+                .ok_or(ExecError::IntegerDivisionError { node_idx }),
+            Opcode::Rem => a
+                .checked_rem(*b)
+                .map(EvalValue::ScalarU8)
+                .ok_or(ExecError::IntegerDivisionError { node_idx }),
             _ => Err(ExecError::InvalidOperandState(node_idx)),
         };
     }
@@ -1208,6 +1967,7 @@ pub fn execute_tier1_stencil(
 
     Ok(ExecutionReport {
         output,
+        output_bytes: None,
         telemetry: build_telemetry(verify_ns, exec_ns, elements_processed, intermediate_bytes),
     })
 }
@@ -1259,6 +2019,7 @@ pub fn execute_tier2_with_zonemap(
 
         return Ok(ExecutionReport {
             output: RuntimeValue::Scalar(scalar_out),
+            output_bytes: None,
             telemetry: build_telemetry(verify_ns, exec_ns, elements_processed, 0),
         });
     }
@@ -1505,13 +2266,29 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
             | Opcode::ConstI64
             | Opcode::LocalGet
             | Opcode::LocalSet
+            | Opcode::MaskNot
+            | Opcode::Cast
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::ShrU
+            | Opcode::Rem
+            | Opcode::ShrS
+            | Opcode::CmpLtU
             | Opcode::Block
             | Opcode::Loop
             | Opcode::If
             | Opcode::Else
             | Opcode::End
             | Opcode::Br
-            | Opcode::BrIf => return None,
+            | Opcode::BrIf
+            | Opcode::RegionNew
+            | Opcode::RegionGrow
+            | Opcode::RegionLen
+            | Opcode::RegionLoad
+            | Opcode::RegionStore
+            | Opcode::RegionFree => return None,
         };
         if let Some(slot) = phases.get_mut(idx) {
             *slot = phase;
@@ -2502,6 +3279,7 @@ fn values_approx_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
             let scale = x.abs().max(y.abs()).max(1.0);
             diff / scale <= 1e-9
         }
+        (RuntimeValue::TypedScalar(x), RuntimeValue::TypedScalar(y)) => x == y,
         (RuntimeValue::ColumnF64(xs), RuntimeValue::ColumnF64(ys)) => {
             if xs.len() != ys.len() {
                 return false;
@@ -2656,7 +3434,7 @@ pub fn trace_program(
     let t_exec = Instant::now();
     let mut entries: Vec<NodeTraceEntry> = Vec::with_capacity(program.nodes.len());
     let (values, intermediate_bytes) = if program.uses_structured_control_or_locals() {
-        let (vals, inter_bytes) = eval_structured_tier0(program, inputs)?;
+        let (vals, inter_bytes, _out_bytes) = eval_structured_tier0(program, inputs, &[])?;
         for (idx, frame) in program.nodes.iter().enumerate() {
             let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
             let is_live = live.get(idx).copied().unwrap_or(false);
@@ -2722,6 +3500,21 @@ fn summarize_eval_value(
                 opcode,
                 is_live,
                 value_kind: "ScalarI64",
+                element_count: 1,
+                min_val: approx,
+                max_val: approx,
+                sum_or_true_count: approx,
+                nan_or_inf_count: 0,
+                sample_head: vec![approx],
+            }
+        }
+        EvalValue::ScalarU8(v) => {
+            let approx = f64::from(*v);
+            NodeTraceEntry {
+                node_idx,
+                opcode,
+                is_live,
+                value_kind: "ScalarU8",
                 element_count: 1,
                 min_val: approx,
                 max_val: approx,

@@ -7,13 +7,15 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use crate::bytecode::{ElemType, Opcode, RulProgram};
+use crate::bytecode::{
+    ElemType, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram, MAX_REGION_SLOTS,
+};
 use crate::verifier::{verify_program, ValueShape, VerifiedSummary, VerifyDiagnostic};
 
 /// Base virtual address for the standalone `x86_64` `ELF64` executable.
@@ -25,10 +27,16 @@ const ELF_PHDR_SIZE: usize = 56;
 /// Offset where machine code entry `_start` begins (`64 + 56 = 120`).
 const ELF_CODE_OFFSET: usize = ELF_EHDR_SIZE + ELF_PHDR_SIZE;
 
-/// Exit status code emitted by the standalone ELF binary when `AssertContract` fails (`NaN`/`Inf`).
+/// Exit status code emitted by the standalone ELF binary when `AssertContract` fails (`NaN`/`Inf`) or a bounded loop exceeds `LoopBound`.
 pub const AOT_EXIT_CONTRACT_FAILED: i32 = 70;
-/// Exit status code emitted by the standalone ELF binary when `Gather` index is out of bounds.
+/// Exit status code emitted by the standalone ELF binary when `Gather` or `RegionLoad`/`RegionStore` index is out of bounds.
 pub const AOT_EXIT_GATHER_OOB: i32 = 71;
+/// Exit status code emitted by the standalone ELF binary on checked integer division/remainder by zero or `i64::MIN / -1`.
+pub const AOT_EXIT_INT_DIV_ERR: i32 = 72;
+/// Exit status code emitted by the standalone ELF binary on `NaN` or out-of-range float-to-integer `Cast`.
+pub const AOT_EXIT_CAST_ERR: i32 = 73;
+/// Exit status code emitted by the standalone ELF binary on region allocation/capacity/length failure.
+pub const AOT_EXIT_REGION_OOM: i32 = 74;
 
 /// Report returned after compiling a `.rl` program into a standalone native executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,8 +66,14 @@ pub enum AotError {
     Io(std::io::Error),
     /// `AssertContract` detected a non-finite (`NaN`/`Inf`) scalar output in the native binary.
     ContractAssertionFailed,
-    /// `Gather` index out-of-bounds detected by the native binary.
+    /// `Gather` or `RegionLoad`/`RegionStore` index out-of-bounds detected by the native binary (`exit 71`).
     GatherOutOfBounds,
+    /// Checked integer division or remainder fault detected by the native binary (`exit 72`).
+    IntegerDivisionError,
+    /// Float-to-integer `Cast` out-of-range or `NaN` fault detected by the native binary (`exit 73`).
+    CastOutOfRange,
+    /// Region allocation, growth, reset, or input size limit failure detected by the native binary (`exit 74`).
+    RegionAllocationFailed,
     /// Native binary exited with a non-zero status code or invalid output.
     ExecutionFailed(String),
 }
@@ -77,7 +91,28 @@ impl fmt::Display for AotError {
                 )
             }
             Self::GatherOutOfBounds => {
-                write!(f, "AOT native binary detected out-of-bounds Gather index")
+                write!(
+                    f,
+                    "AOT native binary detected out-of-bounds Gather or Region index"
+                )
+            }
+            Self::IntegerDivisionError => {
+                write!(
+                    f,
+                    "AOT native binary detected integer division or remainder error"
+                )
+            }
+            Self::CastOutOfRange => {
+                write!(
+                    f,
+                    "AOT native binary detected out-of-range float-to-integer Cast"
+                )
+            }
+            Self::RegionAllocationFailed => {
+                write!(
+                    f,
+                    "AOT native binary detected region allocation or length limit failure"
+                )
             }
             Self::ExecutionFailed(msg) => write!(f, "AOT native execution failed: {msg}"),
         }
@@ -498,15 +533,31 @@ pub fn compile_to_elf64_bytes(
             Opcode::ConstI64
             | Opcode::LocalGet
             | Opcode::LocalSet
+            | Opcode::MaskNot
+            | Opcode::Cast
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::ShrU
+            | Opcode::Rem
+            | Opcode::ShrS
+            | Opcode::CmpLtU
             | Opcode::Block
             | Opcode::Loop
             | Opcode::If
             | Opcode::Else
             | Opcode::End
             | Opcode::Br
-            | Opcode::BrIf => {
+            | Opcode::BrIf
+            | Opcode::RegionNew
+            | Opcode::RegionGrow
+            | Opcode::RegionLen
+            | Opcode::RegionLoad
+            | Opcode::RegionStore
+            | Opcode::RegionFree => {
                 return Err(AotError::UnsupportedGraph(
-                    "structured control-flow opcode reached columnar AOT pipeline",
+                    "structured control-flow or region opcode reached columnar AOT pipeline",
                 ));
             }
         };
@@ -611,13 +662,29 @@ pub fn compile_to_elf64_bytes(
             | Opcode::ConstI64
             | Opcode::LocalGet
             | Opcode::LocalSet
+            | Opcode::MaskNot
+            | Opcode::Cast
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::ShrU
+            | Opcode::Rem
+            | Opcode::ShrS
+            | Opcode::CmpLtU
             | Opcode::Block
             | Opcode::Loop
             | Opcode::If
             | Opcode::Else
             | Opcode::End
             | Opcode::Br
-            | Opcode::BrIf => {}
+            | Opcode::BrIf
+            | Opcode::RegionNew
+            | Opcode::RegionGrow
+            | Opcode::RegionLen
+            | Opcode::RegionLoad
+            | Opcode::RegionStore
+            | Opcode::RegionFree => {}
         }
     }
 
@@ -777,17 +844,31 @@ pub fn run_compiled_executable(
     Ok(f64::from_le_bytes(bytes))
 }
 
-/// Executes a compiled standalone scalar Rul `ELF64` binary (requiring no arena data file)
-/// and reads back its 8-byte scalar output bit-pattern as `f64`.
+/// Executes a compiled standalone structured Rul `ELF64` binary with caller-supplied `stdin_bytes`
+/// and returns its raw `stdout` bytes (either the 8-byte scalar bit pattern or the declared output region's bytes).
+///
+/// Fails closed if the binary exits with a non-zero status or writes any bytes to stdout on a fail-closed exit.
 ///
 /// # Errors
-/// Returns [`AotError`] if the process exits with a contract/loop-bound violation (`70`) or I/O fails.
-pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64, AotError> {
+/// Returns [`AotError`] matching exit codes `70..=74`, I/O errors, or unexpected exit status.
+pub fn run_compiled_structured_executable(
+    exe_path: impl AsRef<Path>,
+    stdin_bytes: &[u8],
+) -> Result<Vec<u8>, AotError> {
     let exe_ref = exe_path.as_ref();
     let mut attempt = 0u32;
-    let output = loop {
-        match Command::new(exe_ref).output() {
-            Ok(out) => break out,
+    let mut child = loop {
+        match Command::new(exe_ref)
+            .stdin(if stdin_bytes.is_empty() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => break child,
             Err(e) if e.raw_os_error() == Some(26) && attempt < 32 => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_micros(250));
@@ -796,10 +877,48 @@ pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64,
         }
     };
 
+    // Write stdin on a scoped thread while the main thread drains stdout/stderr via
+    // `wait_with_output()`, preventing pipe-buffer deadlock when both stdin and stdout exceed 64 KiB
+    // (including when an output-only binary never reads stdin).
+    let child_stdin = child.stdin.take();
+    let (write_res, wait_res) = std::thread::scope(|s| {
+        let writer = child_stdin.map(|mut stdin| {
+            s.spawn(move || -> Result<(), std::io::Error> {
+                if let Err(e) = stdin.write_all(stdin_bytes) {
+                    if e.kind() != ErrorKind::BrokenPipe {
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            })
+        });
+        let wait_out = child.wait_with_output();
+        let write_out = match writer {
+            Some(handle) => match handle.join() {
+                Ok(res) => res,
+                Err(_) => Ok(()),
+            },
+            None => Ok(()),
+        };
+        (write_out, wait_out)
+    });
+    write_res.map_err(AotError::Io)?;
+    let output = wait_res.map_err(AotError::Io)?;
+
     if !output.status.success() {
+        if !output.stdout.is_empty() {
+            return Err(AotError::ExecutionFailed(format!(
+                "standalone binary wrote {} unexpected stdout bytes on fail-closed exit {:?}",
+                output.stdout.len(),
+                output.status.code()
+            )));
+        }
         match output.status.code() {
             Some(AOT_EXIT_CONTRACT_FAILED) => return Err(AotError::ContractAssertionFailed),
             Some(AOT_EXIT_GATHER_OOB) => return Err(AotError::GatherOutOfBounds),
+            Some(AOT_EXIT_INT_DIV_ERR) => return Err(AotError::IntegerDivisionError),
+            Some(AOT_EXIT_CAST_ERR) => return Err(AotError::CastOutOfRange),
+            Some(AOT_EXIT_REGION_OOM) => return Err(AotError::RegionAllocationFailed),
             other => {
                 return Err(AotError::ExecutionFailed(format!(
                     "standalone binary exited with status {other:?}"
@@ -808,10 +927,20 @@ pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64,
         }
     }
 
-    let bytes: [u8; 8] = output.stdout.as_slice().try_into().map_err(|_e| {
+    Ok(output.stdout)
+}
+
+/// Executes a compiled standalone scalar Rul `ELF64` binary (requiring no arena data file)
+/// and reads back its 8-byte scalar output bit-pattern as `f64`.
+///
+/// # Errors
+/// Returns [`AotError`] if the process exits with a fail-closed status (`70..=74`) or I/O fails.
+pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64, AotError> {
+    let stdout = run_compiled_structured_executable(exe_path, &[])?;
+    let bytes: [u8; 8] = stdout.as_slice().try_into().map_err(|_e| {
         AotError::ExecutionFailed(format!(
             "expected 8-byte scalar output on stdout, got {} bytes",
-            output.stdout.len()
+            stdout.len()
         ))
     })?;
     Ok(f64::from_le_bytes(bytes))
@@ -930,13 +1059,648 @@ fn emit_loop_backedge_jump(
     patch_rel32(code, patch_pos, body_start_offset)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AotRegionDecl {
+    min_len: u64,
+    max_len: u64,
+    elem: ElemType,
+    role: RegionRole,
+}
+
+const fn align_up_4096(bytes: u64) -> u64 {
+    bytes.div_ceil(4096).saturating_mul(4096)
+}
+
+fn sc_region_off(slot: usize, field_off: i32) -> i32 {
+    let slot_i32 = i32::try_from(slot).unwrap_or(0);
+    slot_i32.saturating_mul(32).saturating_add(field_off)
+}
+
+fn emit_movabs_reg(code: &mut Vec<u8>, reg: u8, val: u64) {
+    let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 };
+    code.push(rex);
+    code.push(0xB8 + (reg & 7));
+    code.extend_from_slice(&val.to_le_bytes());
+}
+
+fn emit_load_reg_r15(code: &mut Vec<u8>, reg: u8, disp: i32) {
+    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
+    let modrm = 0x87 | ((reg & 7) << 3);
+    code.extend_from_slice(&[rex, 0x8B, modrm]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_store_r15_reg(code: &mut Vec<u8>, reg: u8, disp: i32) {
+    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
+    let modrm = 0x87 | ((reg & 7) << 3);
+    code.extend_from_slice(&[rex, 0x89, modrm]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+fn emit_cmp_reg_r15(code: &mut Vec<u8>, reg: u8, disp: i32) {
+    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
+    let modrm = 0x87 | ((reg & 7) << 3);
+    code.extend_from_slice(&[rex, 0x3B, modrm]);
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+/// Emits `SYS_mmap(NULL, rsi, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`
+/// and fails closed with exit `74` if the kernel returns an error (`rax >= -4095`).
+fn emit_sc_sys_mmap_anon(code: &mut Vec<u8>) {
+    // xor edi, edi
+    code.extend_from_slice(&[0x31, 0xFF]);
+    // mov edx, 3 (PROT_READ | PROT_WRITE)
+    code.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]);
+    // mov r10d, 0x22 (MAP_PRIVATE | MAP_ANONYMOUS)
+    code.extend_from_slice(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]);
+    // mov r8, -1
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // xor r9d, r9d
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]);
+    // mov eax, 9 (SYS_mmap)
+    code.extend_from_slice(&[0xB8, 0x09, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // cmp rax, -4095; jb +12 (skip exit(74))
+    code.extend_from_slice(&[0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF, 0x72, 0x0C]);
+    emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+}
+
+/// Emits `SYS_mremap(rdi, rsi, rdx, MREMAP_MAYMOVE=1, 0)` and fails closed with exit `74` on error.
+fn emit_sc_sys_mremap(code: &mut Vec<u8>) {
+    // mov r10d, 1 (MREMAP_MAYMOVE)
+    code.extend_from_slice(&[0x41, 0xBA, 0x01, 0x00, 0x00, 0x00]);
+    // xor r8d, r8d
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]);
+    // mov eax, 25 (SYS_mremap)
+    code.extend_from_slice(&[0xB8, 0x19, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // cmp rax, -4095; jb +12 (skip exit(74))
+    code.extend_from_slice(&[0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF, 0x72, 0x0C]);
+    emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+}
+
+/// Emits `SYS_munmap(rdi, rsi)`.
+fn emit_sc_sys_munmap(code: &mut Vec<u8>) {
+    // mov eax, 11 (SYS_munmap)
+    code.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Allocates the 4096-byte program-global region table in `r15`, maps all `min_len > 0` regions,
+/// and reads stdin to EOF into the declared `RegionRole::Input` region if present.
+fn emit_sc_region_startup(
+    code: &mut Vec<u8>,
+    regions: &[Option<AotRegionDecl>; MAX_REGION_SLOTS],
+) -> Result<(), AotError> {
+    // Allocate 1 page (4096 bytes) for 64 x 32-byte region descriptors `(base, len, cap, pad)`.
+    // mov esi, 4096
+    code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]);
+    emit_sc_sys_mmap_anon(code);
+    // mov r15, rax
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+
+    for (slot, opt_decl) in regions.iter().enumerate() {
+        let Some(decl) = *opt_decl else {
+            continue;
+        };
+        let off_base = sc_region_off(slot, 0);
+        let off_len = sc_region_off(slot, 8);
+        let off_cap = sc_region_off(slot, 16);
+
+        if decl.role == RegionRole::Input {
+            if decl.max_len == 0 {
+                // Verify stdin is immediately at EOF; any byte exceeds max_len == 0 -> exit(74).
+                let probe_pos = code.len();
+                // xor edi, edi
+                code.extend_from_slice(&[0x31, 0xFF]);
+                // lea rsi, [rbp + SC_STDOUT_DISP]
+                code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+                code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
+                // mov edx, 1
+                code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+                // xor eax, eax (SYS_read)
+                code.extend_from_slice(&[0x31, 0xC0]);
+                // syscall
+                code.extend_from_slice(&[0x0F, 0x05]);
+                // cmp rax, -4 (EINTR); je probe_pos
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]);
+                code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                let eintr_patch = code.len() - 4;
+                patch_rel32(code, eintr_patch, probe_pos)?;
+                // test rax, rax; jz +12 (EOF -> ok); else exit(74)
+                code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x74, 0x0C]);
+                emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+            } else {
+                let max_cap = align_up_4096(decl.max_len);
+                // r12 = cur_len, r13 = cur_cap, r14 = cur_base
+                code.extend_from_slice(&[0x45, 0x31, 0xE4]); // xor r12d, r12d
+                code.extend_from_slice(&[0x45, 0x31, 0xED]); // xor r13d, r13d
+                code.extend_from_slice(&[0x45, 0x31, 0xF6]); // xor r14d, r14d
+
+                let read_loop_pos = code.len();
+                emit_movabs_reg(code, 0, decl.max_len);
+                // cmp r12, rax; jb not_full
+                code.extend_from_slice(&[0x49, 0x39, 0xC4]);
+                code.extend_from_slice(&[0x0F, 0x82, 0x00, 0x00, 0x00, 0x00]);
+                let not_full_patch = code.len() - 4;
+
+                // cur_len == max_len: probe 1 byte for EOF.
+                let probe_eof_pos = code.len();
+                code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+                code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+                code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
+                code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+                code.extend_from_slice(&[0x31, 0xC0, 0x0F, 0x05]); // xor eax, eax; syscall
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4
+                code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                let probe_eintr_patch = code.len() - 4;
+                patch_rel32(code, probe_eintr_patch, probe_eof_pos)?;
+                // test rax, rax; jz input_done; else exit(74)
+                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                let probe_done_patch = code.len() - 4;
+                emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+
+                let not_full_pos = code.len();
+                patch_rel32(code, not_full_patch, not_full_pos)?;
+
+                // cmp r12, r13; jb have_cap
+                code.extend_from_slice(&[0x4D, 0x39, 0xEC]);
+                code.extend_from_slice(&[0x0F, 0x82, 0x00, 0x00, 0x00, 0x00]);
+                let have_cap_patch_1 = code.len() - 4;
+
+                // Need capacity: if r13 == 0 map initial 4096B, else mremap doubling up to max_cap.
+                code.extend_from_slice(&[0x4D, 0x85, 0xED]); // test r13, r13
+                code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                let grow_mremap_patch = code.len() - 4;
+
+                // Initial 4096-byte page
+                code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+                emit_sc_sys_mmap_anon(code);
+                code.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax
+                code.extend_from_slice(&[0x41, 0xBD, 0x00, 0x10, 0x00, 0x00]); // mov r13d, 4096
+                code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                let have_cap_patch_2 = code.len() - 4;
+
+                let grow_mremap_pos = code.len();
+                patch_rel32(code, grow_mremap_patch, grow_mremap_pos)?;
+                code.extend_from_slice(&[0x4C, 0x89, 0xEA]); // mov rdx, r13
+                code.extend_from_slice(&[0x48, 0xD1, 0xE2]); // shl rdx, 1
+                emit_movabs_reg(code, 0, max_cap);
+                // cmp rdx, rax; cmova rdx, rax
+                code.extend_from_slice(&[0x48, 0x39, 0xC2, 0x48, 0x0F, 0x47, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx
+                code.extend_from_slice(&[0x4C, 0x89, 0xF7]); // mov rdi, r14
+                code.extend_from_slice(&[0x4C, 0x89, 0xEE]); // mov rsi, r13
+                emit_sc_sys_mremap(code);
+                code.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax
+                code.extend_from_slice(&[0x49, 0x89, 0xDD]); // mov r13, rbx
+
+                let have_cap_pos = code.len();
+                patch_rel32(code, have_cap_patch_1, have_cap_pos)?;
+                patch_rel32(code, have_cap_patch_2, have_cap_pos)?;
+
+                // avail = min(r13, max_len) - r12
+                emit_movabs_reg(code, 2, decl.max_len); // movabs rdx, max_len
+                code.extend_from_slice(&[0x49, 0x39, 0xD5, 0x49, 0x0F, 0x42, 0xD5]); // cmp r13, rdx; cmovb rdx, r13
+                code.extend_from_slice(&[0x4C, 0x29, 0xE2]); // sub rdx, r12
+                code.extend_from_slice(&[0x4C, 0x89, 0xF6]); // mov rsi, r14
+                code.extend_from_slice(&[0x4C, 0x01, 0xE6]); // add rsi, r12
+                code.extend_from_slice(&[0x31, 0xFF, 0x31, 0xC0, 0x0F, 0x05]); // xor edi, edi; xor eax, eax; syscall
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4
+                code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                let read_eintr_patch = code.len() - 4;
+                patch_rel32(code, read_eintr_patch, read_loop_pos)?;
+                // test rax, rax; jns +12; exit(74)
+                code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x79, 0x0C]);
+                emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+                // jz input_done
+                code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                let read_done_patch = code.len() - 4;
+                code.extend_from_slice(&[0x49, 0x01, 0xC4]); // add r12, rax
+                code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                let loop_back_patch = code.len() - 4;
+                patch_rel32(code, loop_back_patch, read_loop_pos)?;
+
+                let input_done_pos = code.len();
+                patch_rel32(code, probe_done_patch, input_done_pos)?;
+                patch_rel32(code, read_done_patch, input_done_pos)?;
+
+                emit_store_r15_reg(code, 14, off_base);
+                emit_store_r15_reg(code, 12, off_len);
+                emit_store_r15_reg(code, 13, off_cap);
+            }
+        } else if decl.min_len > 0 {
+            let elem_bytes = decl.elem.region_elem_bytes() as u64;
+            let init_cap = align_up_4096(decl.min_len.saturating_mul(elem_bytes));
+            emit_movabs_reg(code, 6, init_cap); // rsi = init_cap
+            emit_sc_sys_mmap_anon(code);
+            emit_store_r15_reg(code, 0, off_base); // base_ptr = rax
+            emit_movabs_reg(code, 0, decl.min_len);
+            emit_store_r15_reg(code, 0, off_len); // len_elems = min_len
+            emit_movabs_reg(code, 0, init_cap);
+            emit_store_r15_reg(code, 0, off_cap); // cap_bytes = init_cap
+        }
+    }
+    Ok(())
+}
+
+fn emit_sc_region_new(
+    code: &mut Vec<u8>,
+    slot: usize,
+    decl: AotRegionDecl,
+    disp_b: i32,
+) -> Result<(), AotError> {
+    let off_base = sc_region_off(slot, 0);
+    let off_len = sc_region_off(slot, 8);
+    let off_cap = sc_region_off(slot, 16);
+    let elem_bytes = decl.elem.region_elem_bytes();
+
+    // mov r12, [rbp + disp_b] (new_len)
+    code.extend_from_slice(&[0x4C, 0x8B, 0xA5]);
+    code.extend_from_slice(&disp_b.to_le_bytes());
+
+    if decl.min_len > 0 {
+        emit_movabs_reg(code, 0, decl.min_len);
+        // cmp r12, rax; jae +12; exit(74)
+        code.extend_from_slice(&[0x49, 0x39, 0xC4, 0x73, 0x0C]);
+        emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+    }
+    emit_movabs_reg(code, 0, decl.max_len);
+    // cmp r12, rax; jbe +12; exit(74) (also rejects negative i64 since high bit is set!)
+    code.extend_from_slice(&[0x49, 0x39, 0xC4, 0x76, 0x0C]);
+    emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+
+    // rbx = needed_bytes = r12 * elem_bytes
+    code.extend_from_slice(&[0x4C, 0x89, 0xE3]); // mov rbx, r12
+    if elem_bytes == 8 {
+        code.extend_from_slice(&[0x48, 0xC1, 0xE3, 0x03]); // shl rbx, 3
+    }
+
+    // rsi = old_cap
+    emit_load_reg_r15(code, 6, off_cap);
+    // cmp rbx, rsi; jbe reuse_cap
+    code.extend_from_slice(&[0x48, 0x39, 0xF3]);
+    code.extend_from_slice(&[0x0F, 0x86, 0x00, 0x00, 0x00, 0x00]);
+    let reuse_patch = code.len() - 4;
+
+    // needed_bytes > old_cap: unmap old mapping if any, then mmap fresh zeroed pages.
+    code.extend_from_slice(&[0x48, 0x85, 0xF6]); // test rsi, rsi
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    let skip_unmap_patch = code.len() - 4;
+    emit_load_reg_r15(code, 7, off_base); // rdi = old_base
+    emit_sc_sys_munmap(code);
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    emit_store_r15_reg(code, 0, off_base);
+    emit_store_r15_reg(code, 0, off_len);
+    emit_store_r15_reg(code, 0, off_cap);
+
+    let skip_unmap_pos = code.len();
+    patch_rel32(code, skip_unmap_patch, skip_unmap_pos)?;
+
+    // new_cap = align_up_4096(rbx)
+    code.extend_from_slice(&[0x48, 0x81, 0xC3, 0xFF, 0x0F, 0x00, 0x00]); // add rbx, 4095
+    code.extend_from_slice(&[0x48, 0x81, 0xE3, 0x00, 0xF0, 0xFF, 0xFF]); // and rbx, -4096
+    code.extend_from_slice(&[0x48, 0x89, 0xDE]); // mov rsi, rbx
+    emit_sc_sys_mmap_anon(code);
+    emit_store_r15_reg(code, 0, off_base);
+    emit_store_r15_reg(code, 12, off_len);
+    emit_store_r15_reg(code, 3, off_cap);
+    code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+    let done_patch = code.len() - 4;
+
+    let reuse_pos = code.len();
+    patch_rel32(code, reuse_patch, reuse_pos)?;
+    // Zero [0..needed_bytes] and update len_elems.
+    emit_load_reg_r15(code, 7, off_base); // rdi = base_ptr
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+    code.extend_from_slice(&[0x31, 0xC0, 0xFC, 0xF3, 0xAA]); // xor eax, eax; cld; rep stosb
+    emit_store_r15_reg(code, 12, off_len);
+
+    let done_pos = code.len();
+    patch_rel32(code, done_patch, done_pos)?;
+    Ok(())
+}
+
+fn emit_sc_region_grow(
+    code: &mut Vec<u8>,
+    slot: usize,
+    decl: AotRegionDecl,
+    disp_b: i32,
+    disp: i32,
+) -> Result<(), AotError> {
+    let off_base = sc_region_off(slot, 0);
+    let off_len = sc_region_off(slot, 8);
+    let off_cap = sc_region_off(slot, 16);
+    let elem_bytes = decl.elem.region_elem_bytes();
+    let max_cap = align_up_4096(decl.max_len.saturating_mul(elem_bytes as u64));
+
+    // r12 = add_len
+    code.extend_from_slice(&[0x4C, 0x8B, 0xA5]);
+    code.extend_from_slice(&disp_b.to_le_bytes());
+
+    // Reject add_len < 0 or add_len > max_len via unsigned comparison.
+    emit_movabs_reg(code, 0, decl.max_len);
+    code.extend_from_slice(&[0x49, 0x39, 0xC4, 0x76, 0x0C]); // cmp r12, rax; jbe +12
+    emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+
+    // r13 = old_len, r14 = old_len + add_len
+    emit_load_reg_r15(code, 13, off_len);
+    code.extend_from_slice(&[0x4D, 0x89, 0xEE]); // mov r14, r13
+    code.extend_from_slice(&[0x4D, 0x01, 0xE6]); // add r14, r12
+                                                 // cmp r14, rax (max_len); jbe +12
+    code.extend_from_slice(&[0x49, 0x39, 0xC6, 0x76, 0x0C]);
+    emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+
+    // If add_len == 0, return old_len directly.
+    code.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    let done_patch = code.len() - 4;
+
+    // rbx = new_bytes = r14 * elem_bytes
+    code.extend_from_slice(&[0x4C, 0x89, 0xF3]); // mov rbx, r14
+    if elem_bytes == 8 {
+        code.extend_from_slice(&[0x48, 0xC1, 0xE3, 0x03]); // shl rbx, 3
+    }
+
+    // rsi = old_cap; if new_bytes <= old_cap skip mmap/mremap
+    emit_load_reg_r15(code, 6, off_cap);
+    code.extend_from_slice(&[0x48, 0x39, 0xF3]); // cmp rbx, rsi
+    code.extend_from_slice(&[0x0F, 0x86, 0x00, 0x00, 0x00, 0x00]);
+    let zero_tail_patch_1 = code.len() - 4;
+
+    // rdx = align_up_4096(new_bytes)
+    code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
+    code.extend_from_slice(&[0x48, 0x81, 0xC2, 0xFF, 0x0F, 0x00, 0x00]); // add rdx, 4095
+    code.extend_from_slice(&[0x48, 0x81, 0xE2, 0x00, 0xF0, 0xFF, 0xFF]); // and rdx, -4096
+
+    code.extend_from_slice(&[0x48, 0x85, 0xF6]); // test rsi, rsi
+    code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+    let mremap_patch = code.len() - 4;
+
+    // old_cap == 0: SYS_mmap(rdx)
+    code.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx
+    code.extend_from_slice(&[0x48, 0x89, 0xD6]); // mov rsi, rdx
+    emit_sc_sys_mmap_anon(code);
+    emit_store_r15_reg(code, 0, off_base);
+    emit_store_r15_reg(code, 3, off_cap);
+    code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+    let zero_tail_patch_2 = code.len() - 4;
+
+    let mremap_pos = code.len();
+    patch_rel32(code, mremap_patch, mremap_pos)?;
+    // new_cap = clamp(max(old_cap * 2, align_up_4096(new_bytes)), max_cap)
+    code.extend_from_slice(&[0x48, 0x89, 0xF0, 0x48, 0xD1, 0xE0]); // mov rax, rsi; shl rax, 1
+    code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x48, 0x0F, 0x47, 0xD0]); // cmp rax, rdx; cmova rdx, rax
+    emit_movabs_reg(code, 0, max_cap);
+    code.extend_from_slice(&[0x48, 0x39, 0xC2, 0x48, 0x0F, 0x47, 0xD0]); // cmp rdx, rax; cmova rdx, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx
+    emit_load_reg_r15(code, 7, off_base); // rdi = old_base
+    emit_sc_sys_mremap(code);
+    emit_store_r15_reg(code, 0, off_base);
+    emit_store_r15_reg(code, 3, off_cap);
+
+    let zero_tail_pos = code.len();
+    patch_rel32(code, zero_tail_patch_1, zero_tail_pos)?;
+    patch_rel32(code, zero_tail_patch_2, zero_tail_pos)?;
+
+    // Zero newly exposed bytes [old_len * elem_bytes .. new_len * elem_bytes]
+    emit_load_reg_r15(code, 7, off_base); // rdi = base_ptr
+    code.extend_from_slice(&[0x4C, 0x89, 0xE8]); // mov rax, r13 (old_len)
+    if elem_bytes == 8 {
+        code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]); // shl rax, 3
+    }
+    code.extend_from_slice(&[0x48, 0x01, 0xC7]); // add rdi, rax
+    code.extend_from_slice(&[0x4C, 0x89, 0xE1]); // mov rcx, r12 (add_len)
+    if elem_bytes == 8 {
+        code.extend_from_slice(&[0x48, 0xC1, 0xE1, 0x03]); // shl rcx, 3
+    }
+    code.extend_from_slice(&[0x31, 0xC0, 0xFC, 0xF3, 0xAA]); // xor eax, eax; cld; rep stosb
+    emit_store_r15_reg(code, 14, off_len);
+
+    let done_pos = code.len();
+    patch_rel32(code, done_patch, done_pos)?;
+    code.extend_from_slice(&[0x4C, 0x89, 0xF0]); // mov rax, r14
+    emit_mov_rbp_rax(code, disp);
+    Ok(())
+}
+
+fn emit_sc_region_free(code: &mut Vec<u8>, slot: usize) -> Result<(), AotError> {
+    let off_base = sc_region_off(slot, 0);
+    let off_len = sc_region_off(slot, 8);
+    let off_cap = sc_region_off(slot, 16);
+
+    emit_load_reg_r15(code, 6, off_cap); // rsi = cap_bytes
+    code.extend_from_slice(&[0x48, 0x85, 0xF6]); // test rsi, rsi
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    let skip_patch = code.len() - 4;
+
+    emit_load_reg_r15(code, 7, off_base); // rdi = base_ptr
+    emit_sc_sys_munmap(code);
+
+    let skip_pos = code.len();
+    patch_rel32(code, skip_patch, skip_pos)?;
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    emit_store_r15_reg(code, 0, off_base);
+    emit_store_r15_reg(code, 0, off_len);
+    emit_store_r15_reg(code, 0, off_cap);
+    Ok(())
+}
+
+fn emit_sc_output_region_epilogue(code: &mut Vec<u8>, out_slot: usize) -> Result<(), AotError> {
+    let off_base = sc_region_off(out_slot, 0);
+    let off_len = sc_region_off(out_slot, 8);
+
+    emit_load_reg_r15(code, 12, off_base); // r12 = base_ptr
+    emit_load_reg_r15(code, 13, off_len); // r13 = len
+    code.extend_from_slice(&[0x45, 0x31, 0xF6]); // xor r14d, r14d (written = 0)
+
+    let write_loop_pos = code.len();
+    code.extend_from_slice(&[0x4D, 0x39, 0xEE]); // cmp r14, r13
+    code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]); // jae write_done
+    let done_patch = code.len() - 4;
+
+    // SYS_write(1, r12 + r14, r13 - r14)
+    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1
+    code.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
+    code.extend_from_slice(&[0x4C, 0x01, 0xF6]); // add rsi, r14
+    code.extend_from_slice(&[0x4C, 0x89, 0xEA]); // mov rdx, r13
+    code.extend_from_slice(&[0x4C, 0x29, 0xF2]); // sub rdx, r14
+    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4 (EINTR)
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    let eintr_patch = code.len() - 4;
+    patch_rel32(code, eintr_patch, write_loop_pos)?;
+    // test rax, rax; jg +12; exit(74)
+    code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x7F, 0x0C]);
+    emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
+    code.extend_from_slice(&[0x49, 0x01, 0xC6]); // add r14, rax
+    code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+    let back_patch = code.len() - 4;
+    patch_rel32(code, back_patch, write_loop_pos)?;
+
+    let done_pos = code.len();
+    patch_rel32(code, done_patch, done_pos)?;
+    emit_sys_exit(code, 0);
+    Ok(())
+}
+
+fn emit_sc_int_div_rem(
+    code: &mut Vec<u8>,
+    is_u8: bool,
+    is_rem: bool,
+    disp_a: i32,
+    disp_b: i32,
+    disp: i32,
+) -> Result<(), AotError> {
+    // mov rcx, [rbp + disp_b]
+    code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+    code.extend_from_slice(&disp_b.to_le_bytes());
+    // test rcx, rcx; jnz +12; exit(72)
+    code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x75, 0x0C]);
+    emit_sys_exit(code, AOT_EXIT_INT_DIV_ERR as u32);
+
+    emit_mov_rax_rbp(code, disp_a);
+    if is_u8 {
+        // xor edx, edx; div rcx
+        code.extend_from_slice(&[0x31, 0xD2, 0x48, 0xF7, 0xF1]);
+    } else {
+        // Guard against i64::MIN / -1 and i64::MIN % -1 (x86_64 #DE trap) -> exit(72).
+        emit_movabs_reg(code, 2, 0x8000_0000_0000_0000); // rdx = i64::MIN
+        code.extend_from_slice(&[0x48, 0x39, 0xD0]); // cmp rax, rdx
+        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+        let ok_patch_1 = code.len() - 4;
+        code.extend_from_slice(&[0x48, 0x83, 0xF9, 0xFF]); // cmp rcx, -1
+        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+        let ok_patch_2 = code.len() - 4;
+        emit_sys_exit(code, AOT_EXIT_INT_DIV_ERR as u32);
+
+        let ok_pos = code.len();
+        patch_rel32(code, ok_patch_1, ok_pos)?;
+        patch_rel32(code, ok_patch_2, ok_pos)?;
+        // cqo; idiv rcx
+        code.extend_from_slice(&[0x48, 0x99, 0x48, 0xF7, 0xF9]);
+    }
+
+    if is_rem {
+        // mov [rbp + disp], rdx
+        code.extend_from_slice(&[0x48, 0x89, 0x95]);
+        code.extend_from_slice(&disp.to_le_bytes());
+    } else {
+        emit_mov_rbp_rax(code, disp);
+    }
+    Ok(())
+}
+
+fn emit_sc_cast(
+    code: &mut Vec<u8>,
+    src_elem: ElemType,
+    dst_elem: ElemType,
+    disp_a: i32,
+    disp: i32,
+) -> Result<(), AotError> {
+    match (src_elem, dst_elem) {
+        (ElemType::I64, ElemType::U8) | (ElemType::U8, ElemType::I64) => {
+            emit_mov_rax_rbp(code, disp_a);
+            // movzx eax, al
+            code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
+            emit_mov_rbp_rax(code, disp);
+        }
+        (ElemType::BoolMask, ElemType::I64) => {
+            emit_mov_rax_rbp(code, disp_a);
+            // and eax, 1
+            code.extend_from_slice(&[0x83, 0xE0, 0x01]);
+            emit_mov_rbp_rax(code, disp);
+        }
+        (ElemType::I64, ElemType::F64) => {
+            // cvtsi2sd xmm0, qword ptr [rbp + disp_a]
+            code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0x85]);
+            code.extend_from_slice(&disp_a.to_le_bytes());
+            emit_store_xmm0_rbp(code, disp);
+        }
+        (ElemType::U8, ElemType::F64) => {
+            emit_mov_rax_rbp(code, disp_a);
+            // movzx eax, al; cvtsi2sd xmm0, rax
+            code.extend_from_slice(&[0x0F, 0xB6, 0xC0, 0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
+            emit_store_xmm0_rbp(code, disp);
+        }
+        (ElemType::F64, ElemType::I64) => {
+            emit_load_xmm0_rbp(code, disp_a);
+            // Reject NaN, -Inf, < -2^63: ucomisd xmm0, -2^63 -> jae +12 (CF=0 only when ordered and >= -2^63)
+            emit_movabs_reg(code, 0, (-9_223_372_036_854_775_808.0_f64).to_bits());
+            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // movq xmm1, rax
+            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1, 0x73, 0x0C]); // ucomisd xmm0, xmm1; jae +12
+            emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
+            // Reject +Inf, >= +2^63, NaN: ucomisd +2^63, xmm0 -> ja +12 (CF=0 && ZF=0 only when ordered and +2^63 > xmm0)
+            emit_movabs_reg(code, 0, (9_223_372_036_854_775_808.0_f64).to_bits());
+            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // movq xmm1, rax
+            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC8, 0x77, 0x0C]); // ucomisd xmm1, xmm0; ja +12
+            emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
+            // cvttsd2si rax, xmm0
+            code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]);
+            emit_mov_rbp_rax(code, disp);
+        }
+        (ElemType::F64, ElemType::U8) => {
+            emit_load_xmm0_rbp(code, disp_a);
+            // roundsd xmm0, xmm0, 0x0B (truncate toward zero, suppress precision exception)
+            code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0B]);
+            // xorpd xmm1, xmm1 (0.0); ucomisd xmm0, xmm1; jae +12 (rejects NaN, -Inf, < 0.0)
+            code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xC9, 0x66, 0x0F, 0x2E, 0xC1, 0x73, 0x0C]);
+            emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
+            // ucomisd 255.0, xmm0; jae +12 (accepts <= 255.0 only when ordered)
+            emit_movabs_reg(code, 0, 255.0_f64.to_bits());
+            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // movq xmm1, rax
+            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC8, 0x73, 0x0C]); // ucomisd xmm1, xmm0; jae +12
+            emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
+            // cvttsd2si eax, xmm0 (zero-extends into rax)
+            code.extend_from_slice(&[0xF2, 0x0F, 0x2C, 0xC0]);
+            emit_mov_rbp_rax(code, disp);
+        }
+        _ => {
+            return Err(AotError::UnsupportedGraph(
+                "unsupported Cast element-type pair in structured AOT",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "single-pass O(N) structured x86_64 scalar control-flow emitter"
+    reason = "single-pass O(N) structured x86_64 scalar control-flow and region emitter"
 )]
 fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotError> {
     let node_count = program.nodes.len();
     let mut code: Vec<u8> = Vec::with_capacity(256 + node_count * 24);
+
+    let mut regions: [Option<AotRegionDecl>; MAX_REGION_SLOTS] = [None; MAX_REGION_SLOTS];
+    let mut has_any_region = false;
+    let mut output_region_slot: Option<usize> = None;
+    for proof in &program.proofs {
+        if proof.rule_kind != ProofRuleKind::RegionDecl {
+            continue;
+        }
+        let Some((elem, role)) = ProofEntry::decode_region_decl_witness(proof.witness_node) else {
+            return Err(AotError::UnsupportedGraph("invalid RegionDecl witness"));
+        };
+        let slot = usize::from(proof.target_arena);
+        if let Some(entry) = regions.get_mut(slot) {
+            *entry = Some(AotRegionDecl {
+                min_len: u64::from(proof.bound_lo),
+                max_len: u64::from(proof.bound_hi),
+                elem,
+                role,
+            });
+            has_any_region = true;
+            if role == RegionRole::Output {
+                output_region_slot = Some(slot);
+            }
+        }
+    }
 
     // 1. Entry prologue: align stack to 32B, establish `rbp`, allocate 64 local slots + SSA slots.
     // and rsp, -32
@@ -950,6 +1714,10 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
     // sub rsp, frame_bytes
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_bytes.to_le_bytes());
+
+    if has_any_region {
+        emit_sc_region_startup(&mut code, &regions)?;
+    }
 
     let mut node_elem: Vec<ElemType> = vec![ElemType::I64; node_count];
     let mut local_elem: [ElemType; 64] = [ElemType::I64; 64];
@@ -1040,6 +1808,33 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                     if let Some(el) = node_elem.get_mut(idx) {
                         *el = ElemType::I64;
                     }
+                } else if elem_a == ElemType::U8 {
+                    // mov eax, [rbp + disp_a]
+                    code.extend_from_slice(&[0x8B, 0x85]);
+                    code.extend_from_slice(&disp_a.to_le_bytes());
+                    match frame.opcode {
+                        Opcode::Add => {
+                            // add eax, [rbp + disp_b]
+                            code.extend_from_slice(&[0x03, 0x85]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                        }
+                        Opcode::Sub => {
+                            // sub eax, [rbp + disp_b]
+                            code.extend_from_slice(&[0x2B, 0x85]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                        }
+                        _ => {
+                            // imul eax, [rbp + disp_b]
+                            code.extend_from_slice(&[0x0F, 0xAF, 0x85]);
+                            code.extend_from_slice(&disp_b.to_le_bytes());
+                        }
+                    }
+                    // and eax, 0xFF (zero-extends into rax)
+                    code.extend_from_slice(&[0x25, 0xFF, 0x00, 0x00, 0x00]);
+                    emit_mov_rbp_rax(&mut code, disp);
+                    if let Some(el) = node_elem.get_mut(idx) {
+                        *el = ElemType::U8;
+                    }
                 } else {
                     emit_load_xmm0_rbp(&mut code, disp_a);
                     let op_byte = match frame.opcode {
@@ -1055,12 +1850,116 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                     }
                 }
             }
-            Opcode::Div | Opcode::Min | Opcode::Max => {
-                emit_load_xmm0_rbp(&mut code, disp_a);
+            Opcode::Div => {
+                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
+                if matches!(elem_a, ElemType::I64 | ElemType::U8) {
+                    emit_sc_int_div_rem(
+                        &mut code,
+                        elem_a == ElemType::U8,
+                        false,
+                        disp_a,
+                        disp_b,
+                        disp,
+                    )?;
+                    if let Some(el) = node_elem.get_mut(idx) {
+                        *el = elem_a;
+                    }
+                } else {
+                    emit_load_xmm0_rbp(&mut code, disp_a);
+                    code.extend_from_slice(&[0xF2, 0x0F, 0x5E, 0x85]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    emit_store_xmm0_rbp(&mut code, disp);
+                    if let Some(el) = node_elem.get_mut(idx) {
+                        *el = ElemType::F64;
+                    }
+                }
+            }
+            Opcode::Rem => {
+                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
+                emit_sc_int_div_rem(
+                    &mut code,
+                    elem_a == ElemType::U8,
+                    true,
+                    disp_a,
+                    disp_b,
+                    disp,
+                )?;
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = elem_a;
+                }
+            }
+            Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
+                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
+                emit_mov_rax_rbp(&mut code, disp_a);
                 let op_byte = match frame.opcode {
-                    Opcode::Div => 0x5E,
-                    Opcode::Min => 0x5D,
-                    _ => 0x5F,
+                    Opcode::BitAnd => 0x23,
+                    Opcode::BitOr => 0x0B,
+                    _ => 0x33,
+                };
+                code.extend_from_slice(&[0x48, op_byte, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = elem_a;
+                }
+            }
+            Opcode::Shl | Opcode::ShrU | Opcode::ShrS => {
+                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
+                if elem_a == ElemType::U8 {
+                    // mov eax, [rbp + disp_a]; mov ecx, [rbp + disp_b]; and ecx, 7
+                    code.extend_from_slice(&[0x8B, 0x85]);
+                    code.extend_from_slice(&disp_a.to_le_bytes());
+                    code.extend_from_slice(&[0x8B, 0x8D]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    code.extend_from_slice(&[0x83, 0xE1, 0x07]);
+                    if frame.opcode == Opcode::Shl {
+                        // shl eax, cl; and eax, 0xFF
+                        code.extend_from_slice(&[0xD3, 0xE0, 0x25, 0xFF, 0x00, 0x00, 0x00]);
+                    } else {
+                        // shr eax, cl
+                        code.extend_from_slice(&[0xD3, 0xE8]);
+                    }
+                    emit_mov_rbp_rax(&mut code, disp);
+                } else {
+                    emit_mov_rax_rbp(&mut code, disp_a);
+                    // mov rcx, [rbp + disp_b] (x86_64 64-bit shift masks cl & 63 in hardware)
+                    code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                    code.extend_from_slice(&disp_b.to_le_bytes());
+                    let shift_modrm = match frame.opcode {
+                        Opcode::Shl => 0xE0,  // shl rax, cl
+                        Opcode::ShrU => 0xE8, // shr rax, cl
+                        _ => 0xF8,            // sar rax, cl
+                    };
+                    code.extend_from_slice(&[0x48, 0xD3, shift_modrm]);
+                    emit_mov_rbp_rax(&mut code, disp);
+                }
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = elem_a;
+                }
+            }
+            Opcode::MaskNot => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                // xor eax, 1 (zero-extends 0/1 into rax)
+                code.extend_from_slice(&[0x83, 0xF0, 0x01]);
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::BoolMask;
+                }
+            }
+            Opcode::Cast => {
+                let src_elem = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
+                let dst_elem = frame.type_lane.elem;
+                emit_sc_cast(&mut code, src_elem, dst_elem, disp_a, disp)?;
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = dst_elem;
+                }
+            }
+            Opcode::Min | Opcode::Max => {
+                emit_load_xmm0_rbp(&mut code, disp_a);
+                let op_byte = if frame.opcode == Opcode::Min {
+                    0x5D
+                } else {
+                    0x5F
                 };
                 code.extend_from_slice(&[0xF2, 0x0F, op_byte, 0x85]);
                 code.extend_from_slice(&disp_b.to_le_bytes());
@@ -1131,15 +2030,23 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
             }
             Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
                 let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
-                if elem_a == ElemType::I64 {
+                if elem_a == ElemType::I64 || elem_a == ElemType::U8 {
                     emit_mov_rax_rbp(&mut code, disp_a);
                     // cmp rax, [rbp + disp_b]
                     code.extend_from_slice(&[0x48, 0x3B, 0x85]);
                     code.extend_from_slice(&disp_b.to_le_bytes());
-                    let setcc = match frame.opcode {
-                        Opcode::CmpGt => 0x9F, // setg al
-                        Opcode::CmpLt => 0x9C, // setl al
-                        _ => 0x94,             // sete al
+                    let setcc = if elem_a == ElemType::U8 {
+                        match frame.opcode {
+                            Opcode::CmpGt => 0x97, // seta al (unsigned >)
+                            Opcode::CmpLt => 0x92, // setb al (unsigned <)
+                            _ => 0x94,             // sete al
+                        }
+                    } else {
+                        match frame.opcode {
+                            Opcode::CmpGt => 0x9F, // setg al (signed >)
+                            Opcode::CmpLt => 0x9C, // setl al (signed <)
+                            _ => 0x94,             // sete al
+                        }
                     };
                     code.extend_from_slice(&[0x0F, setcc, 0xC0]);
                     // movzx eax, al
@@ -1175,6 +2082,17 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                     code.extend_from_slice(&[0x83, 0xE0, 0x01]);
                     emit_mov_rbp_rax(&mut code, disp);
                 }
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::BoolMask;
+                }
+            }
+            Opcode::CmpLtU => {
+                emit_mov_rax_rbp(&mut code, disp_a);
+                // cmp rax, [rbp + disp_b]; setb al; movzx eax, al
+                code.extend_from_slice(&[0x48, 0x3B, 0x85]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                code.extend_from_slice(&[0x0F, 0x92, 0xC0, 0x0F, 0xB6, 0xC0]);
+                emit_mov_rbp_rax(&mut code, disp);
                 if let Some(el) = node_elem.get_mut(idx) {
                     *el = ElemType::BoolMask;
                 }
@@ -1433,6 +2351,98 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                     }
                 }
             }
+            Opcode::RegionNew => {
+                let slot = frame.in_a as usize;
+                let decl = regions
+                    .get(slot)
+                    .and_then(|d| *d)
+                    .ok_or(AotError::UnsupportedGraph("undeclared RegionNew slot"))?;
+                emit_sc_region_new(&mut code, slot, decl, disp_b)?;
+            }
+            Opcode::RegionGrow => {
+                let slot = frame.in_a as usize;
+                let decl = regions
+                    .get(slot)
+                    .and_then(|d| *d)
+                    .ok_or(AotError::UnsupportedGraph("undeclared RegionGrow slot"))?;
+                emit_sc_region_grow(&mut code, slot, decl, disp_b, disp)?;
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::I64;
+                }
+            }
+            Opcode::RegionLen => {
+                let slot = frame.in_a as usize;
+                let off_len = sc_region_off(slot, 8);
+                emit_load_reg_r15(&mut code, 0, off_len);
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = ElemType::I64;
+                }
+            }
+            Opcode::RegionLoad => {
+                let slot = frame.in_a as usize;
+                let decl = regions
+                    .get(slot)
+                    .and_then(|d| *d)
+                    .ok_or(AotError::UnsupportedGraph("undeclared RegionLoad slot"))?;
+                let off_base = sc_region_off(slot, 0);
+                let off_len = sc_region_off(slot, 8);
+                // mov rcx, [rbp + disp_b]
+                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                code.extend_from_slice(&disp_b.to_le_bytes());
+                if frame.proof_idx == 0 {
+                    // Unsigned bounds check: cmp rcx, [r15 + off_len]; jb +12; exit(71)
+                    emit_cmp_reg_r15(&mut code, 1, off_len);
+                    code.extend_from_slice(&[0x72, 0x0C]);
+                    emit_sys_exit(&mut code, AOT_EXIT_GATHER_OOB as u32);
+                }
+                emit_load_reg_r15(&mut code, 2, off_base); // rdx = base_ptr
+                if decl.elem == ElemType::U8 {
+                    // movzx eax, byte ptr [rdx + rcx]
+                    code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x0A]);
+                } else {
+                    // mov rax, qword ptr [rdx + rcx*8]
+                    code.extend_from_slice(&[0x48, 0x8B, 0x04, 0xCA]);
+                }
+                emit_mov_rbp_rax(&mut code, disp);
+                if let Some(el) = node_elem.get_mut(idx) {
+                    *el = decl.elem;
+                }
+            }
+            Opcode::RegionStore => {
+                let slot = frame.in_a as usize;
+                let decl = regions
+                    .get(slot)
+                    .and_then(|d| *d)
+                    .ok_or(AotError::UnsupportedGraph("undeclared RegionStore slot"))?;
+                let (idx_node, val_node) = frame.decode_u16_pair();
+                let disp_idx = sc_node_disp(idx_node as usize);
+                let disp_val = sc_node_disp(val_node as usize);
+                let off_base = sc_region_off(slot, 0);
+                let off_len = sc_region_off(slot, 8);
+                // mov rcx, [rbp + disp_idx]
+                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                code.extend_from_slice(&disp_idx.to_le_bytes());
+                if frame.proof_idx == 0 {
+                    // Unsigned bounds check: cmp rcx, [r15 + off_len]; jb +12; exit(71)
+                    emit_cmp_reg_r15(&mut code, 1, off_len);
+                    code.extend_from_slice(&[0x72, 0x0C]);
+                    emit_sys_exit(&mut code, AOT_EXIT_GATHER_OOB as u32);
+                }
+                emit_load_reg_r15(&mut code, 2, off_base); // rdx = base_ptr
+                emit_mov_rax_rbp(&mut code, disp_val);
+                if decl.elem == ElemType::U8 {
+                    // mov byte ptr [rdx + rcx], al
+                    code.extend_from_slice(&[0x88, 0x04, 0x0A]);
+                } else {
+                    // mov qword ptr [rdx + rcx*8], rax
+                    code.extend_from_slice(&[0x48, 0x89, 0x04, 0xCA]);
+                }
+            }
+            Opcode::RegionFree => {
+                let slot = frame.in_a as usize;
+                emit_sc_region_free(&mut code, slot)?;
+            }
             Opcode::ArenaInput
             | Opcode::ArenaSlice
             | Opcode::ArenaMutate
@@ -1448,23 +2458,27 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
         }
     }
 
-    // Epilogue: write 8-byte output_node bit-pattern to stdout (`fd = 1`) and `SYS_exit(0)`.
-    emit_mov_rax_rbp(&mut code, sc_node_disp(program.output_node as usize));
-    emit_mov_rbp_rax(&mut code, SC_STDOUT_DISP);
+    if let Some(out_slot) = output_region_slot {
+        emit_sc_output_region_epilogue(&mut code, out_slot)?;
+    } else {
+        // Epilogue: write 8-byte output_node bit-pattern to stdout (`fd = 1`) and `SYS_exit(0)`.
+        emit_mov_rax_rbp(&mut code, sc_node_disp(program.output_node as usize));
+        emit_mov_rbp_rax(&mut code, SC_STDOUT_DISP);
 
-    // mov eax, 1 (SYS_write)
-    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
-    // mov edi, 1 (STDOUT_FILENO)
-    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
-    // lea rsi, [rbp + SC_STDOUT_DISP]
-    code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
-    code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
-    // mov edx, 8
-    code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
-    // syscall
-    code.extend_from_slice(&[0x0F, 0x05]);
+        // mov eax, 1 (SYS_write)
+        code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        // mov edi, 1 (STDOUT_FILENO)
+        code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
+        // lea rsi, [rbp + SC_STDOUT_DISP]
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+        code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
+        // mov edx, 8
+        code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+        // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
 
-    emit_sys_exit(&mut code, 0);
+        emit_sys_exit(&mut code, 0);
+    }
     Ok(code)
 }
 
@@ -1797,13 +2811,29 @@ fn emit_x86_64_machine_code(
                 | Opcode::ConstI64
                 | Opcode::LocalGet
                 | Opcode::LocalSet
+                | Opcode::MaskNot
+                | Opcode::Cast
+                | Opcode::BitAnd
+                | Opcode::BitOr
+                | Opcode::BitXor
+                | Opcode::Shl
+                | Opcode::ShrU
+                | Opcode::Rem
+                | Opcode::ShrS
+                | Opcode::CmpLtU
                 | Opcode::Block
                 | Opcode::Loop
                 | Opcode::If
                 | Opcode::Else
                 | Opcode::End
                 | Opcode::Br
-                | Opcode::BrIf => {}
+                | Opcode::BrIf
+                | Opcode::RegionNew
+                | Opcode::RegionGrow
+                | Opcode::RegionLen
+                | Opcode::RegionLoad
+                | Opcode::RegionStore
+                | Opcode::RegionFree => {}
             }
         }
         for spec in reductions {
@@ -2128,13 +3158,29 @@ fn emit_x86_64_machine_code(
                 | Opcode::ConstI64
                 | Opcode::LocalGet
                 | Opcode::LocalSet
+                | Opcode::MaskNot
+                | Opcode::Cast
+                | Opcode::BitAnd
+                | Opcode::BitOr
+                | Opcode::BitXor
+                | Opcode::Shl
+                | Opcode::ShrU
+                | Opcode::Rem
+                | Opcode::ShrS
+                | Opcode::CmpLtU
                 | Opcode::Block
                 | Opcode::Loop
                 | Opcode::If
                 | Opcode::Else
                 | Opcode::End
                 | Opcode::Br
-                | Opcode::BrIf => {}
+                | Opcode::BrIf
+                | Opcode::RegionNew
+                | Opcode::RegionGrow
+                | Opcode::RegionLen
+                | Opcode::RegionLoad
+                | Opcode::RegionStore
+                | Opcode::RegionFree => {}
             }
         }
 
@@ -2490,13 +3536,29 @@ fn emit_x86_64_machine_code(
             | Opcode::ConstI64
             | Opcode::LocalGet
             | Opcode::LocalSet
+            | Opcode::MaskNot
+            | Opcode::Cast
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::ShrU
+            | Opcode::Rem
+            | Opcode::ShrS
+            | Opcode::CmpLtU
             | Opcode::Block
             | Opcode::Loop
             | Opcode::If
             | Opcode::Else
             | Opcode::End
             | Opcode::Br
-            | Opcode::BrIf => {}
+            | Opcode::BrIf
+            | Opcode::RegionNew
+            | Opcode::RegionGrow
+            | Opcode::RegionLen
+            | Opcode::RegionLoad
+            | Opcode::RegionStore
+            | Opcode::RegionFree => {}
         }
     }
 
@@ -3367,7 +4429,9 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::LocalGet
             | Opcode::Block
             | Opcode::Loop
-            | Opcode::Br => {}
+            | Opcode::Br
+            | Opcode::RegionLen
+            | Opcode::RegionFree => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt
@@ -3375,6 +4439,8 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Ceil
             | Opcode::Ln
             | Opcode::Exp
+            | Opcode::MaskNot
+            | Opcode::Cast
             | Opcode::ReduceSum
             | Opcode::ReduceMax
             | Opcode::ReduceMin
@@ -3386,8 +4452,21 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
                     *a = true;
                 }
             }
-            Opcode::ArenaMutate | Opcode::LocalSet => {
+            Opcode::ArenaMutate
+            | Opcode::LocalSet
+            | Opcode::RegionNew
+            | Opcode::RegionGrow
+            | Opcode::RegionLoad => {
                 if let Some(b) = live.get_mut(frame.in_b as usize) {
+                    *b = true;
+                }
+            }
+            Opcode::RegionStore => {
+                let (idx_node, val_node) = frame.decode_u16_pair();
+                if let Some(a) = live.get_mut(idx_node as usize) {
+                    *a = true;
+                }
+                if let Some(b) = live.get_mut(val_node as usize) {
                     *b = true;
                 }
             }
@@ -3402,11 +4481,19 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Sub
             | Opcode::Mul
             | Opcode::Div
+            | Opcode::Rem
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::ShrU
+            | Opcode::ShrS
             | Opcode::Min
             | Opcode::Max
             | Opcode::CmpGt
             | Opcode::CmpLt
             | Opcode::CmpEq
+            | Opcode::CmpLtU
             | Opcode::MaskAnd
             | Opcode::MaskOr
             | Opcode::SelectZero
