@@ -9,7 +9,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::aot::{compile_rl_to_executable, run_compiled_scalar_executable};
+use crate::aot::{
+    compile_rl_to_executable, run_compiled_scalar_executable, run_compiled_structured_executable,
+};
 use crate::bytecode::{ElemType, RulProgram};
 use crate::cas::builtin_intrinsics;
 use crate::engine::{
@@ -188,6 +190,24 @@ fn prepare_program_and_arenas(
 fn format_runtime_value(val: &RuntimeValue) -> String {
     match val {
         RuntimeValue::Scalar(v) => format!("Scalar({v:.6})"),
+        RuntimeValue::TypedScalar(ts) => match ts.elem {
+            ElemType::I64 => format!(
+                "TypedScalar(I64={}, bits=0x{:016x})",
+                ts.as_i64().unwrap_or(0),
+                ts.bits
+            ),
+            ElemType::U8 => format!(
+                "TypedScalar(U8={}, bits=0x{:016x})",
+                ts.as_u8().unwrap_or(0),
+                ts.bits
+            ),
+            ElemType::BoolMask => format!(
+                "TypedScalar(BoolMask={}, bits=0x{:016x})",
+                ts.as_bool().unwrap_or(false),
+                ts.bits
+            ),
+            ElemType::F64 => format!("Scalar({:.6})", ts.as_f64().unwrap_or(0.0)),
+        },
         RuntimeValue::ColumnF64(col) => {
             let preview: Vec<String> = col.iter().take(4).map(|x| format!("{x:.2}")).collect();
             format!(
@@ -203,10 +223,12 @@ fn format_runtime_value(val: &RuntimeValue) -> String {
     }
 }
 
-fn mcp_scalars_equivalent(output_elem: ElemType, expected: f64, actual: f64) -> bool {
+fn mcp_scalars_equivalent(output_elem: ElemType, expected_bits: u64, actual_bits: u64) -> bool {
     match output_elem {
-        ElemType::I64 | ElemType::BoolMask => expected.to_bits() == actual.to_bits(),
+        ElemType::I64 | ElemType::U8 | ElemType::BoolMask => expected_bits == actual_bits,
         ElemType::F64 => {
+            let expected = f64::from_bits(expected_bits);
+            let actual = f64::from_bits(actual_bits);
             if expected.is_nan() && actual.is_nan() {
                 return true;
             }
@@ -245,17 +267,31 @@ fn tool_test_differential(
                 std::env::temp_dir().join(format!("rul_mcp_diff_{}_{seq}", std::process::id()));
             let aot_rep = compile_rl_to_executable(&program, &tmp_exe)
                 .map_err(|e| format!("AOT_COMPILE_ERROR: {e:?}"))?;
-            let aot_res = run_compiled_scalar_executable(&tmp_exe);
-            let _ = std::fs::remove_file(&tmp_exe);
-            let aot_val = aot_res.map_err(|e| format!("AOT_EXEC_ERROR: {e:?}"))?;
-            if let RuntimeValue::Scalar(t0_val) = rep0.output {
-                if !mcp_scalars_equivalent(summary.output_elem, t0_val, aot_val) {
+            if program.has_output_region() {
+                let aot_res = run_compiled_structured_executable(&tmp_exe, &[]);
+                let _ = std::fs::remove_file(&tmp_exe);
+                let aot_bytes = aot_res.map_err(|e| format!("AOT_EXEC_ERROR: {e:?}"))?;
+                let t0_bytes = rep0.output_bytes.as_deref().unwrap_or(&[]);
+                if t0_bytes != aot_bytes.as_slice() {
                     return Err(format!(
-                        "AOT_EQUIVALENCE_ERROR ({:?}): Tier0=0x{:016x} != AOT=0x{:016x}",
-                        summary.output_elem,
-                        t0_val.to_bits(),
-                        aot_val.to_bits()
+                        "AOT_EQUIVALENCE_ERROR (OutputRegion): Tier0 len={} != AOT len={}",
+                        t0_bytes.len(),
+                        aot_bytes.len()
                     ));
+                }
+            } else {
+                let aot_res = run_compiled_scalar_executable(&tmp_exe);
+                let _ = std::fs::remove_file(&tmp_exe);
+                let aot_val = aot_res.map_err(|e| format!("AOT_EXEC_ERROR: {e:?}"))?;
+                if let Some(t0_ts) = rep0.output.as_typed_scalar() {
+                    if !mcp_scalars_equivalent(summary.output_elem, t0_ts.bits, aot_val.to_bits()) {
+                        return Err(format!(
+                            "AOT_EQUIVALENCE_ERROR ({:?}): Tier0=0x{:016x} != AOT=0x{:016x}",
+                            summary.output_elem,
+                            t0_ts.bits,
+                            aot_val.to_bits()
+                        ));
+                    }
                 }
             }
             let _ = writeln!(out, "STATUS: DIFFERENTIAL_EQUIVALENCE_PASS");

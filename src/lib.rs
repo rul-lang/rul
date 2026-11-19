@@ -2990,17 +2990,18 @@ output $out
 
         // `i64::MAX.wrapping_mul(2) == -2`, `-2 + 44 == 42`
         let rep0 = execute_tier0_interpreter(&prog, &[]).map_err(|e| format!("{e:?}"))?;
-        let RuntimeValue::Scalar(t0_out) = rep0.output else {
-            return Err("expected Scalar output from Tier 0".to_owned());
+        let RuntimeValue::TypedScalar(t0_out) = rep0.output else {
+            return Err("expected TypedScalar output from Tier 0".to_owned());
         };
-        assert_eq!(t0_out.to_bits(), 42_u64);
+        assert_eq!(t0_out.elem, crate::bytecode::ElemType::I64);
+        assert_eq!(t0_out.bits, 42_u64);
 
         let exe_path = std::env::temp_dir().join("rul_tc_core1_ac1_bin");
         crate::aot::compile_rl_to_executable(&prog, &exe_path).map_err(|e| format!("{e:?}"))?;
         let aot_res = crate::aot::run_compiled_scalar_executable(&exe_path);
         let _ = std::fs::remove_file(&exe_path);
         let aot_out = aot_res.map_err(|e| format!("{e:?}"))?;
-        assert_eq!(aot_out.to_bits(), t0_out.to_bits());
+        assert_eq!(aot_out.to_bits(), t0_out.bits);
 
         // 3. Both branches initializing a previously uninitialized local slot makes it definitely initialized after End.
         let both_init_rls = "\
@@ -3197,10 +3198,11 @@ output $out
         let deep_prog = assemble_rls(deep_and_node0_rls).map_err(|e| format!("{e:?}"))?;
         verify_program(&deep_prog).map_err(|e| format!("{e:?}"))?;
         let rep0 = execute_tier0_interpreter(&deep_prog, &[]).map_err(|e| format!("{e:?}"))?;
-        let RuntimeValue::Scalar(v0) = rep0.output else {
-            return Err("expected Scalar".to_owned());
+        let RuntimeValue::TypedScalar(v0) = rep0.output else {
+            return Err("expected TypedScalar".to_owned());
         };
-        assert_eq!(v0.to_bits(), 778_u64);
+        assert_eq!(v0.elem, crate::bytecode::ElemType::I64);
+        assert_eq!(v0.bits, 778_u64);
 
         let exe_path = std::env::temp_dir().join("rul_tc_core1_ac2_bin");
         crate::aot::compile_rl_to_executable(&deep_prog, &exe_path)
@@ -3649,10 +3651,11 @@ output $out
 
         let rep_sum =
             execute_tier0_interpreter(&bounded_prog, &[]).map_err(|e| format!("{e:?}"))?;
-        let RuntimeValue::Scalar(t0_sum) = rep_sum.output else {
-            return Err("expected Scalar".to_owned());
+        let RuntimeValue::TypedScalar(t0_sum) = rep_sum.output else {
+            return Err("expected TypedScalar".to_owned());
         };
-        assert_eq!(t0_sum.to_bits(), 55_u64);
+        assert_eq!(t0_sum.elem, crate::bytecode::ElemType::I64);
+        assert_eq!(t0_sum.bits, 55_u64);
 
         let exe_sum = std::env::temp_dir().join("rul_tc_core1_ac3_bounded_ok");
         crate::aot::compile_rl_to_executable(&bounded_prog, &exe_sum)
@@ -3715,10 +3718,11 @@ output $out
 ";
         let fib_prog = assemble_rls(fib50_rls).map_err(|e| format!("{e:?}"))?;
         let rep_fib = execute_tier0_interpreter(&fib_prog, &[]).map_err(|e| format!("{e:?}"))?;
-        let RuntimeValue::Scalar(t0_fib) = rep_fib.output else {
-            return Err("expected Scalar".to_owned());
+        let RuntimeValue::TypedScalar(t0_fib) = rep_fib.output else {
+            return Err("expected TypedScalar".to_owned());
         };
-        assert_eq!(t0_fib.to_bits(), 12_586_269_025_u64);
+        assert_eq!(t0_fib.elem, crate::bytecode::ElemType::I64);
+        assert_eq!(t0_fib.bits, 12_586_269_025_u64);
 
         let exe_fib = std::env::temp_dir().join("rul_tc_core1_ac3_fib50");
         crate::aot::compile_rl_to_executable(&fib_prog, &exe_fib).map_err(|e| format!("{e:?}"))?;
@@ -3792,15 +3796,16 @@ output $out
 ";
         let gcd_prog = assemble_rls(nested_gcd_rls).map_err(|e| format!("{e:?}"))?;
         let rep_gcd = execute_tier0_interpreter(&gcd_prog, &[]).map_err(|e| format!("{e:?}"))?;
-        let RuntimeValue::Scalar(t0_gcd) = rep_gcd.output else {
-            return Err("expected Scalar".to_owned());
+        let RuntimeValue::TypedScalar(t0_gcd) = rep_gcd.output else {
+            return Err("expected TypedScalar".to_owned());
         };
         #[expect(
             clippy::cast_sign_loss,
             reason = "positive GCD sum compared via exact 64-bit integer bit pattern"
         )]
         let expected_gcd_bits = rust_gcd_sum as u64;
-        assert_eq!(t0_gcd.to_bits(), expected_gcd_bits);
+        assert_eq!(t0_gcd.elem, crate::bytecode::ElemType::I64);
+        assert_eq!(t0_gcd.bits, expected_gcd_bits);
 
         let exe_gcd = std::env::temp_dir().join("rul_tc_core1_ac3_nested_gcd");
         crate::aot::compile_rl_to_executable(&gcd_prog, &exe_gcd).map_err(|e| format!("{e:?}"))?;
@@ -3882,10 +3887,11 @@ output $res_cnt
 ";
         let nb_prog = assemble_rls(nested_bounded_rls).map_err(|e| format!("{e:?}"))?;
         let rep_nb = execute_tier0_interpreter(&nb_prog, &[]).map_err(|e| format!("{e:?}"))?;
-        let RuntimeValue::Scalar(t0_nb) = rep_nb.output else {
-            return Err("expected Scalar".to_owned());
+        let RuntimeValue::TypedScalar(t0_nb) = rep_nb.output else {
+            return Err("expected TypedScalar".to_owned());
         };
-        assert_eq!(t0_nb.to_bits(), 12_u64);
+        assert_eq!(t0_nb.elem, crate::bytecode::ElemType::I64);
+        assert_eq!(t0_nb.bits, 12_u64);
         let exe_nb = std::env::temp_dir().join("rul_tc_core1_ac3_nested_bounded");
         crate::aot::compile_rl_to_executable(&nb_prog, &exe_nb).map_err(|e| format!("{e:?}"))?;
         let aot_nb_res = crate::aot::run_compiled_scalar_executable(&exe_nb);
@@ -3895,7 +3901,10 @@ output $res_cnt
         // Verify white-box tracer and MCP differential harness on structured control-flow program.
         let trace_rep =
             crate::engine::trace_program(&nb_prog, &[]).map_err(|e| format!("{e:?}"))?;
-        assert_eq!(trace_rep.output, RuntimeValue::Scalar(f64::from_bits(12)));
+        assert_eq!(
+            trace_rep.output,
+            RuntimeValue::TypedScalar(crate::engine::TypedScalar::i64(12))
+        );
 
         // 9. Scalar F64 loop with `Ln`/`Exp` and `f64x8` lane hints on scalar nodes (including `output_node`),
         //    verifying `Tier 0 == ELF64 AOT` via `summary.output_shape == ValueShape::Scalar` AND MCP `rul_test_differential`.
@@ -4037,6 +4046,1387 @@ output $out
         let decompiled_2 = program_to_rls(&prog_2);
         let reassembled_2 = assemble_rls(&decompiled_2).map_err(|e| format!("{e:?}"))?;
         assert_eq!(reassembled_2.to_rl_bytes(), rl_bytes_2);
+
+        Ok(())
+    }
+
+    fn run_tc_core2_scalar_diff(
+        tag: &str,
+        rls: &str,
+        expected_elem: crate::bytecode::ElemType,
+        expected_bits: u64,
+    ) -> Result<(), String> {
+        use crate::aot::{compile_rl_to_executable, run_compiled_structured_executable};
+        use crate::transpiler::assemble_rls;
+
+        let prog = assemble_rls(rls).map_err(|e| format!("{tag} assemble: {e:?}"))?;
+        let summary = verify_program(&prog).map_err(|e| format!("{tag} verify: {e:?}"))?;
+        assert_eq!(summary.output_elem, expected_elem, "{tag} output_elem");
+        assert_eq!(summary.output_shape, ValueShape::Scalar, "{tag} shape");
+
+        let rep0 = execute_tier0_interpreter(&prog, &[]).map_err(|e| format!("{tag} t0: {e:?}"))?;
+        assert!(rep0.output_bytes.is_none(), "{tag} no output region");
+        let ts = rep0
+            .output
+            .as_typed_scalar()
+            .ok_or_else(|| format!("{tag} expected scalar output"))?;
+        assert_eq!(ts.elem, expected_elem, "{tag} tier0 typed elem");
+        assert_eq!(ts.bits, expected_bits, "{tag} tier0 bits");
+
+        let exe_path =
+            std::env::temp_dir().join(format!("rul_tc_core2_{}_{tag}", std::process::id()));
+        compile_rl_to_executable(&prog, &exe_path)
+            .map_err(|e| format!("{tag} aot compile: {e:?}"))?;
+        let aot_res = run_compiled_structured_executable(&exe_path, &[]);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = aot_res.map_err(|e| format!("{tag} aot exec: {e:?}"))?;
+        let bytes: [u8; 8] = stdout
+            .as_slice()
+            .try_into()
+            .map_err(|_e| format!("{tag} expected 8-byte stdout, got {}", stdout.len()))?;
+        let aot_bits = u64::from_le_bytes(bytes);
+        assert_eq!(aot_bits, expected_bits, "{tag} AOT != Tier0 bits");
+        Ok(())
+    }
+
+    #[test]
+    fn test_tc_core2_i64_u8_ops_and_cast() -> Result<(), String> {
+        use crate::aot::{compile_rl_to_executable, run_compiled_structured_executable, AotError};
+        use crate::bytecode::ElemType;
+        use crate::engine::TypedScalar;
+        use crate::transpiler::assemble_rls;
+
+        // 1. Verifier rejects mixed-type operands, disallowed Cast pairs (including identity),
+        //    ShrS/CmpLtU on non-I64, and MaskNot on non-BoolMask.
+        let invalid_cases = [
+            // Mixed I64 + U8
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $b = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $bad = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$b
+output $bad
+",
+            // Mixed U8 + F64
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $u = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $f = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=1.0
+node $bad = Add u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u b=$f
+output $bad
+",
+            // Identity Cast I64 -> I64
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $bad = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+output $bad
+",
+            // Identity Cast U8 -> U8
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $u = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $bad = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u b=0
+output $bad
+",
+            // Disallowed Cast BoolMask -> U8
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$a
+node $bad = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$m b=0
+output $bad
+",
+            // Disallowed Cast I64 -> BoolMask
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $bad = Cast maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+output $bad
+",
+            // Disallowed Cast BoolMask -> F64
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $m = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$a
+node $bad = Cast f64x1 fg=0 pol=l1 proof=0 tok=pure a=$m b=0
+output $bad
+",
+            // ShrS on U8
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=200
+node $b = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2
+node $ua = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $ub = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$b b=0
+node $bad = ShrS u8x1 fg=0 pol=l1 proof=0 tok=pure a=$ua b=$ub
+output $bad
+",
+            // CmpLtU on U8
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $b = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2
+node $ua = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $ub = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$b b=0
+node $bad = CmpLtU maskx1 fg=0 pol=l1 proof=0 tok=pure a=$ua b=$ub
+output $bad
+",
+            // MaskNot on I64
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $bad = MaskNot maskx1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+output $bad
+",
+            // MaskNot on U8
+            "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $u = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $bad = MaskNot maskx1 fg=0 pol=l1 proof=0 tok=pure a=$u b=0
+output $bad
+",
+        ];
+        for (i, src) in invalid_cases.iter().enumerate() {
+            let p = assemble_rls(src).map_err(|e| format!("invalid_case[{i}] assemble: {e:?}"))?;
+            let err = verify_program(&p);
+            assert!(
+                matches!(
+                    err,
+                    Err(crate::verifier::VerifyDiagnostic {
+                        kind: VerifyErrorKind::ElementTypeMismatch { .. },
+                        ..
+                    })
+                ),
+                "invalid_case[{i}] expected ElementTypeMismatch, got {err:?}"
+            );
+        }
+
+        // 2. Comprehensive I64 bitwise, shifts (& 63), signed Div/Rem, CmpLtU, MaskNot, BoolMask->I64.
+        let i64_ops_rls = "\
+cap NONE
+node $neg100 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-100
+node $c7 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=7
+node $c66 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=66
+node $c1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $neg1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $q = Div i64x1 fg=0 pol=l1 proof=0 tok=pure a=$neg100 b=$c7
+node $r = Rem i64x1 fg=0 pol=l1 proof=0 tok=pure a=$neg100 b=$c7
+node $qr = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$q b=$r
+node $shl = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c7 b=$c66
+node $shrs = ShrS i64x1 fg=0 pol=l1 proof=0 tok=pure a=$neg100 b=$c66
+node $shru = ShrU i64x1 fg=0 pol=l1 proof=0 tok=pure a=$neg1 b=$c66
+node $band = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$shru b=$c7
+node $bor = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$shl b=$band
+node $bxor = BitXor i64x1 fg=0 pol=l1 proof=0 tok=pure a=$bor b=$shrs
+node $ult1 = CmpLtU maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c1 b=$neg1
+node $ult2 = CmpLtU maskx1 fg=0 pol=l1 proof=0 tok=pure a=$neg1 b=$c1
+node $not2 = MaskNot maskx1 fg=0 pol=l1 proof=0 tok=pure a=$ult2 b=0
+node $both = MaskAnd maskx1 fg=0 pol=l1 proof=0 tok=pure a=$ult1 b=$not2
+node $b2i = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$both b=0
+node $s1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$qr b=$bxor
+node $out = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$s1 b=$b2i
+output $out
+";
+        let q = -100_i64 / 7;
+        let r = -100_i64 % 7;
+        let shl = 7_i64.wrapping_shl(66 & 63);
+        let shrs = (-100_i64).wrapping_shr(66 & 63);
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "reference logical right shift of u64::MAX by 2"
+        )]
+        let shru = (u64::MAX >> (66 & 63)) as i64;
+        let expected_i64 = q
+            .wrapping_add(r)
+            .wrapping_add((shl | (shru & 7)) ^ shrs)
+            .wrapping_add(1);
+        run_tc_core2_scalar_diff(
+            "ac1_i64_ops",
+            i64_ops_rls,
+            ElemType::I64,
+            TypedScalar::i64(expected_i64).bits,
+        )?;
+
+        // 3. Comprehensive U8 wrapping Add/Sub/Mul, unsigned Div/Rem, BitAnd/Or/Xor, Shl (including 8-bit overflow)/ShrU (& 7),
+        //    CmpGt/CmpLt/CmpEq, SelectZero, I64->U8 out-of-range truncation (-1 -> 255, 300 -> 44), and U8 typed scalar output.
+        let u8_ops_rls = "\
+cap NONE
+node $c250 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=250
+node $c10 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $c7 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=7
+node $c9 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=9
+node $cneg1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $c300 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=300
+node $u250 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c250 b=0
+node $u10 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c10 b=0
+node $u7 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c7 b=0
+node $u9 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c9 b=0
+node $u255 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$cneg1 b=0
+node $u44 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c300 b=0
+node $add = Add u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u250 b=$u10
+node $sub = Sub u8x1 fg=0 pol=l1 proof=0 tok=pure a=$add b=$u10
+node $mul = Mul u8x1 fg=0 pol=l1 proof=0 tok=pure a=$sub b=$u7
+node $div = Div u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u250 b=$u7
+node $rem = Rem u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u250 b=$u7
+node $shl = Shl u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u250 b=$u9
+node $shru = ShrU u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u250 b=$u9
+node $bx = BitXor u8x1 fg=0 pol=l1 proof=0 tok=pure a=$mul b=$div
+node $bo = BitOr u8x1 fg=0 pol=l1 proof=0 tok=pure a=$bx b=$rem
+node $ba = BitAnd u8x1 fg=0 pol=l1 proof=0 tok=pure a=$shl b=$shru
+node $gt = CmpGt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$u255 b=$u44
+node $lt = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$u44 b=$u255
+node $eq = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$u44 b=$u44
+node $m1 = MaskAnd maskx1 fg=0 pol=l1 proof=0 tok=pure a=$gt b=$lt
+node $m2 = MaskAnd maskx1 fg=0 pol=l1 proof=0 tok=pure a=$m1 b=$eq
+node $sel = SelectZero u8x1 fg=0 pol=l1 proof=0 tok=pure a=$m2 b=$bo
+node $t1 = Add u8x1 fg=0 pol=l1 proof=0 tok=pure a=$sel b=$ba
+node $t2 = Add u8x1 fg=0 pol=l1 proof=0 tok=pure a=$t1 b=$u255
+node $out = Add u8x1 fg=0 pol=l1 proof=0 tok=pure a=$t2 b=$u44
+output $out
+";
+        let u_add = 250_u8.wrapping_add(10);
+        let u_sub = u_add.wrapping_sub(10);
+        let u_mul = u_sub.wrapping_mul(7);
+        let u_div = 250_u8 / 7;
+        let u_rem = 250_u8 % 7;
+        let u_shl = 250_u8.wrapping_shl(9 & 7); // 250 << 1 == 244 (tests 8-bit overflow masking!)
+        let u_shru = 250_u8.wrapping_shr(9 & 7);
+        let expected_u8 = ((u_mul ^ u_div) | u_rem)
+            .wrapping_add(u_shl & u_shru)
+            .wrapping_add(255)
+            .wrapping_add(44);
+        run_tc_core2_scalar_diff(
+            "ac1_u8_ops",
+            u8_ops_rls,
+            ElemType::U8,
+            u64::from(expected_u8),
+        )?;
+
+        // 4. All 7 Cast directions including boundary values (-2^63 -> i64::MIN, -0.5 -> 0u8, 255.9 -> 255u8).
+        let cast_f64_min_rls = "\
+cap NONE
+node $f = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=-9223372036854775808.0
+node $out = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$f b=0
+output $out
+";
+        run_tc_core2_scalar_diff(
+            "ac1_cast_f64_i64_min",
+            cast_f64_min_rls,
+            ElemType::I64,
+            TypedScalar::i64(i64::MIN).bits,
+        )?;
+
+        let cast_f64_u8_neg_half_rls = "\
+cap NONE
+node $f = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=-0.99
+node $u = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$f b=0
+node $f2 = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=255.9
+node $u2 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$f2 b=0
+node $out = Add u8x1 fg=0 pol=l1 proof=0 tok=pure a=$u b=$u2
+output $out
+";
+        run_tc_core2_scalar_diff(
+            "ac1_cast_f64_u8_trunc",
+            cast_f64_u8_neg_half_rls,
+            ElemType::U8,
+            255_u64,
+        )?;
+
+        let cast_int_to_f64_rls = "\
+cap NONE
+node $i = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-42
+node $fi = Cast f64x1 fg=0 pol=l1 proof=0 tok=pure a=$i b=0
+node $c200 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=200
+node $u = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c200 b=0
+node $fu = Cast f64x1 fg=0 pol=l1 proof=0 tok=pure a=$u b=0
+node $out = Add f64x1 fg=0 pol=l1 proof=0 tok=pure a=$fi b=$fu
+output $out
+";
+        run_tc_core2_scalar_diff(
+            "ac1_cast_int_to_f64",
+            cast_int_to_f64_rls,
+            ElemType::F64,
+            (158.0_f64).to_bits(),
+        )?;
+
+        // 5. Fail-closed equivalence on integer division/rem faults (exit 72) and Cast faults (exit 73).
+        let div_fault_cases = [
+            (
+                "i64_div_zero",
+                "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=42
+node $z = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $out = Div i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$z
+output $out
+",
+            ),
+            (
+                "i64_rem_zero",
+                "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=42
+node $z = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $out = Rem i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$z
+output $out
+",
+            ),
+            (
+                "i64_min_div_neg1",
+                "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-9223372036854775808
+node $b = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $out = Div i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$b
+output $out
+",
+            ),
+            (
+                "i64_min_rem_neg1",
+                "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-9223372036854775808
+node $b = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $out = Rem i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=$b
+output $out
+",
+            ),
+            (
+                "u8_div_zero",
+                "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $z = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $ua = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $uz = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$z b=0
+node $out = Div u8x1 fg=0 pol=l1 proof=0 tok=pure a=$ua b=$uz
+output $out
+",
+            ),
+            (
+                "u8_rem_zero",
+                "\
+cap NONE
+node $a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $z = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $ua = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$a b=0
+node $uz = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$z b=0
+node $out = Rem u8x1 fg=0 pol=l1 proof=0 tok=pure a=$ua b=$uz
+output $out
+",
+            ),
+        ];
+        for (tag, src) in div_fault_cases {
+            let p = assemble_rls(src).map_err(|e| format!("{tag}: {e:?}"))?;
+            assert!(
+                matches!(
+                    execute_tier0_interpreter(&p, &[]),
+                    Err(ExecError::IntegerDivisionError { .. })
+                ),
+                "{tag} Tier 0 expected IntegerDivisionError"
+            );
+            let exe =
+                std::env::temp_dir().join(format!("rul_tc_core2_{}_{tag}", std::process::id()));
+            compile_rl_to_executable(&p, &exe).map_err(|e| format!("{tag} compile: {e:?}"))?;
+            let aot_res = run_compiled_structured_executable(&exe, &[]);
+            let _ = std::fs::remove_file(&exe);
+            assert!(
+                matches!(aot_res, Err(AotError::IntegerDivisionError)),
+                "{tag} AOT expected IntegerDivisionError (exit 72), got {aot_res:?}"
+            );
+        }
+
+        // Cast fault cases (exit 73): NaN, +Inf, -Inf, +2^63 -> I64, -1.0 -> U8, 256.0 -> U8.
+        let cast_fault_programs: Vec<(&str, RulProgram)> = vec![
+            (
+                "f64_nan_to_i64",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(f64::NAN, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::I64_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_2p63_to_i64",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(9_223_372_036_854_775_808.0, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::I64_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_neg_inf_to_i64",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(f64::NEG_INFINITY, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::I64_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_neg1_to_u8",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(-1.0, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::U8_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_256_to_u8",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(256.0, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::U8_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_pos_inf_to_i64",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(f64::INFINITY, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::I64_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_pos_inf_to_u8",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(f64::INFINITY, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::U8_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_neg_inf_to_u8",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(f64::NEG_INFINITY, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::U8_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+            (
+                "f64_nan_to_u8",
+                RulProgram {
+                    capability_mask: CAP_NONE,
+                    arenas: Vec::new(),
+                    proofs: Vec::new(),
+                    nodes: vec![
+                        NodeFrame::const_f64(f64::NAN, ScheduleHint::UNFUSED),
+                        NodeFrame {
+                            opcode: Opcode::Cast,
+                            type_lane: TypeLane::U8_SCALAR,
+                            schedule: ScheduleHint::UNFUSED,
+                            proof_idx: 0,
+                            token_op: TokenOp::PURE,
+                            in_a: 0,
+                            in_b: 0,
+                        },
+                    ],
+                    output_node: 1,
+                },
+            ),
+        ];
+        for (tag, p) in cast_fault_programs {
+            assert!(
+                matches!(
+                    execute_tier0_interpreter(&p, &[]),
+                    Err(ExecError::CastOutOfRange { .. })
+                ),
+                "{tag} Tier 0 expected CastOutOfRange"
+            );
+            let exe =
+                std::env::temp_dir().join(format!("rul_tc_core2_{}_{tag}", std::process::id()));
+            compile_rl_to_executable(&p, &exe).map_err(|e| format!("{tag} compile: {e:?}"))?;
+            let aot_res = run_compiled_structured_executable(&exe, &[]);
+            let _ = std::fs::remove_file(&exe);
+            assert!(
+                matches!(aot_res, Err(AotError::CastOutOfRange)),
+                "{tag} AOT expected CastOutOfRange (exit 73), got {aot_res:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tc_core2_growable_regions_and_bounds() -> Result<(), String> {
+        use crate::aot::{compile_rl_to_executable, run_compiled_structured_executable, AotError};
+        use crate::bytecode::ElemType;
+        use crate::transpiler::assemble_rls;
+
+        // 1. Verifier rejects invalid RegionDecl entries and malformed region opcodes.
+        let invalid_decl_cases = [
+            // slot >= 64
+            "\
+cap NONE
+proof 1 rule=region_decl target=64 lo=0 hi=16 witness=u8:plain
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // duplicate slot
+            "\
+cap NONE
+proof 1 rule=region_decl target=2 lo=0 hi=16 witness=u8:plain
+proof 2 rule=region_decl target=2 lo=0 hi=32 witness=i64:plain
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // min_len > max_len
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=20 hi=10 witness=i64:plain
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // max_len bytes > MAX_REGION_BYTES (33_554_433 * 8 > 256 MiB)
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=33554433 witness=i64:plain
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // unsupported element type (BoolMask = 3)
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=16 witness=3
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // RegionFree when min_len > 0
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=u8:plain
+node $fr = RegionFree u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // Undeclared slot
+            "\
+cap NONE
+node $out = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=pure a=5 b=0
+output $out
+",
+            // Element type mismatch on RegionLoad
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=u8:plain
+node $z = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$z
+output $out
+",
+            // Non-pure token on region opcode
+            "\
+cap NONE
+arena 0 len=4 lane=f64x4 mut=false ver=1
+proof 1 rule=region_decl target=0 lo=0 hi=16 witness=u8:plain
+node $out = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=read(0,1) a=0 b=0
+output $out
+",
+        ];
+        for (i, src) in invalid_decl_cases.iter().enumerate() {
+            let p = assemble_rls(src).map_err(|e| format!("invalid_decl[{i}] assemble: {e:?}"))?;
+            assert!(
+                verify_program(&p).is_err(),
+                "invalid_decl[{i}] must be rejected by verifier"
+            );
+        }
+
+        // 2. Full lifecycle across U8, I64, F64 regions (slots 0, 7, 63), growth across 4096B page boundaries
+        //    (triggering SYS_mremap), zero-initialization after RegionNew shrink + RegionGrow, and RegionFree.
+        let lifecycle_rls = "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=10000 witness=u8:plain
+proof 2 rule=region_decl target=7 lo=4 hi=1000 witness=i64:plain
+proof 3 rule=region_decl target=63 lo=2 hi=8 witness=f64:plain
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $c1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $c3 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3
+node $c10 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $c5000 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=5000
+node $c4999 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=4999
+node $c77 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=77
+node $u77 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c77 b=0
+node $g1 = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c10
+node $st1 = RegionStore u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3 c=$u77
+node $g2 = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c5000
+node $ld_old = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3
+node $ld_new_zero = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c4999
+node $rn = RegionNew u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c0
+node $g3 = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c10
+node $ld_rezero = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3
+node $fr = RegionFree u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $len_after_free = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $i_init_zero = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=7 b=$c3
+node $st_i = RegionStore i64x1 fg=0 pol=l1 proof=0 tok=pure a=7 b=$c3 c=$c5000
+node $ld_i = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=7 b=$c3
+node $f_val = ConstF64 f64x1 fg=0 pol=l1 proof=0 tok=pure const=12.5
+node $st_f = RegionStore f64x1 fg=0 pol=l1 proof=0 tok=pure a=63 b=$c1 c=$f_val
+node $ld_f0 = RegionLoad f64x1 fg=0 pol=l1 proof=0 tok=pure a=63 b=$c0
+node $ld_f1 = RegionLoad f64x1 fg=0 pol=l1 proof=0 tok=pure a=63 b=$c1
+node $fsum = Add f64x1 fg=0 pol=l1 proof=0 tok=pure a=$ld_f0 b=$ld_f1
+node $fsum_i = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$fsum b=0
+node $u_old_i = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$ld_old b=0
+node $u_zero_i = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$ld_new_zero b=0
+node $u_rezero_i = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$ld_rezero b=0
+node $a1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$g1 b=$g2
+node $a2 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a1 b=$g3
+node $a3 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a2 b=$len_after_free
+node $a4 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a3 b=$i_init_zero
+node $a5 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a4 b=$ld_i
+node $a6 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a5 b=$fsum_i
+node $a7 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a6 b=$u_old_i
+node $a8 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a7 b=$u_zero_i
+node $out = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$a8 b=$u_rezero_i
+output $out
+";
+        let lifecycle_prog = assemble_rls(lifecycle_rls).map_err(|e| format!("{e:?}"))?;
+        let summary = verify_program(&lifecycle_prog).map_err(|e| format!("{e:?}"))?;
+        assert!(
+            !summary.zero_runtime_bounds_checks,
+            "unproven region accesses must set zero_runtime_bounds_checks = false"
+        );
+        assert_eq!(
+            execute_tier1_stencil(&lifecycle_prog, &[]),
+            Err(ExecError::UnsupportedInColumnarTier)
+        );
+        assert_eq!(
+            execute_tier2_fused(&lifecycle_prog, &[]),
+            Err(ExecError::UnsupportedInColumnarTier)
+        );
+        // Expected: g1(10) + g2(5010) + g3(10) + len_after_free(0) + i_init_zero(0) + ld_i(5000) + fsum_i(12) + u_old_i(77) + 0 + 0 = 10119
+        run_tc_core2_scalar_diff("ac2_lifecycle", lifecycle_rls, ElemType::I64, 10_119_u64)?;
+
+        // 2b. Exercise 8-byte (I64) RegionGrow across page boundaries, non-zero RegionNew exceeding capacity
+        //     (munmap + mmap), non-zero RegionNew within existing capacity (rep stosb zeroing), and
+        //     RegionFree followed by re-allocation via RegionGrow from cap_bytes == 0.
+        let i64_reset_realloc_rls = "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=4000 witness=i64:plain
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $c3 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3
+node $c4 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=4
+node $c5 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=5
+node $c10 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=10
+node $c599 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=599
+node $c600 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=600
+node $c1500 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1500
+node $s1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1111
+node $s2 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2222
+node $s3 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3333
+node $g600 = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c600
+node $st_a = RegionStore i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3 c=$s1
+node $st_b = RegionStore i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c599 c=$s2
+node $ld_599 = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c599
+node $rn_big = RegionNew i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c1500
+node $len_big = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ld_big_zero = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3
+node $st_c = RegionStore i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3 c=$s1
+node $rn_small = RegionNew i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c10
+node $len_small = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ld_small_zero = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3
+node $fr = RegionFree i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $g5 = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c5
+node $st_d = RegionStore i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c4 c=$s3
+node $ld_d = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c4
+node $ld_d0 = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c0
+node $t1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$g600 b=$ld_599
+node $t2 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$t1 b=$len_big
+node $t3 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$t2 b=$ld_big_zero
+node $t4 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$t3 b=$len_small
+node $t5 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$t4 b=$ld_small_zero
+node $t6 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$t5 b=$g5
+node $t7 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$t6 b=$ld_d
+node $out = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$t7 b=$ld_d0
+output $out
+";
+        // Expected: 600 + 2222 + 1500 + 0 + 10 + 0 + 5 + 3333 + 0 = 7670
+        run_tc_core2_scalar_diff(
+            "ac2_i64_reset_realloc",
+            i64_reset_realloc_rls,
+            ElemType::I64,
+            7_670_u64,
+        )?;
+
+        // 3. Runtime bounds checks (exit 71) and allocation/range checks (exit 74) match across Tier 0 & AOT.
+        let oob_cases = [
+            (
+                "oob_eq_len",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=i64:plain
+node $idx = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=4
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$idx
+output $out
+",
+            ),
+            (
+                "oob_neg_idx",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=i64:plain
+node $idx = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$idx
+output $out
+",
+            ),
+            (
+                "oob_store_after_free",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=16 witness=i64:plain
+node $c2 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2
+node $g = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c2
+node $fr = RegionFree i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $st = RegionStore i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c0 c=$g
+output $g
+",
+            ),
+        ];
+        for (tag, src) in oob_cases {
+            let p = assemble_rls(src).map_err(|e| format!("{tag}: {e:?}"))?;
+            assert!(
+                matches!(
+                    execute_tier0_interpreter(&p, &[]),
+                    Err(ExecError::RegionBoundsOutOfRange { .. })
+                ),
+                "{tag} Tier 0 expected RegionBoundsOutOfRange"
+            );
+            let exe =
+                std::env::temp_dir().join(format!("rul_tc_core2_{}_{tag}", std::process::id()));
+            compile_rl_to_executable(&p, &exe).map_err(|e| format!("{tag} compile: {e:?}"))?;
+            let aot_res = run_compiled_structured_executable(&exe, &[]);
+            let _ = std::fs::remove_file(&exe);
+            assert!(
+                matches!(aot_res, Err(AotError::GatherOutOfBounds)),
+                "{tag} AOT expected GatherOutOfBounds (exit 71), got {aot_res:?}"
+            );
+        }
+
+        let oom_cases = [
+            (
+                "new_below_min",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=i64:plain
+node $c3 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3
+node $rn = RegionNew i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c3
+output $c3
+",
+            ),
+            (
+                "new_above_max",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=i64:plain
+node $c17 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=17
+node $rn = RegionNew i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c17
+output $c17
+",
+            ),
+            (
+                "new_negative",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=16 witness=i64:plain
+node $cn = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-5
+node $rn = RegionNew i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$cn
+output $cn
+",
+            ),
+            (
+                "grow_negative",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=16 witness=i64:plain
+node $cn = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $out = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$cn
+output $out
+",
+            ),
+            (
+                "grow_above_max",
+                "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=i64:plain
+node $c13 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=13
+node $out = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c13
+output $out
+",
+            ),
+        ];
+        for (tag, src) in oom_cases {
+            let p = assemble_rls(src).map_err(|e| format!("{tag}: {e:?}"))?;
+            assert!(
+                matches!(
+                    execute_tier0_interpreter(&p, &[]),
+                    Err(ExecError::RegionAllocationFailed { .. })
+                ),
+                "{tag} Tier 0 expected RegionAllocationFailed"
+            );
+            let exe =
+                std::env::temp_dir().join(format!("rul_tc_core2_{}_{tag}", std::process::id()));
+            compile_rl_to_executable(&p, &exe).map_err(|e| format!("{tag} compile: {e:?}"))?;
+            let aot_res = run_compiled_structured_executable(&exe, &[]);
+            let _ = std::fs::remove_file(&exe);
+            assert!(
+                matches!(aot_res, Err(AotError::RegionAllocationFailed)),
+                "{tag} AOT expected RegionAllocationFailed (exit 74), got {aot_res:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tc_core2_rls_roundtrip() -> Result<(), String> {
+        use crate::transpiler::{assemble_rls, program_to_rls};
+
+        let rls = "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=1024 witness=u8:input
+proof 2 rule=region_decl target=1 lo=0 hi=1024 witness=u8:output
+proof 3 rule=region_decl target=2 lo=8 hi=64 witness=i64:plain
+proof 4 rule=region_decl target=3 lo=0 hi=32 witness=f64:plain
+proof 5 rule=region_index_in_bounds target=2 lo=0 hi=8 witness=0
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $c1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $c7 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=7
+node $c3 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3
+node $rem = Rem i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c7 b=$c3
+node $band = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rem b=$c7
+node $bor = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$band b=$c1
+node $bxor = BitXor i64x1 fg=0 pol=l1 proof=0 tok=pure a=$bor b=$c3
+node $shl = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$bxor b=$c1
+node $shru = ShrU i64x1 fg=0 pol=l1 proof=0 tok=pure a=$shl b=$c1
+node $shrs = ShrS i64x1 fg=0 pol=l1 proof=0 tok=pure a=$shru b=$c1
+node $ult = CmpLtU maskx1 fg=0 pol=l1 proof=0 tok=pure a=$c0 b=$c7
+node $nult = MaskNot maskx1 fg=0 pol=l1 proof=0 tok=pure a=$ult b=0
+node $u = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$shrs b=0
+node $i_from_u = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$u b=0
+node $i_from_m = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$nult b=0
+node $st2 = RegionStore i64x1 fg=0 pol=l1 proof=5 tok=pure a=2 b=$band c=$i_from_u
+node $ld2 = RegionLoad i64x1 fg=0 pol=l1 proof=5 tok=pure a=2 b=$c0
+node $len0 = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $g1 = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$c1
+node $st1 = RegionStore u8x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$c0 c=$u
+node $rn3 = RegionNew f64x1 fg=0 pol=l1 proof=0 tok=pure a=3 b=$c1
+node $fr3 = RegionFree f64x1 fg=0 pol=l1 proof=0 tok=pure a=3 b=0
+node $s1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$ld2 b=$len0
+node $s2 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$s1 b=$g1
+node $out = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$s2 b=$i_from_m
+output $out
+";
+        let prog = assemble_rls(rls).map_err(|e| format!("{e:?}"))?;
+        verify_program(&prog).map_err(|e| format!("{e:?}"))?;
+
+        let rl_bytes = prog.to_rl_bytes();
+        let decoded = RulProgram::from_rl_bytes(&rl_bytes).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(decoded.to_rl_bytes(), rl_bytes);
+
+        let decompiled = program_to_rls(&decoded);
+        assert!(decompiled.contains("rule=region_decl"));
+        assert!(decompiled.contains("witness=u8:input"));
+        assert!(decompiled.contains("witness=u8:output"));
+        assert!(decompiled.contains("rule=region_index_in_bounds"));
+
+        let reassembled = assemble_rls(&decompiled).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(reassembled.to_rl_bytes(), rl_bytes);
+
+        let disasm = disassemble_rl(&prog);
+        assert!(disasm.contains("RegionStore"));
+        assert!(disasm.contains("RegionDecl"));
+        assert!(disasm.contains("RegionIndexInBounds"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_tc_core2_io_regions() -> Result<(), String> {
+        use crate::aot::{compile_rl_to_executable, run_compiled_structured_executable, AotError};
+        use crate::engine::execute_tier0_interpreter_with_input;
+        use crate::transpiler::assemble_rls;
+
+        // 1. Verifier rejects invalid input/output region declarations.
+        let bad_io_decls = [
+            // Input region not U8
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=64 witness=i64:input
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // Output region not U8
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=64 witness=f64:output
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // Input region with min_len != 0
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=1 hi=64 witness=u8:input
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // Duplicate input region
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=64 witness=u8:input
+proof 2 rule=region_decl target=1 lo=0 hi=64 witness=u8:input
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+            // Duplicate output region
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=64 witness=u8:output
+proof 2 rule=region_decl target=1 lo=0 hi=64 witness=u8:output
+node $out = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $out
+",
+        ];
+        for (i, src) in bad_io_decls.iter().enumerate() {
+            let p = assemble_rls(src).map_err(|e| format!("bad_io[{i}]: {e:?}"))?;
+            assert!(
+                verify_program(&p).is_err(),
+                "bad_io[{i}] must fail verification"
+            );
+        }
+
+        // 2. Transform stdin -> reversed XOR 0x5A into output region (max_len = 16384), testing empty,
+        //    small, multi-page (> 4096B mremap), exact max_len, and overflow (> max_len -> exit 74, empty stdout).
+        let xform_rls = "\
+cap DIVERGE
+proof 1 rule=region_decl target=0 lo=0 hi=16384 witness=u8:input
+proof 2 rule=region_decl target=1 lo=0 hi=16384 witness=u8:output
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $c1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $k5a = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=90
+node $uk = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$k5a b=0
+node $n = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $g = RegionGrow i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$n
+node $si = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c0
+node $blk = Block i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $lp = Loop i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $i = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $done = CmpEq maskx1 fg=0 pol=l1 proof=0 tok=pure a=$i b=$n
+node $br_done = BrIf maskx1 fg=0 pol=l1 proof=0 tok=pure a=$done b=1
+node $b = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$i
+node $xb = BitXor u8x1 fg=0 pol=l1 proof=0 tok=pure a=$b b=$uk
+node $n_sub1 = Sub i64x1 fg=0 pol=l1 proof=0 tok=pure a=$n b=$c1
+node $dst = Sub i64x1 fg=0 pol=l1 proof=0 tok=pure a=$n_sub1 b=$i
+node $st = RegionStore u8x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$dst c=$xb
+node $i1 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$i b=$c1
+node $ui = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$i1
+node $back = Br i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_lp = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $end_blk = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $g
+";
+        let xform_prog = assemble_rls(xform_rls).map_err(|e| format!("{e:?}"))?;
+        verify_program(&xform_prog).map_err(|e| format!("{e:?}"))?;
+        let exe_xform =
+            std::env::temp_dir().join(format!("rul_tc_core2_io_xform_{}", std::process::id()));
+        compile_rl_to_executable(&xform_prog, &exe_xform).map_err(|e| format!("{e:?}"))?;
+
+        let multipage_input: Vec<u8> = (0..10_000usize)
+            .map(|i| ((i * 31 + 7) & 0xFF) as u8)
+            .collect();
+        let exact_max_input: Vec<u8> = (0..16_384usize)
+            .map(|i| ((i * 13 + 3) & 0xFF) as u8)
+            .collect();
+        for payload in [
+            &b""[..],
+            &b"Hello, Rul v0.5!"[..],
+            &multipage_input,
+            &exact_max_input,
+        ] {
+            let expected: Vec<u8> = payload.iter().rev().map(|&b| b ^ 0x5A).collect();
+            let rep0 = execute_tier0_interpreter_with_input(&xform_prog, &[], payload)
+                .map_err(|e| format!("t0 len={}: {e:?}", payload.len()))?;
+            assert_eq!(rep0.output_bytes.as_deref(), Some(expected.as_slice()));
+            let ts = rep0
+                .output
+                .as_typed_scalar()
+                .ok_or_else(|| "expected typed scalar alongside output_bytes".to_owned())?;
+            assert_eq!(ts.bits, payload.len() as u64);
+
+            let aot_out = run_compiled_structured_executable(&exe_xform, payload)
+                .map_err(|e| format!("aot len={}: {e:?}", payload.len()))?;
+            assert_eq!(aot_out, expected);
+        }
+
+        // Input exceeding max_len (16385 > 16384) -> fail closed with exit 74 & 0 stdout bytes.
+        let overflow_input = vec![0xAB_u8; 16_385];
+        assert!(matches!(
+            execute_tier0_interpreter_with_input(&xform_prog, &[], &overflow_input),
+            Err(ExecError::RegionAllocationFailed { slot: 0 })
+        ));
+        let aot_over = run_compiled_structured_executable(&exe_xform, &overflow_input);
+        let _ = std::fs::remove_file(&exe_xform);
+        assert!(
+            matches!(aot_over, Err(AotError::RegionAllocationFailed)),
+            "expected RegionAllocationFailed (exit 74, empty stdout), got {aot_over:?}"
+        );
+
+        // 3. Input region with max_len == 0: empty input ok, 1-byte input fails with exit 74 (Tier 0 == AOT).
+        let zero_max_rls = "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=0 witness=u8:input
+node $out = RegionLen i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+output $out
+";
+        let zero_prog = assemble_rls(zero_max_rls).map_err(|e| format!("{e:?}"))?;
+        let t0_zero_ok = execute_tier0_interpreter_with_input(&zero_prog, &[], &[])
+            .map_err(|e| format!("t0 zero ok: {e:?}"))?;
+        assert_eq!(t0_zero_ok.output.as_typed_scalar().map(|s| s.bits), Some(0));
+        assert!(matches!(
+            execute_tier0_interpreter_with_input(&zero_prog, &[], b"x"),
+            Err(ExecError::RegionAllocationFailed { slot: 0 })
+        ));
+        let exe_zero =
+            std::env::temp_dir().join(format!("rul_tc_core2_io_zero_{}", std::process::id()));
+        compile_rl_to_executable(&zero_prog, &exe_zero).map_err(|e| format!("{e:?}"))?;
+        let ok_zero =
+            run_compiled_structured_executable(&exe_zero, &[]).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(ok_zero, 0_u64.to_le_bytes());
+        let fail_zero = run_compiled_structured_executable(&exe_zero, b"x");
+        let _ = std::fs::remove_file(&exe_zero);
+        assert!(matches!(fail_zero, Err(AotError::RegionAllocationFailed)));
+
+        // 4. Mid-execution trap after writing to output region must fail in Tier 0 and emit ZERO stdout bytes in AOT.
+        let trap_after_write_rls = "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=4 hi=16 witness=u8:output
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $c65 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=65
+node $u65 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c65 b=0
+node $st = RegionStore u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c0 c=$u65
+node $trap = Div i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c65 b=$c0
+output $trap
+";
+        let trap_prog = assemble_rls(trap_after_write_rls).map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            execute_tier0_interpreter_with_input(&trap_prog, &[], &[]),
+            Err(ExecError::IntegerDivisionError { .. })
+        ));
+        let exe_trap =
+            std::env::temp_dir().join(format!("rul_tc_core2_io_trap_{}", std::process::id()));
+        compile_rl_to_executable(&trap_prog, &exe_trap).map_err(|e| format!("{e:?}"))?;
+        // `run_compiled_structured_executable` explicitly fails if any stdout bytes are written on fail-closed exit.
+        let trap_res = run_compiled_structured_executable(&exe_trap, &[]);
+        let _ = std::fs::remove_file(&exe_trap);
+        assert!(matches!(trap_res, Err(AotError::IntegerDivisionError)));
+
+        // 5. Pipe-deadlock regression: output-only program emitting 100 KiB fed 100 KiB of unread stdin
+        //    must finish cleanly without blocking.
+        let big_out_only_rls = "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=102400 hi=102400 witness=u8:output
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $c99 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=99
+node $u99 = Cast u8x1 fg=0 pol=l1 proof=0 tok=pure a=$c99 b=0
+node $st = RegionStore u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c0 c=$u99
+output $c0
+";
+        let big_out_prog = assemble_rls(big_out_only_rls).map_err(|e| format!("{e:?}"))?;
+        let exe_big_out =
+            std::env::temp_dir().join(format!("rul_tc_core2_io_big_out_{}", std::process::id()));
+        compile_rl_to_executable(&big_out_prog, &exe_big_out).map_err(|e| format!("{e:?}"))?;
+        let large_unread_stdin = vec![0x55_u8; 102_400];
+        let big_out_bytes = run_compiled_structured_executable(&exe_big_out, &large_unread_stdin)
+            .map_err(|e| format!("big_out_only: {e:?}"))?;
+        let _ = std::fs::remove_file(&exe_big_out);
+        assert_eq!(big_out_bytes.len(), 102_400);
+        assert_eq!(big_out_bytes.first().copied(), Some(99));
+        assert_eq!(big_out_bytes.last().copied(), Some(0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tc_core2_region_index_proof_elision() -> Result<(), String> {
+        use crate::aot::compile_to_elf64_bytes;
+        use crate::bytecode::ElemType;
+        use crate::transpiler::assemble_rls;
+
+        // 1. Valid proven accesses: ConstI64 c (0 <= c < bound_hi <= min_len) AND BitAnd with ConstI64 m
+        //    (both operand orders, even with negative runtime LHS), keeping zero_runtime_bounds_checks == true!
+        let proven_rls = "\
+cap NONE
+proof 1 rule=region_decl target=1 lo=16 hi=32 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=1 lo=0 hi=16 witness=0
+node $c5 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=5
+node $c15 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=15
+node $neg = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $v1 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=111
+node $v2 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=222
+node $idx_rhs = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$neg b=$c15
+node $idx_lhs = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$c15 b=$neg
+node $st1 = RegionStore i64x1 fg=0 pol=l1 proof=2 tok=pure a=1 b=$c5 c=$v1
+node $st2 = RegionStore i64x1 fg=0 pol=l1 proof=2 tok=pure a=1 b=$idx_rhs c=$v2
+node $ld1 = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=1 b=$c5
+node $ld2 = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=1 b=$idx_lhs
+node $out = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$ld1 b=$ld2
+output $out
+";
+        let proven_prog = assemble_rls(proven_rls).map_err(|e| format!("{e:?}"))?;
+        let proven_summary = verify_program(&proven_prog).map_err(|e| format!("{e:?}"))?;
+        assert!(
+            proven_summary.zero_runtime_bounds_checks,
+            "all region accesses proven -> zero_runtime_bounds_checks must be true"
+        );
+        run_tc_core2_scalar_diff("ac6_proven", proven_rls, ElemType::I64, 333_u64)?;
+
+        // Compare emitted code size vs identical unproven program: elided bounds checks emit strictly fewer bytes.
+        let unproven_rls = proven_rls.replace("proof=2", "proof=0");
+        let unproven_prog = assemble_rls(&unproven_rls).map_err(|e| format!("{e:?}"))?;
+        let unproven_summary = verify_program(&unproven_prog).map_err(|e| format!("{e:?}"))?;
+        assert!(!unproven_summary.zero_runtime_bounds_checks);
+        let (_elf_p, rep_p) = compile_to_elf64_bytes(&proven_prog).map_err(|e| format!("{e:?}"))?;
+        let (_elf_u, rep_u) =
+            compile_to_elf64_bytes(&unproven_prog).map_err(|e| format!("{e:?}"))?;
+        assert!(
+            rep_p.machine_code_bytes < rep_u.machine_code_bytes,
+            "proven accesses must elide runtime bounds check instructions ({} vs {})",
+            rep_p.machine_code_bytes,
+            rep_u.machine_code_bytes
+        );
+
+        // 2. Every invalid RegionIndexInBounds use must fail with VerifyErrorKind::InvalidRefinementProof.
+        let invalid_proof_cases = [
+            // Wrong rule kind (points to RegionDecl at proof 1)
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=16 hi=16 witness=i64:plain
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=1 tok=pure a=0 b=$c0
+output $out
+",
+            // Other slot (proof targets slot 1, access targets slot 0)
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=16 hi=16 witness=i64:plain
+proof 2 rule=region_decl target=1 lo=16 hi=16 witness=i64:plain
+proof 3 rule=region_index_in_bounds target=1 lo=0 hi=16 witness=0
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=3 tok=pure a=0 b=$c0
+output $out
+",
+            // bound_hi > min_len
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=16 witness=0
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$c0
+output $out
+",
+            // bound_hi == 0
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=0 witness=0
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$c0
+output $out
+",
+            // ConstI64 c == bound_hi (out of range)
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=8 witness=0
+node $c8 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=8
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$c8
+output $out
+",
+            // ConstI64 c < 0
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=8 witness=0
+node $cn = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$cn
+output $out
+",
+            // BitAnd with mask m == bound_hi
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=8 witness=0
+node $c8 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=8
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c8
+node $x = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $idx = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$x b=$c8
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$idx
+output $out
+",
+            // BitAnd with negative mask m = -1
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=8 witness=0
+node $cm = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=-1
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$cm
+node $x = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $idx = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$x b=$cm
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$idx
+output $out
+",
+            // Non-const / non-BitAnd index (LocalGet)
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=8 witness=0
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c0
+node $x = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$x
+output $out
+",
+            // Chained BitAnd without a direct ConstI64 operand
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+proof 2 rule=region_index_in_bounds target=0 lo=0 hi=8 witness=0
+node $c7 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=7
+node $s = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$c7
+node $x = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $m1 = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$x b=$c7
+node $m2 = BitAnd i64x1 fg=0 pol=l1 proof=0 tok=pure a=$m1 b=$x
+node $out = RegionLoad i64x1 fg=0 pol=l1 proof=2 tok=pure a=0 b=$m2
+output $out
+",
+            // RegionStore with invalid proof index out of table bounds
+            "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=8 hi=16 witness=i64:plain
+node $c0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $st = RegionStore i64x1 fg=0 pol=l1 proof=9 tok=pure a=0 b=$c0 c=$c0
+output $c0
+",
+        ];
+        for (i, src) in invalid_proof_cases.iter().enumerate() {
+            let p = assemble_rls(src).map_err(|e| format!("invalid_proof[{i}]: {e:?}"))?;
+            let err = verify_program(&p);
+            assert!(
+                matches!(
+                    err,
+                    Err(crate::verifier::VerifyDiagnostic {
+                        kind: VerifyErrorKind::InvalidRefinementProof { .. },
+                        ..
+                    })
+                ),
+                "invalid_proof[{i}] expected InvalidRefinementProof, got {err:?}"
+            );
+        }
 
         Ok(())
     }

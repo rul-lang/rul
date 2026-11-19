@@ -19,18 +19,18 @@
 #![deny(clippy::indexing_slicing)]
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rul::aot::{
     compile_rl_to_executable, run_compiled_executable, run_compiled_scalar_executable,
-    write_arena_data_file,
+    run_compiled_structured_executable, write_arena_data_file,
 };
 use rul::bytecode::{ElemType, RulProgram};
 use rul::engine::{
-    autotune_schedule, execute_tier0_interpreter, execute_tier2_fused, format_trace_table,
-    trace_program, RuntimeValue,
+    autotune_schedule, execute_tier0_interpreter, execute_tier0_interpreter_with_input,
+    execute_tier2_fused, format_trace_table, trace_program, RuntimeValue,
 };
 use rul::suite10::{load_rl_file, save_rl_file, MAX_RL_FILE_BYTES};
 use rul::transpiler::{assemble_rls, disassemble_rl, program_to_rls};
@@ -229,6 +229,13 @@ fn cmd_check(arg: Option<&str>) -> Result<(), String> {
 }
 
 fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram, VerifiedSummary), String> {
+    build_program(arg, false)
+}
+
+fn build_program(
+    arg: Option<&str>,
+    status_to_stderr_if_output_region: bool,
+) -> Result<(PathBuf, PathBuf, RulProgram, VerifiedSummary), String> {
     let entry = resolve_entry_path(arg)?;
     let t0 = Instant::now();
     let prog = load_program(&entry)?;
@@ -250,17 +257,31 @@ fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram, Verifie
     let aot_rep = compile_rl_to_executable(&prog, &exe_out).map_err(|e| e.to_string())?;
     let total_us = t0.elapsed().as_secs_f64() * 1e6;
 
-    println!(
-        "[RUL BUILD OK] {} -> {} ({rl_bytes} B) + {} ({} B ELF64, AVX2={}) | Nodes={} | Verify={} ns | Codegen={} ns | Total={total_us:.1} us",
-        entry.display(),
-        rl_out.display(),
-        exe_out.display(),
-        aot_rep.elf_bytes,
-        aot_rep.avx2_vectorized,
-        summary.node_count,
-        aot_rep.verify_ns,
-        aot_rep.codegen_ns
-    );
+    if status_to_stderr_if_output_region && prog.has_output_region() {
+        eprintln!(
+            "[RUL BUILD OK] {} -> {} ({rl_bytes} B) + {} ({} B ELF64, AVX2={}) | Nodes={} | Verify={} ns | Codegen={} ns | Total={total_us:.1} us",
+            entry.display(),
+            rl_out.display(),
+            exe_out.display(),
+            aot_rep.elf_bytes,
+            aot_rep.avx2_vectorized,
+            summary.node_count,
+            aot_rep.verify_ns,
+            aot_rep.codegen_ns
+        );
+    } else {
+        println!(
+            "[RUL BUILD OK] {} -> {} ({rl_bytes} B) + {} ({} B ELF64, AVX2={}) | Nodes={} | Verify={} ns | Codegen={} ns | Total={total_us:.1} us",
+            entry.display(),
+            rl_out.display(),
+            exe_out.display(),
+            aot_rep.elf_bytes,
+            aot_rep.avx2_vectorized,
+            summary.node_count,
+            aot_rep.verify_ns,
+            aot_rep.codegen_ns
+        );
+    }
     Ok((rl_out, exe_out, prog, summary))
 }
 
@@ -362,53 +383,111 @@ fn scalars_equivalent(expected: f64, actual: f64) -> bool {
     diff <= 1e-9 * scale
 }
 
-fn scalar_outputs_equivalent(output_elem: ElemType, expected: f64, actual: f64) -> bool {
+fn scalar_outputs_equivalent(output_elem: ElemType, expected_bits: u64, actual_bits: u64) -> bool {
     match output_elem {
-        ElemType::F64 => scalars_equivalent(expected, actual),
-        ElemType::I64 | ElemType::BoolMask => expected.to_bits() == actual.to_bits(),
+        ElemType::F64 => {
+            scalars_equivalent(f64::from_bits(expected_bits), f64::from_bits(actual_bits))
+        }
+        ElemType::I64 | ElemType::U8 | ElemType::BoolMask => expected_bits == actual_bits,
     }
 }
 
+fn read_bounded_input_bytes(reader: impl Read, max_len: u32) -> Result<Vec<u8>, String> {
+    let cap_bytes = u64::from(max_len).saturating_add(1);
+    let mut buf = Vec::new();
+    reader
+        .take(cap_bytes)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read stdin for input region: {e}"))?;
+    Ok(buf)
+}
+
 fn cmd_run(arg: Option<&str>) -> Result<(), String> {
-    let (_rl_path, exe_path, prog, summary) = cmd_build(arg)?;
+    let (_rl_path, exe_path, prog, summary) = build_program(arg, true)?;
     let (cols, is_synthetic) = load_or_synthesize_arenas(&prog)?;
     let refs: Vec<&[f64]> = cols.iter().map(Vec::as_slice).collect();
 
     if prog.uses_structured_control_or_locals() {
-        let tier0 = execute_tier0_interpreter(&prog, &refs).map_err(|e| e.to_string())?;
-        let tier0_scalar = match tier0.output {
-            RuntimeValue::Scalar(v) => v,
-            RuntimeValue::ColumnF64(ref c) => c.iter().copied().sum(),
-            RuntimeValue::ColumnMask(ref m) => m.iter().filter(|&&b| b).count() as f64,
+        let stdin_bytes = if let Some(max_len) = prog.input_region_max_len() {
+            read_bounded_input_bytes(io::stdin(), max_len)?
+        } else {
+            Vec::new()
         };
+        let tier0 = execute_tier0_interpreter_with_input(&prog, &refs, &stdin_bytes)
+            .map_err(|e| e.to_string())?;
         let t_aot = Instant::now();
-        let aot_val = run_compiled_scalar_executable(&exe_path).map_err(|e| e.to_string())?;
+        if prog.has_output_region() {
+            let aot_bytes = run_compiled_structured_executable(&exe_path, &stdin_bytes)
+                .map_err(|e| e.to_string())?;
+            let t0_bytes = tier0.output_bytes.as_deref().unwrap_or(&[]);
+            if t0_bytes != aot_bytes.as_slice() {
+                return Err(format!(
+                    "[RUL RUN ERROR] differential equivalence failed (OutputRegion): Tier0 len={} != Native ELF64 len={}",
+                    t0_bytes.len(),
+                    aot_bytes.len()
+                ));
+            }
+            io::stdout()
+                .write_all(&aot_bytes)
+                .map_err(|e| format!("failed to write output region to stdout: {e}"))?;
+            return Ok(());
+        }
+        let aot_bytes = if prog.has_io_regions() {
+            run_compiled_structured_executable(&exe_path, &stdin_bytes)
+                .map_err(|e| e.to_string())?
+        } else {
+            run_compiled_scalar_executable(&exe_path)
+                .map_err(|e| e.to_string())?
+                .to_le_bytes()
+                .to_vec()
+        };
         let aot_us = t_aot.elapsed().as_secs_f64() * 1e6;
-        if !scalar_outputs_equivalent(summary.output_elem, tier0_scalar, aot_val) {
+        let aot_bits = u64::from_le_bytes(aot_bytes.as_slice().try_into().map_err(|_e| {
+            format!(
+                "[RUL RUN ERROR] expected 8-byte scalar output, got {} bytes",
+                aot_bytes.len()
+            )
+        })?);
+        let tier0_bits = match tier0.output.as_typed_scalar() {
+            Some(ts) => ts.bits,
+            None => match tier0.output {
+                RuntimeValue::ColumnF64(ref c) => c.iter().copied().sum::<f64>().to_bits(),
+                RuntimeValue::ColumnMask(ref m) => {
+                    (m.iter().filter(|&&b| b).count() as f64).to_bits()
+                }
+                RuntimeValue::Scalar(v) => v.to_bits(),
+                RuntimeValue::TypedScalar(ts) => ts.bits,
+            },
+        };
+        if !scalar_outputs_equivalent(summary.output_elem, tier0_bits, aot_bits) {
             return Err(format!(
-                "[RUL RUN ERROR] differential equivalence failed ({:?}): Tier0 Oracle=0x{:016x}, Native ELF64=0x{:016x}",
+                "[RUL RUN ERROR] differential equivalence failed ({:?}): Tier0 Oracle=0x{tier0_bits:016x}, Native ELF64=0x{aot_bits:016x}",
                 summary.output_elem,
-                tier0_scalar.to_bits(),
-                aot_val.to_bits()
             ));
         }
-        let bits = tier0_scalar.to_bits();
         match summary.output_elem {
             ElemType::I64 => {
-                let out_i64 = i64::from_ne_bytes(bits.to_ne_bytes());
+                let out_i64 = i64::from_ne_bytes(tier0_bits.to_ne_bytes());
                 println!(
-                    "[RUL RUN OK] Output_i64={out_i64} (bits=0x{bits:016x}, Native ELF64 in {aot_us:.1} us)"
+                    "[RUL RUN OK] Output_i64={out_i64} (bits=0x{tier0_bits:016x}, Native ELF64 in {aot_us:.1} us)"
+                );
+            }
+            ElemType::U8 => {
+                let out_u8 = (tier0_bits & 0xFF) as u8;
+                println!(
+                    "[RUL RUN OK] Output_u8={out_u8} (bits=0x{tier0_bits:016x}, Native ELF64 in {aot_us:.1} us)"
                 );
             }
             ElemType::BoolMask => {
-                let out_bool = bits != 0;
+                let out_bool = tier0_bits != 0;
                 println!(
-                    "[RUL RUN OK] Output_bool={out_bool} (bits=0x{bits:016x}, Native ELF64 in {aot_us:.1} us)"
+                    "[RUL RUN OK] Output_bool={out_bool} (bits=0x{tier0_bits:016x}, Native ELF64 in {aot_us:.1} us)"
                 );
             }
             ElemType::F64 => {
+                let tier0_scalar = f64::from_bits(tier0_bits);
                 println!(
-                    "[RUL RUN OK] Output={tier0_scalar:.6} (bits=0x{bits:016x}, Native ELF64 in {aot_us:.1} us)"
+                    "[RUL RUN OK] Output={tier0_scalar:.6} (bits=0x{tier0_bits:016x}, Native ELF64 in {aot_us:.1} us)"
                 );
             }
         }
@@ -425,11 +504,13 @@ fn cmd_run(arg: Option<&str>) -> Result<(), String> {
 
     let tier0_scalar = match tier0.output {
         RuntimeValue::Scalar(v) => v,
+        RuntimeValue::TypedScalar(ts) => f64::from_bits(ts.bits),
         RuntimeValue::ColumnF64(ref c) => c.iter().copied().sum(),
         RuntimeValue::ColumnMask(ref m) => m.iter().filter(|&&b| b).count() as f64,
     };
     let tier2_scalar = match tier2.output {
         RuntimeValue::Scalar(v) => v,
+        RuntimeValue::TypedScalar(ts) => f64::from_bits(ts.bits),
         RuntimeValue::ColumnF64(ref c) => c.iter().copied().sum(),
         RuntimeValue::ColumnMask(ref m) => m.iter().filter(|&&b| b).count() as f64,
     };
@@ -632,42 +713,35 @@ mod tests {
 
     #[test]
     fn test_scalar_outputs_equivalent_strict_i64_and_mask_bits() {
-        let neg_one = f64::from_bits(u64::from_ne_bytes((-1_i64).to_ne_bytes()));
-        let neg_two = f64::from_bits(u64::from_ne_bytes((-2_i64).to_ne_bytes()));
-        assert!(neg_one.is_nan() && neg_two.is_nan());
+        let neg_one = u64::from_ne_bytes((-1_i64).to_ne_bytes());
+        let neg_two = u64::from_ne_bytes((-2_i64).to_ne_bytes());
         assert!(scalar_outputs_equivalent(ElemType::I64, neg_one, neg_one));
         assert!(!scalar_outputs_equivalent(ElemType::I64, neg_one, neg_two));
 
-        let pos_one = f64::from_bits(1_u64);
-        let pos_two = f64::from_bits(2_u64);
-        let pos_large_subnormal = f64::from_bits(999_999_999_u64);
-        assert!(scalar_outputs_equivalent(ElemType::I64, pos_one, pos_one));
-        assert!(!scalar_outputs_equivalent(ElemType::I64, pos_one, pos_two));
+        assert!(scalar_outputs_equivalent(ElemType::I64, 1_u64, 1_u64));
+        assert!(!scalar_outputs_equivalent(ElemType::I64, 1_u64, 2_u64));
         assert!(!scalar_outputs_equivalent(
             ElemType::I64,
-            pos_one,
-            pos_large_subnormal
+            1_u64,
+            999_999_999_u64
         ));
 
-        let mask_false = f64::from_bits(0_u64);
-        let mask_true = f64::from_bits(1_u64);
-        assert!(scalar_outputs_equivalent(
-            ElemType::BoolMask,
-            mask_true,
-            mask_true
-        ));
-        assert!(!scalar_outputs_equivalent(
-            ElemType::BoolMask,
-            mask_false,
-            mask_true
-        ));
+        assert!(scalar_outputs_equivalent(ElemType::U8, 255_u64, 255_u64));
+        assert!(!scalar_outputs_equivalent(ElemType::U8, 0_u64, 255_u64));
+
+        assert!(scalar_outputs_equivalent(ElemType::BoolMask, 1_u64, 1_u64));
+        assert!(!scalar_outputs_equivalent(ElemType::BoolMask, 0_u64, 1_u64));
 
         assert!(scalar_outputs_equivalent(
             ElemType::F64,
-            100.0,
-            100.0 + 1e-11
+            100.0_f64.to_bits(),
+            (100.0_f64 + 1e-11).to_bits()
         ));
-        assert!(scalar_outputs_equivalent(ElemType::F64, f64::NAN, f64::NAN));
+        assert!(scalar_outputs_equivalent(
+            ElemType::F64,
+            f64::NAN.to_bits(),
+            f64::NAN.to_bits()
+        ));
     }
 
     #[test]
@@ -697,6 +771,28 @@ mod tests {
         assert_eq!(col.len(), elem_count);
         assert_eq!(col.first().copied(), Some(42.5));
         assert_eq!(col.last().copied(), Some(99.25));
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_bounded_input_bytes_caps_at_max_len_plus_one() -> Result<(), String> {
+        let large = vec![0x42_u8; 1024];
+        let bounded = read_bounded_input_bytes(large.as_slice(), 16)?;
+        assert_eq!(bounded.len(), 17);
+
+        let exact = vec![0x41_u8; 16];
+        let ok_exact = read_bounded_input_bytes(exact.as_slice(), 16)?;
+        assert_eq!(ok_exact.len(), 16);
+
+        let out_only_rls = "\
+cap NONE
+proof 1 rule=region_decl target=0 lo=0 hi=16 witness=u8:output
+node $c = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+output $c
+";
+        let out_only_prog = assemble_rls(out_only_rls).map_err(|e| e.to_string())?;
+        assert_eq!(out_only_prog.input_region_max_len(), None);
+        assert!(out_only_prog.has_output_region());
         Ok(())
     }
 }

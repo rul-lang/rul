@@ -218,6 +218,7 @@ fn ok_exec_result(
 ) -> RulFfiExecResult {
     let scalar_output = match output {
         RuntimeValue::Scalar(v) => *v,
+        RuntimeValue::TypedScalar(ts) => f64::from_bits(ts.bits),
         RuntimeValue::ColumnF64(col) => col.first().copied().unwrap_or(0.0),
         RuntimeValue::ColumnMask(mask) => {
             if mask.first().copied().unwrap_or(false) {
