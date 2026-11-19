@@ -23,6 +23,29 @@ pub const MAX_REGION_SLOTS: usize = 64;
 /// Maximum permitted byte capacity of a single declared region (`256 MiB`).
 pub const MAX_REGION_BYTES: usize = 256 * 1024 * 1024;
 
+/// Maximum number of live function activations (entry function included) permitted by the ISA.
+pub const MAX_CALL_DEPTH: u32 = 4096;
+
+/// Maximum sum of ISA frame units across live function activations (`1 << 20` units = `8 MiB`).
+pub const MAX_STACK_UNITS: u32 = 1 << 20;
+
+/// Maximum number of nodes permitted in a single `Func`..`End` scope (`< 0xFFFF` sentinel).
+pub const MAX_FUNC_NODES: usize = 65_535;
+
+/// Sentinel packed 16-bit operand value indicating an unused argument slot in `Call` / `CallArg`.
+pub const CALL_ARG_SENTINEL: u16 = 0xFFFF;
+
+/// Computes the ISA-defined stack budget in 8-byte frame units for a function spanning `node_count` nodes.
+#[must_use]
+pub const fn func_frame_units(node_count: usize) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "verified function scopes contain at most MAX_FUNC_NODES (65_535) nodes"
+    )]
+    let count_u32 = node_count as u32;
+    72_u32.saturating_add(count_u32)
+}
+
 /// Capability bit: Pure compute only (no external I/O allowed).
 pub const CAP_NONE: u64 = 0x00;
 /// Capability bit: Lock-free network ring enqueue/dequeue allowed.
@@ -138,6 +161,14 @@ pub enum Opcode {
     Br = 0x55,
     /// Conditional relative structured branch (`in_a = cond_node`, `in_b = relative_depth`).
     BrIf = 0x56,
+    /// Function scope header (`proof_idx == 0`, `in_a = func_id`, `in_b = 0`).
+    Func = 0x57,
+    /// Return from enclosing function (`in_a = rel_val_node` or `0` for `void`, `in_b = 0`).
+    Return = 0x58,
+    /// Direct function call (`in_a = target_func_id`, `in_b = (arg0: u16) | ((arg1: u16) << 16)` with `0xFFFF` sentinel).
+    Call = 0x59,
+    /// Additional call arguments immediately preceding `Call` for arity 3 or 4 (`in_a = arg2`, `in_b = arg3` or `0xFFFF`).
+    CallArg = 0x5A,
     /// Reset a declared region to `len` zeroed elements (`in_a = slot`, `in_b = len_node`; void).
     RegionNew = 0x60,
     /// Append `add_len` zeroed elements to a declared region (`in_a = slot`, `in_b = add_len_node`; yields new length as `I64`).
@@ -209,6 +240,10 @@ impl Opcode {
             0x54 => Ok(Self::End),
             0x55 => Ok(Self::Br),
             0x56 => Ok(Self::BrIf),
+            0x57 => Ok(Self::Func),
+            0x58 => Ok(Self::Return),
+            0x59 => Ok(Self::Call),
+            0x5A => Ok(Self::CallArg),
             0x60 => Ok(Self::RegionNew),
             0x61 => Ok(Self::RegionGrow),
             0x62 => Ok(Self::RegionLen),
@@ -244,6 +279,10 @@ impl Opcode {
                 | Self::End
                 | Self::Br
                 | Self::BrIf
+                | Self::Func
+                | Self::Return
+                | Self::Call
+                | Self::CallArg
                 | Self::RegionNew
                 | Self::RegionGrow
                 | Self::RegionLen
@@ -651,6 +690,8 @@ pub enum ProofRuleKind {
     BlockSig = 3,
     /// Declares a static upper bound (`1 <= bound_hi <= 1_000_000`) on back-edge iterations of a [`Opcode::Loop`] without [`CAP_DIVERGE`].
     LoopBound = 4,
+    /// Declares a function signature (`target_arena = func_id`, `bound_lo = arity (0..=4)`, `bound_hi = packed 4-bit param ElemTypes`, `witness_node = ret ElemType or 0 for void`).
+    FuncSig = 5,
     /// Declares a statically typed, bounded growable region (`target_arena = slot`, `bound_lo = min_len`, `bound_hi = max_len`, `witness_node = elem | (role << 8)`).
     RegionDecl = 6,
     /// Certifies that a `RegionLoad` or `RegionStore` index is `< bound_hi <= min_len` for `target_arena = slot`.
@@ -664,11 +705,25 @@ impl ProofRuleKind {
             2 => Ok(Self::GatherIndexInBounds),
             3 => Ok(Self::BlockSig),
             4 => Ok(Self::LoopBound),
+            5 => Ok(Self::FuncSig),
             6 => Ok(Self::RegionDecl),
             7 => Ok(Self::RegionIndexInBounds),
             other => Err(RulFormatError::InvalidProofRule(other)),
         }
     }
+}
+
+/// Decoded function signature from a [`ProofRuleKind::FuncSig`] proof entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuncSigInfo {
+    /// Function identifier (`0..func_count`).
+    pub func_id: u16,
+    /// Parameter count (`0..=4`).
+    pub arity: u8,
+    /// Parameter element types in slots `0..arity` (unused slots are `ElemType::I64`).
+    pub params: [ElemType; 4],
+    /// Return element type (`None` for `void`).
+    pub ret_elem: Option<ElemType>,
 }
 
 /// 16-byte sidecar refinement proof certificate used for `ArenaSlice` and `Gather`.
@@ -687,6 +742,70 @@ pub struct ProofEntry {
 }
 
 impl ProofEntry {
+    /// Constructs a [`ProofRuleKind::FuncSig`] entry for `func_id`, `params` (`0..=4`), and optional return type.
+    #[must_use]
+    pub fn func_sig(func_id: u16, params: &[ElemType], ret_elem: Option<ElemType>) -> Self {
+        let mut packed: u32 = 0;
+        for (i, &el) in params.iter().take(4).enumerate() {
+            packed |= (el as u32) << (i * 4);
+        }
+        Self {
+            rule_kind: ProofRuleKind::FuncSig,
+            target_arena: func_id,
+            bound_lo: u32::try_from(params.len()).unwrap_or(4),
+            bound_hi: packed,
+            witness_node: ret_elem.map_or(0, |el| el as u32),
+        }
+    }
+
+    /// Decodes a [`FuncSigInfo`] from a [`ProofRuleKind::FuncSig`] proof entry.
+    ///
+    /// Returns `None` if `rule_kind != FuncSig`, `arity > 4`, any param nibble or return tag is invalid,
+    /// or unused high bits in `bound_hi` are non-zero.
+    #[must_use]
+    pub const fn decode_func_sig(self) -> Option<FuncSigInfo> {
+        if !matches!(self.rule_kind, ProofRuleKind::FuncSig) || self.bound_lo > 4 {
+            return None;
+        }
+        let arity = self.bound_lo as u8;
+        if (self.bound_hi >> (arity * 4)) != 0 {
+            return None;
+        }
+        let mut params = [ElemType::I64; 4];
+        let mut i = 0u8;
+        while i < arity {
+            let nibble = ((self.bound_hi >> (i * 4)) & 0x0F) as u8;
+            let elem = match ElemType::from_u8(nibble) {
+                Ok(e) => e,
+                Err(_) => return None,
+            };
+            match i {
+                0 => params[0] = elem,
+                1 => params[1] = elem,
+                2 => params[2] = elem,
+                3 => params[3] = elem,
+                _ => return None,
+            }
+            i += 1;
+        }
+        let ret_elem = if self.witness_node == 0 {
+            None
+        } else if self.witness_node > 0xFF {
+            return None;
+        } else {
+            match ElemType::from_u8(self.witness_node as u8) {
+                Ok(e) => Some(e),
+                Err(_) => return None,
+            }
+        };
+        Some(FuncSigInfo {
+            func_id: self.target_arena,
+            arity,
+            params,
+            ret_elem,
+        })
+    }
+
     /// Constructs a [`ProofRuleKind::RegionDecl`] entry encoding `(elem, role)` in `witness_node`.
     #[must_use]
     pub const fn region_decl(
@@ -943,7 +1062,7 @@ pub struct RulProgram {
 }
 
 impl RulProgram {
-    /// Returns `true` if any node or proof uses structured control flow, typed scalar ops, locals, or declared regions.
+    /// Returns `true` if any node or proof uses structured control flow, functions, typed scalar ops, locals, or declared regions.
     #[must_use]
     pub fn uses_structured_control_or_locals(&self) -> bool {
         self.nodes
@@ -952,9 +1071,21 @@ impl RulProgram {
             || self.proofs.iter().any(|proof| {
                 matches!(
                     proof.rule_kind,
-                    ProofRuleKind::RegionDecl | ProofRuleKind::RegionIndexInBounds
+                    ProofRuleKind::FuncSig
+                        | ProofRuleKind::RegionDecl
+                        | ProofRuleKind::RegionIndexInBounds
                 )
             })
+    }
+
+    /// Returns `true` if the program contains any `Func` node or `FuncSig` proof entry.
+    #[must_use]
+    pub fn has_functions(&self) -> bool {
+        self.nodes.iter().any(|node| node.opcode == Opcode::Func)
+            || self
+                .proofs
+                .iter()
+                .any(|proof| proof.rule_kind == ProofRuleKind::FuncSig)
     }
 
     /// Returns `true` if any proof entry declares an input or output byte region.
