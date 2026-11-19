@@ -14,7 +14,8 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use crate::bytecode::{
-    ElemType, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram, MAX_REGION_SLOTS,
+    func_frame_units, ElemType, FuncSigInfo, Opcode, ProofEntry, ProofRuleKind, RegionRole,
+    RulProgram, CALL_ARG_SENTINEL, MAX_CALL_DEPTH, MAX_REGION_SLOTS, MAX_STACK_UNITS,
 };
 use crate::verifier::{verify_program, ValueShape, VerifiedSummary, VerifyDiagnostic};
 
@@ -37,6 +38,8 @@ pub const AOT_EXIT_INT_DIV_ERR: i32 = 72;
 pub const AOT_EXIT_CAST_ERR: i32 = 73;
 /// Exit status code emitted by the standalone ELF binary on region allocation/capacity/length failure.
 pub const AOT_EXIT_REGION_OOM: i32 = 74;
+/// Exit status code emitted by the standalone ELF binary when call depth (`MAX_CALL_DEPTH`) or stack budget (`MAX_STACK_UNITS`) is exceeded.
+pub const AOT_EXIT_STACK_OVERFLOW: i32 = 75;
 
 /// Report returned after compiling a `.rl` program into a standalone native executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +77,8 @@ pub enum AotError {
     CastOutOfRange,
     /// Region allocation, growth, reset, or input size limit failure detected by the native binary (`exit 74`).
     RegionAllocationFailed,
+    /// Call depth (`MAX_CALL_DEPTH`) or stack budget (`MAX_STACK_UNITS`) exceeded by the native binary (`exit 75`).
+    StackOverflow,
     /// Native binary exited with a non-zero status code or invalid output.
     ExecutionFailed(String),
 }
@@ -112,6 +117,12 @@ impl fmt::Display for AotError {
                 write!(
                     f,
                     "AOT native binary detected region allocation or length limit failure"
+                )
+            }
+            Self::StackOverflow => {
+                write!(
+                    f,
+                    "AOT native binary exceeded call depth or stack budget guard (exit 75)"
                 )
             }
             Self::ExecutionFailed(msg) => write!(f, "AOT native execution failed: {msg}"),
@@ -555,7 +566,11 @@ pub fn compile_to_elf64_bytes(
             | Opcode::RegionLen
             | Opcode::RegionLoad
             | Opcode::RegionStore
-            | Opcode::RegionFree => {
+            | Opcode::RegionFree
+            | Opcode::Func
+            | Opcode::Return
+            | Opcode::Call
+            | Opcode::CallArg => {
                 return Err(AotError::UnsupportedGraph(
                     "structured control-flow or region opcode reached columnar AOT pipeline",
                 ));
@@ -684,7 +699,11 @@ pub fn compile_to_elf64_bytes(
             | Opcode::RegionLen
             | Opcode::RegionLoad
             | Opcode::RegionStore
-            | Opcode::RegionFree => {}
+            | Opcode::RegionFree
+            | Opcode::Func
+            | Opcode::Return
+            | Opcode::Call
+            | Opcode::CallArg => {}
         }
     }
 
@@ -850,7 +869,7 @@ pub fn run_compiled_executable(
 /// Fails closed if the binary exits with a non-zero status or writes any bytes to stdout on a fail-closed exit.
 ///
 /// # Errors
-/// Returns [`AotError`] matching exit codes `70..=74`, I/O errors, or unexpected exit status.
+/// Returns [`AotError`] matching exit codes `70..=75`, I/O errors, or unexpected exit status.
 pub fn run_compiled_structured_executable(
     exe_path: impl AsRef<Path>,
     stdin_bytes: &[u8],
@@ -919,6 +938,7 @@ pub fn run_compiled_structured_executable(
             Some(AOT_EXIT_INT_DIV_ERR) => return Err(AotError::IntegerDivisionError),
             Some(AOT_EXIT_CAST_ERR) => return Err(AotError::CastOutOfRange),
             Some(AOT_EXIT_REGION_OOM) => return Err(AotError::RegionAllocationFailed),
+            Some(AOT_EXIT_STACK_OVERFLOW) => return Err(AotError::StackOverflow),
             other => {
                 return Err(AotError::ExecutionFailed(format!(
                     "standalone binary exited with status {other:?}"
@@ -934,7 +954,7 @@ pub fn run_compiled_structured_executable(
 /// and reads back its 8-byte scalar output bit-pattern as `f64`.
 ///
 /// # Errors
-/// Returns [`AotError`] if the process exits with a fail-closed status (`70..=74`) or I/O fails.
+/// Returns [`AotError`] if the process exits with a fail-closed status (`70..=75`) or I/O fails.
 pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64, AotError> {
     let stdout = run_compiled_structured_executable(exe_path, &[])?;
     let bytes: [u8; 8] = stdout.as_slice().try_into().map_err(|_e| {
@@ -947,6 +967,9 @@ pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64,
 }
 
 const SC_STDOUT_DISP: i32 = -520;
+const SC_CALL_DEPTH_OFF: i32 = 2048;
+const SC_STACK_UNITS_OFF: i32 = 2056;
+const SC_SCRATCH_IO_OFF: i32 = 2064;
 
 fn sc_local_disp(slot: u32) -> i32 {
     let slot_i32 = i32::try_from(slot).unwrap_or(0);
@@ -971,6 +994,12 @@ enum AotCtrlKind {
         false_jump_patch: usize,
         has_else: bool,
     },
+    Func {
+        func_start: usize,
+        units_add_patch: usize,
+        frame_sub_patch: usize,
+        epilogue_patches: Vec<usize>,
+    },
 }
 
 #[derive(Debug)]
@@ -990,7 +1019,7 @@ fn compile_structured_to_elf64_bytes(
             "structured control-flow AOT requires scalar-only programs without columnar arenas",
         ));
     }
-    if program.nodes.len() > 65_536 {
+    if !program.has_functions() && program.nodes.len() > 65_536 {
         return Err(AotError::UnsupportedGraph(
             "structured control-flow AOT exceeds 65,536-node stack frame limit",
         ));
@@ -1149,18 +1178,21 @@ fn emit_sc_sys_munmap(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x0F, 0x05]);
 }
 
-/// Allocates the 4096-byte program-global region table in `r15`, maps all `min_len > 0` regions,
-/// and reads stdin to EOF into the declared `RegionRole::Input` region if present.
+/// Allocates the 4096-byte program-global region table in `r15` (unless already mapped),
+/// maps all `min_len > 0` regions, and reads stdin to EOF into the declared `RegionRole::Input` region if present.
 fn emit_sc_region_startup(
     code: &mut Vec<u8>,
     regions: &[Option<AotRegionDecl>; MAX_REGION_SLOTS],
+    r15_already_mapped: bool,
 ) -> Result<(), AotError> {
-    // Allocate 1 page (4096 bytes) for 64 x 32-byte region descriptors `(base, len, cap, pad)`.
-    // mov esi, 4096
-    code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]);
-    emit_sc_sys_mmap_anon(code);
-    // mov r15, rax
-    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+    if !r15_already_mapped {
+        // Allocate 1 page (4096 bytes) for 64 x 32-byte region descriptors `(base, len, cap, pad)` plus runtime counters.
+        // mov esi, 4096
+        code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]);
+        emit_sc_sys_mmap_anon(code);
+        // mov r15, rax
+        code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+    }
 
     for (slot, opt_decl) in regions.iter().enumerate() {
         let Some(decl) = *opt_decl else {
@@ -1176,9 +1208,9 @@ fn emit_sc_region_startup(
                 let probe_pos = code.len();
                 // xor edi, edi
                 code.extend_from_slice(&[0x31, 0xFF]);
-                // lea rsi, [rbp + SC_STDOUT_DISP]
-                code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
-                code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
+                // lea rsi, [r15 + SC_SCRATCH_IO_OFF]
+                code.extend_from_slice(&[0x49, 0x8D, 0xB7]);
+                code.extend_from_slice(&SC_SCRATCH_IO_OFF.to_le_bytes());
                 // mov edx, 1
                 code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
                 // xor eax, eax (SYS_read)
@@ -1210,8 +1242,8 @@ fn emit_sc_region_startup(
                 // cur_len == max_len: probe 1 byte for EOF.
                 let probe_eof_pos = code.len();
                 code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
-                code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
-                code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
+                code.extend_from_slice(&[0x49, 0x8D, 0xB7]);
+                code.extend_from_slice(&SC_SCRATCH_IO_OFF.to_le_bytes());
                 code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
                 code.extend_from_slice(&[0x31, 0xC0, 0x0F, 0x05]); // xor eax, eax; syscall
                 code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4
@@ -1675,55 +1707,163 @@ fn emit_sc_cast(
 )]
 fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotError> {
     let node_count = program.nodes.len();
+    let func_mode = program.has_functions();
     let mut code: Vec<u8> = Vec::with_capacity(256 + node_count * 24);
 
     let mut regions: [Option<AotRegionDecl>; MAX_REGION_SLOTS] = [None; MAX_REGION_SLOTS];
     let mut has_any_region = false;
     let mut output_region_slot: Option<usize> = None;
+    let mut func_sigs_raw: Vec<FuncSigInfo> = Vec::new();
     for proof in &program.proofs {
-        if proof.rule_kind != ProofRuleKind::RegionDecl {
-            continue;
-        }
-        let Some((elem, role)) = ProofEntry::decode_region_decl_witness(proof.witness_node) else {
-            return Err(AotError::UnsupportedGraph("invalid RegionDecl witness"));
-        };
-        let slot = usize::from(proof.target_arena);
-        if let Some(entry) = regions.get_mut(slot) {
-            *entry = Some(AotRegionDecl {
-                min_len: u64::from(proof.bound_lo),
-                max_len: u64::from(proof.bound_hi),
-                elem,
-                role,
-            });
-            has_any_region = true;
-            if role == RegionRole::Output {
-                output_region_slot = Some(slot);
+        match proof.rule_kind {
+            ProofRuleKind::RegionDecl => {
+                let Some((elem, role)) = ProofEntry::decode_region_decl_witness(proof.witness_node)
+                else {
+                    return Err(AotError::UnsupportedGraph("invalid RegionDecl witness"));
+                };
+                let slot = usize::from(proof.target_arena);
+                if let Some(entry) = regions.get_mut(slot) {
+                    *entry = Some(AotRegionDecl {
+                        min_len: u64::from(proof.bound_lo),
+                        max_len: u64::from(proof.bound_hi),
+                        elem,
+                        role,
+                    });
+                    has_any_region = true;
+                    if role == RegionRole::Output {
+                        output_region_slot = Some(slot);
+                    }
+                }
             }
+            ProofRuleKind::FuncSig => {
+                let sig = proof
+                    .decode_func_sig()
+                    .ok_or(AotError::UnsupportedGraph("invalid FuncSig proof"))?;
+                func_sigs_raw.push(sig);
+            }
+            _ => {}
         }
     }
 
-    // 1. Entry prologue: align stack to 32B, establish `rbp`, allocate 64 local slots + SSA slots.
-    // and rsp, -32
-    code.extend_from_slice(&[0x48, 0x83, 0xE4, 0xE0]);
-    // mov rbp, rsp
-    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
+    let func_count = func_sigs_raw.len();
+    let mut func_sigs: Vec<Option<FuncSigInfo>> = vec![None; func_count];
+    for sig in func_sigs_raw {
+        if let Some(slot) = func_sigs.get_mut(usize::from(sig.func_id)) {
+            *slot = Some(sig);
+        }
+    }
+    let mut func_offsets: Vec<Option<usize>> = vec![None; func_count];
+    let mut call_patches: Vec<(usize, usize)> = Vec::new();
 
-    let raw_frame = 528usize.saturating_add(node_count.saturating_mul(8));
-    let frame_bytes = u32::try_from(raw_frame.div_ceil(32) * 32)
-        .map_err(|_e| AotError::UnsupportedGraph("stack frame overflow"))?;
-    // sub rsp, frame_bytes
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&frame_bytes.to_le_bytes());
+    if func_mode {
+        // 1. Entry stub for function programs:
+        //    Map 4096B global page in `r15` (64 region descriptors + live_call_depth + live_stack_units + io scratch).
+        code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+        emit_sc_sys_mmap_anon(&mut code);
+        code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
 
-    if has_any_region {
-        emit_sc_region_startup(&mut code, &regions)?;
+        //    Map private stack (`8 * MAX_STACK_UNITS + 4096`) with bottom 4096B `PROT_NONE` guard page.
+        let stack_total_bytes = u64::from(MAX_STACK_UNITS)
+            .saturating_mul(8)
+            .saturating_add(4096);
+        emit_movabs_reg(&mut code, 6, stack_total_bytes); // movabs rsi, stack_total_bytes
+        emit_sc_sys_mmap_anon(&mut code);
+        code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax (stack base)
+        code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+        code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+        code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (PROT_NONE)
+        code.extend_from_slice(&[0xB8, 0x0A, 0x00, 0x00, 0x00]); // mov eax, 10 (SYS_mprotect)
+        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        code.extend_from_slice(&[0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF, 0x72, 0x0C]);
+        emit_sys_exit(&mut code, AOT_EXIT_REGION_OOM as u32);
+
+        //    Switch `rsp` to top of private stack (4096B-aligned, 16B-aligned for `call`).
+        emit_movabs_reg(&mut code, 0, stack_total_bytes);
+        code.extend_from_slice(&[0x49, 0x01, 0xC4]); // add r12, rax
+        code.extend_from_slice(&[0x4C, 0x89, 0xE4]); // mov rsp, r12
+        code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+
+        if has_any_region {
+            emit_sc_region_startup(&mut code, &regions, true)?;
+        }
+
+        //    Call entry function (highest func_id = func_count - 1).
+        let entry_func_id = func_count
+            .checked_sub(1)
+            .ok_or(AotError::UnsupportedGraph("empty function table"))?;
+        code.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]);
+        call_patches.push((code.len() - 4, entry_func_id));
+
+        if let Some(out_slot) = output_region_slot {
+            emit_sc_output_region_epilogue(&mut code, out_slot)?;
+        } else {
+            // Write 8-byte scalar return value in `rax` via `[r15 + SC_SCRATCH_IO_OFF]` with EINTR/partial-write loop.
+            emit_store_r15_reg(&mut code, 0, SC_SCRATCH_IO_OFF);
+            code.extend_from_slice(&[0x45, 0x31, 0xE4]); // xor r12d, r12d (written = 0)
+            let write_loop_pos = code.len();
+            code.extend_from_slice(&[0x49, 0x83, 0xFC, 0x08]); // cmp r12, 8
+            code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]); // jae done
+            let done_patch = code.len() - 4;
+            code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1
+            code.extend_from_slice(&[0x49, 0x8D, 0xB7]); // lea rsi, [r15 + SC_SCRATCH_IO_OFF]
+            code.extend_from_slice(&SC_SCRATCH_IO_OFF.to_le_bytes());
+            code.extend_from_slice(&[0x4C, 0x01, 0xE6]); // add rsi, r12
+            code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+            code.extend_from_slice(&[0x4C, 0x29, 0xE2]); // sub rdx, r12
+            code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (SYS_write)
+            code.extend_from_slice(&[0x0F, 0x05]); // syscall
+            code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4 (EINTR)
+            code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+            let eintr_patch = code.len() - 4;
+            patch_rel32(&mut code, eintr_patch, write_loop_pos)?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x7F, 0x0C]); // test rax, rax; jg +12
+            emit_sys_exit(&mut code, AOT_EXIT_REGION_OOM as u32);
+            code.extend_from_slice(&[0x49, 0x01, 0xC4]); // add r12, rax
+            code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+            let back_patch = code.len() - 4;
+            patch_rel32(&mut code, back_patch, write_loop_pos)?;
+            let done_pos = code.len();
+            patch_rel32(&mut code, done_patch, done_pos)?;
+            emit_sys_exit(&mut code, 0);
+        }
+    } else {
+        // 1. Entry prologue: align stack to 32B, establish `rbp`, allocate 64 local slots + SSA slots.
+        // and rsp, -32
+        code.extend_from_slice(&[0x48, 0x83, 0xE4, 0xE0]);
+        // mov rbp, rsp
+        code.extend_from_slice(&[0x48, 0x89, 0xE5]);
+
+        let raw_frame = 528usize.saturating_add(node_count.saturating_mul(8));
+        let frame_bytes = u32::try_from(raw_frame.div_ceil(32) * 32)
+            .map_err(|_e| AotError::UnsupportedGraph("stack frame overflow"))?;
+        // sub rsp, frame_bytes
+        code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+        code.extend_from_slice(&frame_bytes.to_le_bytes());
+
+        if has_any_region {
+            emit_sc_region_startup(&mut code, &regions, false)?;
+        }
     }
 
-    let mut node_elem: Vec<ElemType> = vec![ElemType::I64; node_count];
+    let mut node_elem: Vec<ElemType> = if func_mode {
+        Vec::new()
+    } else {
+        vec![ElemType::I64; node_count]
+    };
     let mut local_elem: [ElemType; 64] = [ElemType::I64; 64];
     let mut ctrl_stack: Vec<AotCtrlFrame> = Vec::new();
+    let mut current_func_start: Option<usize> = None;
+    let mut pending_call_args: Option<(usize, Option<usize>)> = None;
 
-    for (idx, frame) in program.nodes.iter().enumerate() {
+    for (abs_idx, frame) in program.nodes.iter().enumerate() {
+        let idx = if frame.opcode == Opcode::Func {
+            0
+        } else if let Some(fn_start) = current_func_start {
+            node_elem.push(ElemType::I64);
+            abs_idx.saturating_sub(fn_start)
+        } else {
+            abs_idx
+        };
         let disp = sc_node_disp(idx);
         let a_idx = frame.in_a as usize;
         let b_idx = frame.in_b as usize;
@@ -2277,6 +2417,46 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                             }
                         }
                     }
+                    AotCtrlKind::Func {
+                        func_start,
+                        units_add_patch,
+                        frame_sub_patch,
+                        epilogue_patches,
+                    } => {
+                        if frame.in_b != 0 {
+                            emit_mov_rax_rbp(&mut code, disp_a);
+                        }
+                        let epilogue_pos = code.len();
+                        for p in epilogue_patches {
+                            patch_rel32(&mut code, p, epilogue_pos)?;
+                        }
+                        let fn_node_count = abs_idx.saturating_sub(func_start).saturating_add(1);
+                        let fn_frame_units = func_frame_units(fn_node_count);
+                        let fn_raw_frame = 520usize.saturating_add(fn_node_count.saturating_mul(8));
+                        let fn_frame_bytes = u32::try_from(fn_raw_frame.div_ceil(16) * 16)
+                            .map_err(|_e| AotError::UnsupportedGraph("function frame overflow"))?;
+                        let units_dst = code.get_mut(units_add_patch..units_add_patch + 4).ok_or(
+                            AotError::UnsupportedGraph("function units patch out of bounds"),
+                        )?;
+                        units_dst.copy_from_slice(&fn_frame_units.to_le_bytes());
+                        let frame_dst = code.get_mut(frame_sub_patch..frame_sub_patch + 4).ok_or(
+                            AotError::UnsupportedGraph("function frame patch out of bounds"),
+                        )?;
+                        frame_dst.copy_from_slice(&fn_frame_bytes.to_le_bytes());
+                        // Epilogue (preserves `rax` return value):
+                        // dec [r15 + SC_CALL_DEPTH_OFF]
+                        emit_load_reg_r15(&mut code, 11, SC_CALL_DEPTH_OFF);
+                        code.extend_from_slice(&[0x49, 0xFF, 0xCB]); // dec r11
+                        emit_store_r15_reg(&mut code, 11, SC_CALL_DEPTH_OFF);
+                        // sub [r15 + SC_STACK_UNITS_OFF], fn_frame_units
+                        emit_load_reg_r15(&mut code, 11, SC_STACK_UNITS_OFF);
+                        code.extend_from_slice(&[0x49, 0x81, 0xEB]); // sub r11, imm32
+                        code.extend_from_slice(&fn_frame_units.to_le_bytes());
+                        emit_store_r15_reg(&mut code, 11, SC_STACK_UNITS_OFF);
+                        // mov rsp, rbp; pop rbp; ret
+                        code.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D, 0xC3]);
+                        current_func_start = None;
+                    }
                 }
             }
             Opcode::Br => {
@@ -2304,6 +2484,9 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                     AotCtrlKind::Block | AotCtrlKind::If { .. } => {
                         code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
                         target.end_patches.push(code.len() - 4);
+                    }
+                    AotCtrlKind::Func { .. } => {
+                        return Err(AotError::UnsupportedGraph("Br cannot target Func"));
                     }
                 }
             }
@@ -2348,6 +2531,9 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                         // jnz rel32 -> End
                         code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
                         target.end_patches.push(code.len() - 4);
+                    }
+                    AotCtrlKind::Func { .. } => {
+                        return Err(AotError::UnsupportedGraph("BrIf cannot target Func"));
                     }
                 }
             }
@@ -2443,6 +2629,142 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                 let slot = frame.in_a as usize;
                 emit_sc_region_free(&mut code, slot)?;
             }
+            Opcode::Func => {
+                let func_id = frame.in_a as usize;
+                let sig = func_sigs
+                    .get(func_id)
+                    .copied()
+                    .flatten()
+                    .ok_or(AotError::UnsupportedGraph("missing FuncSig in AOT"))?;
+                if let Some(slot) = func_offsets.get_mut(func_id) {
+                    *slot = Some(code.len());
+                }
+                current_func_start = Some(abs_idx);
+                node_elem.clear();
+                node_elem.push(ElemType::I64);
+                local_elem = [ElemType::I64; 64];
+
+                // Prologue guard (uses ONLY `rax` and `r11`, preserving arg regs `rdi, rsi, rdx, rcx`):
+                // 1. live_call_depth + 1 <= MAX_CALL_DEPTH
+                emit_load_reg_r15(&mut code, 0, SC_CALL_DEPTH_OFF);
+                code.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
+                code.extend_from_slice(&[0x48, 0x3D]); // cmp rax, MAX_CALL_DEPTH
+                code.extend_from_slice(&MAX_CALL_DEPTH.to_le_bytes());
+                code.extend_from_slice(&[0x76, 0x0C]); // jbe +12
+                emit_sys_exit(&mut code, AOT_EXIT_STACK_OVERFLOW as u32);
+
+                // 2. live_stack_units + fn_frame_units <= MAX_STACK_UNITS
+                emit_load_reg_r15(&mut code, 11, SC_STACK_UNITS_OFF);
+                code.extend_from_slice(&[0x49, 0x81, 0xC3, 0x00, 0x00, 0x00, 0x00]); // add r11, imm32
+                let units_add_patch = code.len() - 4;
+                code.extend_from_slice(&[0x49, 0x81, 0xFB]); // cmp r11, MAX_STACK_UNITS
+                code.extend_from_slice(&MAX_STACK_UNITS.to_le_bytes());
+                code.extend_from_slice(&[0x76, 0x0C]); // jbe +12
+                emit_sys_exit(&mut code, AOT_EXIT_STACK_OVERFLOW as u32);
+
+                // 3. Commit updated depth & stack unit counters
+                emit_store_r15_reg(&mut code, 0, SC_CALL_DEPTH_OFF);
+                emit_store_r15_reg(&mut code, 11, SC_STACK_UNITS_OFF);
+
+                // 4. Push frame pointer & allocate activation frame
+                code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5]); // push rbp; mov rbp, rsp
+                code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x00, 0x00, 0x00]); // sub rsp, imm32
+                let frame_sub_patch = code.len() - 4;
+
+                // 5. Spill arguments `0..arity` from `rdi, rsi, rdx, rcx` into local slots `0..arity`
+                let arity = usize::from(sig.arity);
+                let param_modrm: [u8; 4] = [0xBD, 0xB5, 0x95, 0x8D];
+                for i in 0..arity {
+                    if let (Some(&modrm), Some(&param_el)) = (param_modrm.get(i), sig.params.get(i))
+                    {
+                        let ldisp = sc_local_disp(u32::try_from(i).unwrap_or(0));
+                        code.extend_from_slice(&[0x48, 0x89, modrm]);
+                        code.extend_from_slice(&ldisp.to_le_bytes());
+                        if let Some(le) = local_elem.get_mut(i) {
+                            *le = param_el;
+                        }
+                    }
+                }
+
+                ctrl_stack.push(AotCtrlFrame {
+                    kind: AotCtrlKind::Func {
+                        func_start: abs_idx,
+                        units_add_patch,
+                        frame_sub_patch,
+                        epilogue_patches: Vec::new(),
+                    },
+                    end_patches: Vec::new(),
+                });
+            }
+            Opcode::Return => {
+                if frame.in_a != 0 {
+                    emit_mov_rax_rbp(&mut code, disp_a);
+                }
+                code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                let patch_pos = code.len() - 4;
+                let func_ctrl = ctrl_stack
+                    .first_mut()
+                    .ok_or(AotError::UnsupportedGraph("Return outside Func"))?;
+                let AotCtrlKind::Func {
+                    ref mut epilogue_patches,
+                    ..
+                } = func_ctrl.kind
+                else {
+                    return Err(AotError::UnsupportedGraph("Return outside Func"));
+                };
+                epilogue_patches.push(patch_pos);
+            }
+            Opcode::CallArg => {
+                let a2 = frame.in_a as usize;
+                let a3 = if frame.in_b == u32::from(CALL_ARG_SENTINEL) {
+                    None
+                } else {
+                    Some(frame.in_b as usize)
+                };
+                pending_call_args = Some((a2, a3));
+            }
+            Opcode::Call => {
+                let target_id = frame.in_a as usize;
+                let callee_sig = func_sigs
+                    .get(target_id)
+                    .copied()
+                    .flatten()
+                    .ok_or(AotError::UnsupportedGraph("unknown callee FuncSig"))?;
+                let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+                let sentinel = u32::from(CALL_ARG_SENTINEL);
+                if arg0_raw != sentinel {
+                    let d = sc_node_disp(arg0_raw as usize);
+                    // mov rdi, [rbp + d]
+                    code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+                    code.extend_from_slice(&d.to_le_bytes());
+                }
+                if arg1_raw != sentinel {
+                    let d = sc_node_disp(arg1_raw as usize);
+                    // mov rsi, [rbp + d]
+                    code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                    code.extend_from_slice(&d.to_le_bytes());
+                }
+                if let Some((a2, a3_opt)) = pending_call_args.take() {
+                    let d2 = sc_node_disp(a2);
+                    // mov rdx, [rbp + d2]
+                    code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                    code.extend_from_slice(&d2.to_le_bytes());
+                    if let Some(a3) = a3_opt {
+                        let d3 = sc_node_disp(a3);
+                        // mov rcx, [rbp + d3]
+                        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                        code.extend_from_slice(&d3.to_le_bytes());
+                    }
+                }
+                code.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call rel32
+                call_patches.push((code.len() - 4, target_id));
+                if let Some(ret_elem) = callee_sig.ret_elem {
+                    emit_mov_rbp_rax(&mut code, disp);
+                    if let Some(el) = node_elem.get_mut(idx) {
+                        *el = ret_elem;
+                    }
+                }
+            }
             Opcode::ArenaInput
             | Opcode::ArenaSlice
             | Opcode::ArenaMutate
@@ -2456,6 +2778,18 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                 ));
             }
         }
+    }
+
+    if func_mode {
+        for (patch_pos, target_id) in call_patches {
+            let target_offset = func_offsets
+                .get(target_id)
+                .copied()
+                .flatten()
+                .ok_or(AotError::UnsupportedGraph("unresolved Call target"))?;
+            patch_rel32(&mut code, patch_pos, target_offset)?;
+        }
+        return Ok(code);
     }
 
     if let Some(out_slot) = output_region_slot {
@@ -2833,7 +3167,11 @@ fn emit_x86_64_machine_code(
                 | Opcode::RegionLen
                 | Opcode::RegionLoad
                 | Opcode::RegionStore
-                | Opcode::RegionFree => {}
+                | Opcode::RegionFree
+                | Opcode::Func
+                | Opcode::Return
+                | Opcode::Call
+                | Opcode::CallArg => {}
             }
         }
         for spec in reductions {
@@ -3180,7 +3518,11 @@ fn emit_x86_64_machine_code(
                 | Opcode::RegionLen
                 | Opcode::RegionLoad
                 | Opcode::RegionStore
-                | Opcode::RegionFree => {}
+                | Opcode::RegionFree
+                | Opcode::Func
+                | Opcode::Return
+                | Opcode::Call
+                | Opcode::CallArg => {}
             }
         }
 
@@ -3558,7 +3900,11 @@ fn emit_x86_64_machine_code(
             | Opcode::RegionLen
             | Opcode::RegionLoad
             | Opcode::RegionStore
-            | Opcode::RegionFree => {}
+            | Opcode::RegionFree
+            | Opcode::Func
+            | Opcode::Return
+            | Opcode::Call
+            | Opcode::CallArg => {}
         }
     }
 
@@ -4431,7 +4777,11 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Loop
             | Opcode::Br
             | Opcode::RegionLen
-            | Opcode::RegionFree => {}
+            | Opcode::RegionFree
+            | Opcode::Func
+            | Opcode::Return
+            | Opcode::Call
+            | Opcode::CallArg => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt

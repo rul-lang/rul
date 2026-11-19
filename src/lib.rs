@@ -25,6 +25,9 @@ pub mod transpiler;
 pub mod verifier;
 
 #[cfg(test)]
+mod tc_core3_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::bytecode::{
         ArenaDescriptor, ExecPolicy, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RulProgram,

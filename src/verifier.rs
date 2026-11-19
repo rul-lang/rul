@@ -11,9 +11,9 @@
 use std::fmt;
 
 use crate::bytecode::{
-    ElemType, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram, SimdWidth,
-    TokenMode, TypeLane, CAP_DIVERGE, CAP_NET_RING, MAX_REGION_BYTES, MAX_REGION_SLOTS,
-    MAX_SECTION_ITEMS,
+    ElemType, FuncSigInfo, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram,
+    SimdWidth, TokenMode, TypeLane, CALL_ARG_SENTINEL, CAP_DIVERGE, CAP_NET_RING, MAX_FUNC_NODES,
+    MAX_REGION_BYTES, MAX_REGION_SLOTS, MAX_SECTION_ITEMS,
 };
 
 /// Shape and static length inferred in $O(1)$ per node during the single-pass scan.
@@ -171,6 +171,22 @@ pub enum VerifyErrorKind {
     },
     /// Region opcode referenced an undeclared or out-of-range region slot.
     UnknownRegion(u32),
+    /// Invalid [`ProofRuleKind::FuncSig`] entry or function table declaration.
+    InvalidFuncSig {
+        /// Offending function identifier.
+        func_id: u32,
+        /// Reason the declaration was rejected.
+        reason: &'static str,
+    },
+    /// `Call` or `Func` referenced an undeclared function identifier.
+    UnknownFunction(u32),
+    /// Function scope (`Func` through matching `End`) exceeds [`MAX_FUNC_NODES`] (65,535).
+    FunctionTooLarge {
+        /// Offending function identifier.
+        func_id: u16,
+        /// Observed node count inside the function scope.
+        node_count: usize,
+    },
 }
 
 impl fmt::Display for VerifyDiagnostic {
@@ -232,6 +248,26 @@ enum ControlKind {
     Block,
     Loop,
     If { has_else: bool },
+    Func { sig: FuncSigInfo, start_node: u32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveFunc {
+    sig: FuncSigInfo,
+    start_node: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCallArg {
+    node_idx: u32,
+    arg2_elem: ElemType,
+    arg3_elem: Option<ElemType>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompletedFunc {
+    sig: FuncSigInfo,
+    start_node: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +309,77 @@ struct VerifierState {
     control_stack: Vec<ControlFrame>,
     regions: [Option<RegionDeclInfo>; MAX_REGION_SLOTS],
     has_unproven_region_access: bool,
+    func_sigs: Vec<FuncSigInfo>,
+    current_func: Option<ActiveFunc>,
+    pending_call_arg: Option<PendingCallArg>,
+    next_func_id: u32,
+    completed_funcs: Vec<CompletedFunc>,
+    has_func_mode: bool,
+    seen_non_func_top_level: bool,
+}
+
+fn scan_func_sigs(program: &RulProgram) -> Result<Vec<FuncSigInfo>, VerifyDiagnostic> {
+    let mut raw: Vec<FuncSigInfo> = Vec::new();
+    for proof in &program.proofs {
+        if proof.rule_kind != ProofRuleKind::FuncSig {
+            continue;
+        }
+        let sig = proof.decode_func_sig().ok_or(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidFuncSig {
+                func_id: u32::from(proof.target_arena),
+                reason: "malformed FuncSig proof entry",
+            },
+        })?;
+        raw.push(sig);
+    }
+
+    let count = raw.len();
+    if count > usize::from(u16::MAX) + 1 {
+        return Err(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidFuncSig {
+                func_id: u32::try_from(count).unwrap_or(u32::MAX),
+                reason: "FuncSig count exceeds u16 func_id space (65,536)",
+            },
+        });
+    }
+    let mut table: Vec<Option<FuncSigInfo>> = vec![None; count];
+    for sig in raw {
+        let idx = usize::from(sig.func_id);
+        let Some(slot) = table.get_mut(idx) else {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidFuncSig {
+                    func_id: u32::from(sig.func_id),
+                    reason: "FuncSig func_id is out of dense 0..N range",
+                },
+            });
+        };
+        if slot.is_some() {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidFuncSig {
+                    func_id: u32::from(sig.func_id),
+                    reason: "duplicate FuncSig for func_id",
+                },
+            });
+        }
+        *slot = Some(sig);
+    }
+
+    let mut dense = Vec::with_capacity(count);
+    for (idx, entry) in table.into_iter().enumerate() {
+        let sig = entry.ok_or(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidFuncSig {
+                func_id: u32::try_from(idx).unwrap_or(u32::MAX),
+                reason: "missing FuncSig in dense 0..N range",
+            },
+        })?;
+        dense.push(sig);
+    }
+    Ok(dense)
 }
 
 fn scan_region_decls(
@@ -414,8 +521,10 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         });
     }
 
-    // One linear pre-scan of the proof table to index statically declared regions.
+    // One linear pre-scan of the proof table to index statically declared regions and function signatures.
     let regions = scan_region_decls(program)?;
+    let func_sigs = scan_func_sigs(program)?;
+    let has_func_mode = !func_sigs.is_empty();
 
     // Track live AffineToken version per Arena.
     let mut arena_versions: Vec<u16> = program.arenas.iter().map(|a| a.initial_version).collect();
@@ -432,12 +541,74 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         control_stack: Vec::new(),
         regions,
         has_unproven_region_access: false,
+        func_sigs,
+        current_func: None,
+        pending_call_arg: None,
+        next_func_id: 0,
+        completed_funcs: Vec::new(),
+        has_func_mode,
+        seen_non_func_top_level: false,
     };
     let mut max_fusion_group: u8 = 0;
     let mut has_gather = false;
 
     for (idx, frame) in program.nodes.iter().enumerate() {
         let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
+
+        if let Some(pending) = state.pending_call_arg {
+            if frame.opcode != Opcode::Call {
+                return Err(VerifyDiagnostic {
+                    node_idx: pending.node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "CallArg must immediately precede Call",
+                    ),
+                });
+            }
+        }
+
+        if frame.opcode == Opcode::Func {
+            if state.seen_non_func_top_level {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "node outside Func scope in function program",
+                    ),
+                });
+            }
+            state.has_func_mode = true;
+        } else if state.current_func.is_none() {
+            if state.has_func_mode {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "node outside Func scope in function program",
+                    ),
+                });
+            }
+            state.seen_non_func_top_level = true;
+        }
+
+        if state.has_func_mode && frame.token_op.mode != TokenMode::PureValue {
+            return Err(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::InvalidControlFlow(
+                    "non-pure token_op is forbidden in programs containing Func",
+                ),
+            });
+        }
+
+        if let Some(active) = state.current_func {
+            let scope_nodes_so_far = (node_idx - active.start_node) as usize + 1;
+            if scope_nodes_so_far > MAX_FUNC_NODES {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::FunctionTooLarge {
+                        func_id: active.sig.func_id,
+                        node_count: scope_nodes_so_far,
+                    },
+                });
+            }
+        }
 
         if frame.schedule.fusion_group > max_fusion_group {
             max_fusion_group = frame.schedule.fusion_group;
@@ -467,12 +638,73 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         }
     }
 
+    if let Some(pending) = state.pending_call_arg {
+        return Err(VerifyDiagnostic {
+            node_idx: pending.node_idx,
+            kind: VerifyErrorKind::InvalidControlFlow("dangling CallArg at end of program"),
+        });
+    }
+
     if let Some(unclosed) = state.control_stack.last() {
         return Err(VerifyDiagnostic {
             node_idx: unclosed.header_node,
             kind: VerifyErrorKind::InvalidControlFlow(
                 "unclosed structured control block at end of program",
             ),
+        });
+    }
+
+    if state.has_func_mode {
+        if state.completed_funcs.len() != state.func_sigs.len() {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidFuncSig {
+                    func_id: u32::try_from(state.completed_funcs.len()).unwrap_or(u32::MAX),
+                    reason: "Func count does not match FuncSig proof count",
+                },
+            });
+        }
+        let entry = state
+            .completed_funcs
+            .last()
+            .copied()
+            .ok_or(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidFuncSig {
+                    func_id: 0,
+                    reason: "function program must declare at least one Func",
+                },
+            })?;
+        if entry.sig.arity != 0 {
+            return Err(VerifyDiagnostic {
+                node_idx: entry.start_node,
+                kind: VerifyErrorKind::InvalidFuncSig {
+                    func_id: u32::from(entry.sig.func_id),
+                    reason: "entry function must have arity 0",
+                },
+            });
+        }
+        let Some(entry_ret_elem) = entry.sig.ret_elem else {
+            return Err(VerifyDiagnostic {
+                node_idx: entry.start_node,
+                kind: VerifyErrorKind::InvalidFuncSig {
+                    func_id: u32::from(entry.sig.func_id),
+                    reason: "entry function must have a non-void return type",
+                },
+            });
+        };
+        if program.output_node != entry.start_node {
+            return Err(VerifyDiagnostic {
+                node_idx: program.output_node,
+                kind: VerifyErrorKind::InvalidOutputNode(program.output_node),
+            });
+        }
+        return Ok(VerifiedSummary {
+            node_count,
+            fusion_groups: usize::from(max_fusion_group),
+            output_shape: ValueShape::Scalar,
+            output_elem: entry_ret_elem,
+            zero_runtime_bounds_checks: !has_gather && !state.has_unproven_region_access,
         });
     }
 
@@ -591,9 +823,30 @@ fn get_prior_meta(
     node_idx: u32,
     input_idx: u32,
     metas: &[NodeMeta],
-    node_visible: &[bool],
+    state: &VerifierState,
 ) -> Result<NodeMeta, VerifyDiagnostic> {
-    if input_idx >= node_idx {
+    let abs_idx = if let Some(active) = state.current_func {
+        if input_idx == 0 {
+            return Err(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::InvalidControlFlow(
+                    "relative operand 0 names the enclosing Func node and is not a value",
+                ),
+            });
+        }
+        active
+            .start_node
+            .checked_add(input_idx)
+            .ok_or(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::NonTopologicalEdge {
+                    input_node: input_idx,
+                },
+            })?
+    } else {
+        input_idx
+    };
+    if abs_idx >= node_idx {
         return Err(VerifyDiagnostic {
             node_idx,
             kind: VerifyErrorKind::NonTopologicalEdge {
@@ -601,7 +854,7 @@ fn get_prior_meta(
             },
         });
     }
-    let idx = input_idx as usize;
+    let idx = abs_idx as usize;
     let meta = metas.get(idx).copied().ok_or(VerifyDiagnostic {
         node_idx,
         kind: VerifyErrorKind::NonTopologicalEdge {
@@ -616,7 +869,7 @@ fn get_prior_meta(
             ),
         });
     }
-    if !node_visible.get(idx).copied().unwrap_or(false) {
+    if !state.node_visible.get(idx).copied().unwrap_or(false) {
         return Err(VerifyDiagnostic {
             node_idx,
             kind: VerifyErrorKind::ScopedValueEscaped {
@@ -1162,7 +1415,7 @@ fn verify_node_semantics(
                 });
             }
             let slot = frame.in_a;
-            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if val_meta.shape != ValueShape::Scalar {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1215,7 +1468,7 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(ValueShape::Scalar, val_meta.elem, None))
         }
         Opcode::ArenaSlice => {
-            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             if frame.proof_idx == 0 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1292,7 +1545,7 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::MissingArenaToken(expected_id),
                 });
             }
-            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if val_meta.elem != arena.type_lane.elem {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1310,8 +1563,8 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(unified, val_meta.elem, Some(expected_id)))
         }
         Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div => {
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) && meta_a.elem == meta_b.elem {
                 let int_elem = meta_a.elem;
                 if meta_a.shape != ValueShape::Scalar || meta_b.shape != ValueShape::Scalar {
@@ -1369,8 +1622,8 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(shape, ElemType::F64, None))
         }
         Opcode::Min | Opcode::Max => {
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if meta_a.elem != ElemType::F64 || meta_b.elem != ElemType::F64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1389,9 +1642,9 @@ fn verify_node_semantics(
         }
         Opcode::Fma => {
             let (in_b, in_c) = frame.decode_fma_bc();
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, in_b, metas, &state.node_visible)?;
-            let meta_c = get_prior_meta(node_idx, in_c, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, in_b, metas, state)?;
+            let meta_c = get_prior_meta(node_idx, in_c, metas, state)?;
             for m in [meta_a, meta_b, meta_c] {
                 if m.elem != ElemType::F64 {
                     return Err(VerifyDiagnostic {
@@ -1408,7 +1661,7 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(shape, ElemType::F64, None))
         }
         Opcode::Abs | Opcode::Sqrt | Opcode::Floor | Opcode::Ceil | Opcode::Ln | Opcode::Exp => {
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             if meta_a.elem != ElemType::F64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1421,8 +1674,8 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(meta_a.shape, ElemType::F64, None))
         }
         Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) && meta_a.elem == meta_b.elem {
                 if meta_a.shape != ValueShape::Scalar || meta_b.shape != ValueShape::Scalar {
                     return Err(VerifyDiagnostic {
@@ -1490,8 +1743,8 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::InvalidControlFlow("CmpLtU requires proof_idx == 0"),
                 });
             }
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if meta_a.elem != ElemType::I64 || meta_b.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1557,8 +1810,8 @@ fn verify_node_semantics(
                     ),
                 });
             }
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if !matches!(meta_a.elem, ElemType::I64 | ElemType::U8) || meta_a.elem != meta_b.elem {
                 let (expected, actual) = if matches!(meta_a.elem, ElemType::I64 | ElemType::U8) {
                     (meta_a.elem, meta_b.elem)
@@ -1633,8 +1886,8 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::InvalidControlFlow("ShrS requires proof_idx == 0"),
                 });
             }
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if meta_a.elem != ElemType::I64 || meta_b.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1691,7 +1944,7 @@ fn verify_node_semantics(
                     ),
                 });
             }
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             if meta_a.elem != ElemType::BoolMask {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1744,7 +1997,7 @@ fn verify_node_semantics(
                     ),
                 });
             }
-            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             if src_meta.shape != ValueShape::Scalar {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1786,8 +2039,8 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(ValueShape::Scalar, dst_elem, None))
         }
         Opcode::MaskAnd | Opcode::MaskOr => {
-            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let meta_a = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let meta_b = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if meta_a.elem != ElemType::BoolMask || meta_b.elem != ElemType::BoolMask {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1805,8 +2058,8 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(shape, ElemType::BoolMask, None))
         }
         Opcode::SelectZero => {
-            let mask_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let mask_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if mask_meta.elem != ElemType::BoolMask {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1820,8 +2073,8 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(shape, val_meta.elem, None))
         }
         Opcode::FilterCompact => {
-            let mask_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let mask_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let val_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if mask_meta.elem != ElemType::BoolMask {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1846,7 +2099,7 @@ fn verify_node_semantics(
             ))
         }
         Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin => {
-            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             if src_meta.elem != ElemType::F64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1859,8 +2112,8 @@ fn verify_node_semantics(
             Ok(NodeMeta::value(ValueShape::Scalar, ElemType::F64, None))
         }
         Opcode::Gather => {
-            let target_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
-            let idx_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let target_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            let idx_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if frame.proof_idx == 0 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -1935,7 +2188,7 @@ fn verify_node_semantics(
                     },
                 });
             }
-            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             Ok(NodeMeta::value(
                 src_meta.shape,
                 src_meta.elem,
@@ -1943,7 +2196,7 @@ fn verify_node_semantics(
             ))
         }
         Opcode::AssertContract => {
-            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let src_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             Ok(NodeMeta::value(
                 src_meta.shape,
                 src_meta.elem,
@@ -2049,7 +2302,7 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::InvalidControlFlow("If header requires in_b == 0"),
                 });
             }
-            let cond_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let cond_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             if cond_meta.elem != ElemType::BoolMask {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2106,7 +2359,7 @@ fn verify_node_semantics(
                             kind: VerifyErrorKind::InvalidControlFlow("duplicate Else in If block"),
                         });
                     }
-                    ControlKind::Block | ControlKind::Loop => {
+                    ControlKind::Block | ControlKind::Loop | ControlKind::Func { .. } => {
                         return Err(VerifyDiagnostic {
                             node_idx,
                             kind: VerifyErrorKind::InvalidControlFlow(
@@ -2126,7 +2379,7 @@ fn verify_node_semantics(
                         ),
                     });
                 }
-                let then_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+                let then_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
                 if then_meta.elem != res_tl.elem {
                     return Err(VerifyDiagnostic {
                         node_idx,
@@ -2214,7 +2467,73 @@ fn verify_node_semantics(
                 (top.kind, top.sig.and_then(|s| s.result_type))
             };
 
-            let out_meta = if let Some(res_tl) = result_tl_opt {
+            let out_meta = if let ControlKind::Func { sig, .. } = kind {
+                if let Some(ret_elem) = sig.ret_elem {
+                    if frame.in_b == 1 {
+                        if frame.type_lane.elem != ret_elem {
+                            return Err(VerifyDiagnostic {
+                                node_idx,
+                                kind: VerifyErrorKind::ElementTypeMismatch {
+                                    expected: ret_elem,
+                                    actual: frame.type_lane.elem,
+                                },
+                            });
+                        }
+                        if frame.type_lane.width != SimdWidth::Scalar {
+                            return Err(VerifyDiagnostic {
+                                node_idx,
+                                kind: VerifyErrorKind::ShapeMismatch {
+                                    left: ValueShape::Scalar,
+                                    right: ValueShape::Column(0),
+                                },
+                            });
+                        }
+                        let res_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+                        if res_meta.elem != ret_elem {
+                            return Err(VerifyDiagnostic {
+                                node_idx,
+                                kind: VerifyErrorKind::ElementTypeMismatch {
+                                    expected: ret_elem,
+                                    actual: res_meta.elem,
+                                },
+                            });
+                        }
+                        if res_meta.shape != ValueShape::Scalar {
+                            return Err(VerifyDiagnostic {
+                                node_idx,
+                                kind: VerifyErrorKind::ShapeMismatch {
+                                    left: ValueShape::Scalar,
+                                    right: res_meta.shape,
+                                },
+                            });
+                        }
+                    } else if frame.in_a == 0 && frame.in_b == 0 {
+                        if state.reachable {
+                            return Err(VerifyDiagnostic {
+                                node_idx,
+                                kind: VerifyErrorKind::InvalidControlFlow(
+                                    "non-void Func may fall through without returning a value",
+                                ),
+                            });
+                        }
+                    } else {
+                        return Err(VerifyDiagnostic {
+                            node_idx,
+                            kind: VerifyErrorKind::InvalidControlFlow(
+                                "End for non-void Func requires in_b == 1 and in_a == result, or unreachable void End",
+                            ),
+                        });
+                    }
+                } else if frame.in_a != 0 || frame.in_b != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "End for void Func requires in_a == 0 and in_b == 0",
+                        ),
+                    });
+                }
+                NodeMeta::VOID
+            } else if let Some(res_tl) = result_tl_opt {
                 if matches!(kind, ControlKind::If { has_else: false }) {
                     return Err(VerifyDiagnostic {
                         node_idx,
@@ -2240,7 +2559,7 @@ fn verify_node_semantics(
                         },
                     });
                 }
-                let res_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+                let res_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
                 if res_meta.elem != res_tl.elem {
                     return Err(VerifyDiagnostic {
                         node_idx,
@@ -2400,6 +2719,15 @@ fn verify_node_semantics(
                         state.local_init = popped.entry_init;
                     }
                 }
+                ControlKind::Func { sig, start_node } => {
+                    state.current_func = None;
+                    state.local_types = [None; 64];
+                    state.local_init = 0;
+                    state.reachable = true;
+                    state
+                        .completed_funcs
+                        .push(CompletedFunc { sig, start_node });
+                }
             }
 
             Ok(out_meta)
@@ -2439,6 +2767,14 @@ fn verify_node_semantics(
                     "Br relative depth exceeds open control stack",
                 ),
             })?;
+            if matches!(target.kind, ControlKind::Func { .. }) {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "Br cannot target a Func scope; use Return",
+                    ),
+                });
+            }
             if target.sig.and_then(|s| s.result_type).is_some() {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2469,6 +2805,7 @@ fn verify_node_semantics(
                             version_bumps,
                         )?;
                     }
+                    ControlKind::Func { .. } => {}
                 }
             }
             *reachable = false;
@@ -2482,7 +2819,7 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::InvalidControlFlow("BrIf requires proof_idx == 0"),
                 });
             }
-            let cond_meta = get_prior_meta(node_idx, frame.in_a, metas, &state.node_visible)?;
+            let cond_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
             if cond_meta.elem != ElemType::BoolMask {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2526,6 +2863,14 @@ fn verify_node_semantics(
                     "BrIf relative depth exceeds open control stack",
                 ),
             })?;
+            if matches!(target.kind, ControlKind::Func { .. }) {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "BrIf cannot target a Func scope; use Return",
+                    ),
+                });
+            }
             if target.sig.and_then(|s| s.result_type).is_some() {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2556,6 +2901,7 @@ fn verify_node_semantics(
                             version_bumps,
                         )?;
                     }
+                    ControlKind::Func { .. } => {}
                 }
             }
             Ok(NodeMeta::VOID)
@@ -2569,7 +2915,7 @@ fn verify_node_semantics(
                 });
             }
             let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
-            let len_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let len_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if len_meta.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2617,7 +2963,7 @@ fn verify_node_semantics(
                 });
             }
             let _decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
-            let add_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let add_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if add_meta.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2690,7 +3036,7 @@ fn verify_node_semantics(
         Opcode::RegionLoad => {
             require_pure_token(node_idx, frame)?;
             let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
-            let idx_meta = get_prior_meta(node_idx, frame.in_b, metas, &state.node_visible)?;
+            let idx_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if idx_meta.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2738,7 +3084,7 @@ fn verify_node_semantics(
             require_pure_token(node_idx, frame)?;
             let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
             let (idx_node, val_node) = frame.decode_u16_pair();
-            let idx_meta = get_prior_meta(node_idx, idx_node, metas, &state.node_visible)?;
+            let idx_meta = get_prior_meta(node_idx, idx_node, metas, state)?;
             if idx_meta.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2757,7 +3103,7 @@ fn verify_node_semantics(
                     },
                 });
             }
-            let val_meta = get_prior_meta(node_idx, val_node, metas, &state.node_visible)?;
+            let val_meta = get_prior_meta(node_idx, val_node, metas, state)?;
             if val_meta.elem != decl.elem {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -2840,6 +3186,347 @@ fn verify_node_semantics(
                 });
             }
             Ok(NodeMeta::VOID)
+        }
+        Opcode::Func => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidFuncSig {
+                        func_id: frame.in_a,
+                        reason: "Func node must have proof_idx == 0",
+                    },
+                });
+            }
+            if frame.in_b != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("Func requires in_b == 0"),
+                });
+            }
+            if !state.control_stack.is_empty() || state.current_func.is_some() {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "Func cannot be nested inside an open control scope",
+                    ),
+                });
+            }
+            let expected_id = state.next_func_id;
+            if frame.in_a != expected_id {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidFuncSig {
+                        func_id: frame.in_a,
+                        reason: "Func ids must be dense and declared in ascending order 0..N",
+                    },
+                });
+            }
+            let sig =
+                state
+                    .func_sigs
+                    .get(expected_id as usize)
+                    .copied()
+                    .ok_or(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UnknownFunction(frame.in_a),
+                    })?;
+            if let Some(ret_elem) = sig.ret_elem {
+                if frame.type_lane.elem != ret_elem {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ElementTypeMismatch {
+                            expected: ret_elem,
+                            actual: frame.type_lane.elem,
+                        },
+                    });
+                }
+                if frame.type_lane.width != SimdWidth::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: ValueShape::Column(0),
+                        },
+                    });
+                }
+            }
+            state.local_types = [None; 64];
+            state.local_init = 0;
+            for i in 0..usize::from(sig.arity) {
+                if let (Some(slot), Some(&param_elem)) =
+                    (state.local_types.get_mut(i), sig.params.get(i))
+                {
+                    *slot = Some(param_elem);
+                    state.local_init |= 1u64 << i;
+                }
+            }
+            state.reachable = true;
+            state.current_func = Some(ActiveFunc {
+                sig,
+                start_node: node_idx,
+            });
+            state.next_func_id = expected_id.saturating_add(1);
+            state.control_stack.push(ControlFrame {
+                kind: ControlKind::Func {
+                    sig,
+                    start_node: node_idx,
+                },
+                header_node: node_idx,
+                sig: None,
+                entry_init: state.local_init,
+                entry_undo_len: state.undo_log.len(),
+                entry_bumps: state.version_bumps,
+                entry_reachable: true,
+                has_branch_or_join: false,
+                has_exit_path: false,
+                exit_init: state.local_init,
+                exit_delta: None,
+                scope_nodes: Vec::new(),
+            });
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::Return => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "Return requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let active = state.current_func.ok_or(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::InvalidControlFlow("Return is only valid inside a Func"),
+            })?;
+            if let Some(ret_elem) = active.sig.ret_elem {
+                let val_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+                if val_meta.elem != ret_elem {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ElementTypeMismatch {
+                            expected: ret_elem,
+                            actual: val_meta.elem,
+                        },
+                    });
+                }
+                if val_meta.shape != ValueShape::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: val_meta.shape,
+                        },
+                    });
+                }
+            } else if frame.in_a != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("void Return requires in_a == 0"),
+                });
+            }
+            state.reachable = false;
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::CallArg => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("CallArg requires proof_idx == 0"),
+                });
+            }
+            if state.current_func.is_none() {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "CallArg is only valid inside a Func",
+                    ),
+                });
+            }
+            let sentinel = u32::from(CALL_ARG_SENTINEL);
+            if frame.in_a == 0 || frame.in_a >= sentinel {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "CallArg requires a valid relative operand in in_a (arg2)",
+                    ),
+                });
+            }
+            let arg2_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            if arg2_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: arg2_meta.shape,
+                    },
+                });
+            }
+            let arg3_elem = if frame.in_b == sentinel {
+                None
+            } else {
+                if frame.in_b == 0 || frame.in_b > sentinel {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "CallArg in_b (arg3) must be a valid relative operand or 0xFFFF sentinel",
+                        ),
+                    });
+                }
+                let arg3_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
+                if arg3_meta.shape != ValueShape::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: arg3_meta.shape,
+                        },
+                    });
+                }
+                Some(arg3_meta.elem)
+            };
+            state.pending_call_arg = Some(PendingCallArg {
+                node_idx,
+                arg2_elem: arg2_meta.elem,
+                arg3_elem,
+            });
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::Call => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("Call requires proof_idx == 0"),
+                });
+            }
+            let active = state.current_func.ok_or(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::InvalidControlFlow("Call is only valid inside a Func"),
+            })?;
+            let target_id = frame.in_a;
+            let callee_sig =
+                state
+                    .func_sigs
+                    .get(target_id as usize)
+                    .copied()
+                    .ok_or(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UnknownFunction(target_id),
+                    })?;
+            if target_id >= u32::from(active.sig.func_id)
+                && (program.capability_mask & CAP_DIVERGE) == 0
+            {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::MissingCapability {
+                        required: CAP_DIVERGE,
+                        actual: program.capability_mask,
+                    },
+                });
+            }
+            let pending = state.pending_call_arg.take();
+            let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+            let sentinel = u32::from(CALL_ARG_SENTINEL);
+            let mut arg_elems: [Option<ElemType>; 4] = [None; 4];
+
+            if arg0_raw != sentinel {
+                let meta0 = get_prior_meta(node_idx, arg0_raw, metas, state)?;
+                if meta0.shape != ValueShape::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: meta0.shape,
+                        },
+                    });
+                }
+                arg_elems[0] = Some(meta0.elem);
+            }
+            if arg1_raw != sentinel {
+                if arg_elems[0].is_none() {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "Call arg1 provided without arg0",
+                        ),
+                    });
+                }
+                let meta1 = get_prior_meta(node_idx, arg1_raw, metas, state)?;
+                if meta1.shape != ValueShape::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: meta1.shape,
+                        },
+                    });
+                }
+                arg_elems[1] = Some(meta1.elem);
+            }
+            if let Some(p) = pending {
+                if arg_elems[0].is_none() || arg_elems[1].is_none() {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "CallArg provided when Call has fewer than 2 arguments",
+                        ),
+                    });
+                }
+                arg_elems[2] = Some(p.arg2_elem);
+                arg_elems[3] = p.arg3_elem;
+            }
+
+            let provided_arity = arg_elems.iter().take_while(|e| e.is_some()).count();
+            if provided_arity != usize::from(callee_sig.arity) {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "Call argument count does not match callee FuncSig arity",
+                    ),
+                });
+            }
+            for i in 0..usize::from(callee_sig.arity) {
+                if let (Some(&expected), Some(Some(actual))) =
+                    (callee_sig.params.get(i), arg_elems.get(i))
+                {
+                    if *actual != expected {
+                        return Err(VerifyDiagnostic {
+                            node_idx,
+                            kind: VerifyErrorKind::ElementTypeMismatch {
+                                expected,
+                                actual: *actual,
+                            },
+                        });
+                    }
+                }
+            }
+
+            if let Some(ret_elem) = callee_sig.ret_elem {
+                if frame.type_lane.elem != ret_elem {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ElementTypeMismatch {
+                            expected: ret_elem,
+                            actual: frame.type_lane.elem,
+                        },
+                    });
+                }
+                if frame.type_lane.width != SimdWidth::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: ValueShape::Column(0),
+                        },
+                    });
+                }
+                Ok(NodeMeta::value(ValueShape::Scalar, ret_elem, None))
+            } else {
+                Ok(NodeMeta::VOID)
+            }
         }
     }
 }

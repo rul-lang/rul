@@ -2,7 +2,18 @@
 
 All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Tier execution engine, and `ELF64` AOT compiler are documented in this file.
 
-## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`), `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`) & `v0-5-tc-core-2` (`I64`/`U8` Arithmetic, Declared Regions & Byte I/O)
+## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`), `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`), `v0-5-tc-core-2` (`I64`/`U8` Arithmetic, Declared Regions & Byte I/O) & `v0-5-tc-core-3` (Function Table, Recursion, Stack Budget & Brainf\*ck Proof)
+
+### Added (`v0-5-tc-core-3` — 60-Opcode ISA: Modular Function Table, `CAP_DIVERGE`-Gated Recursion, Host-Independent Stack Budget & Five `v0.5` Exit Programs)
+- **Modular function scopes & `FuncSig` (`src/bytecode.rs`, `src/verifier.rs`)**:
+  - Added `Func = 0x57`, `Return = 0x58`, `Call = 0x59`, `CallArg = 0x5A`, `ProofRuleKind::FuncSig = 5`, `FuncSigInfo`, `MAX_CALL_DEPTH = 4096`, `MAX_STACK_UNITS = 1 << 20`, `MAX_FUNC_NODES = 65_535`, `CALL_ARG_SENTINEL = 0xFFFF`, and `func_frame_units(node_count) = 72 + node_count`.
+  - Indexed `FuncSig` entries by `func_id` in one linear proof pre-scan (supporting >255 functions and >65,536 total program nodes), enforced dense ascending declaration order `0..N`, `Func.proof_idx == 0`, function-relative node operands (`<= 65,535` nodes per function scope), per-activation 64 locals pre-initialized with `0..arity` parameters (`0..=4`), pure `token_op` enforcement in function programs, and entry point validation (`last Func`, `arity == 0`, non-`void` return, `header.output_node == entry Func`).
+  - Gated recursive and forward `Call` edges (`target_func_id >= caller_func_id`) behind `CAP_DIVERGE = 0x08` (`VerifyErrorKind::MissingCapability`), admitting self and mutual recursion under `CAP_DIVERGE`.
+- **Host-independent fail-closed execution (`src/engine.rs`, `src/aot.rs`)**:
+  - Implemented explicit heap-stack `Tier 0` function interpreter (`eval_functions_tier0`) with zero host stack recursion, enforcing `MAX_CALL_DEPTH` and `MAX_STACK_UNITS` (`ExecError::CallDepthExceeded`).
+  - Extended single-pass forward-patch `ELF64` AOT emitter (`emit_x86_64_scalar_control_flow`) to map a private stack (`8 * MAX_STACK_UNITS + 4096` bytes with bottom `PROT_NONE` guard page), enforce identical `live_call_depth` and `live_stack_units` counters via `[r15 + 2048/2056]` (`AOT_EXIT_STACK_OVERFLOW = 75` / `AotError::StackOverflow`, never `SIGSEGV`, invariant under `ulimit -s 64`), and patch forward/recursive `call rel32` targets in one pass.
+- **`.rls` assembler/decompiler (`src/transpiler.rs`)**: Lossless `.rls` $\leftrightarrow$ `.rl` round-trip for `Func`, `Return`, `Call`, `CallArg`, `func_sig` proof lines, and per-function symbolic-to-relative operand translation.
+- **`v0.5` Exit Programs Suite (`src/tc_core3_tests.rs`)**: Verified `Tier 0 == ELF64 AOT` bit-for-bit and lossless `.rls` round-trip for all five `v0.5` exit programs: **Brainf\*ck interpreter** (Turing-completeness proof with nested `[...]`, `<>+-.,`, `!` input separator, 30,000-byte `U8` tape), recursive `fib(20)`, in-place `quicksort`, prime `sieve(N = 10_000)`, and FIPS 180-4 `sha256`.
 
 ### Added (`v0-5-tc-core-2` — 56-Opcode ISA: `U8`, `I64`/`U8` Bitwise & Checked Div/Rem, Declared Growable Regions, Byte I/O Regions & Proof-Based Bounds Elision)
 - **Unsigned byte type & scalar integer/cast/mask ops (`src/bytecode.rs`, `src/verifier.rs`, `src/engine.rs`, `src/aot.rs`)**:

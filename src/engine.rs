@@ -11,8 +11,9 @@ use std::fmt;
 use std::time::Instant;
 
 use crate::bytecode::{
-    ElemType, ExecPolicy, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram,
-    ScheduleHint, MAX_REGION_SLOTS,
+    func_frame_units, ElemType, ExecPolicy, FuncSigInfo, NodeFrame, Opcode, ProofEntry,
+    ProofRuleKind, RegionRole, RulProgram, ScheduleHint, CALL_ARG_SENTINEL, MAX_CALL_DEPTH,
+    MAX_REGION_SLOTS, MAX_STACK_UNITS,
 };
 use crate::verifier::{verify_program, VerifyDiagnostic};
 
@@ -295,6 +296,13 @@ pub enum ExecError {
         /// Current region length.
         len: usize,
     },
+    /// Function call exceeded [`MAX_CALL_DEPTH`] (4096) or [`MAX_STACK_UNITS`] (`1 << 20`) (`AOT_EXIT_STACK_OVERFLOW = 75`).
+    CallDepthExceeded {
+        /// Attempted live activation count (entry function included).
+        call_depth: u32,
+        /// Attempted live ISA stack frame units sum.
+        stack_units: u32,
+    },
 }
 
 impl fmt::Display for ExecError {
@@ -349,6 +357,13 @@ impl fmt::Display for ExecError {
             } => write!(
                 f,
                 "region bounds out of range at node #{node_idx} (slot #{slot}): index={index}, len={len}"
+            ),
+            Self::CallDepthExceeded {
+                call_depth,
+                stack_units,
+            } => write!(
+                f,
+                "call stack guard exceeded (depth={call_depth}/{MAX_CALL_DEPTH}, stack_units={stack_units}/{MAX_STACK_UNITS})"
             ),
         }
     }
@@ -427,7 +442,11 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Loop
             | Opcode::Br
             | Opcode::RegionLen
-            | Opcode::RegionFree => {}
+            | Opcode::RegionFree
+            | Opcode::Func
+            | Opcode::Return
+            | Opcode::Call
+            | Opcode::CallArg => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt
@@ -720,15 +739,10 @@ struct Tier0Region {
 
 type StructuredTier0Output<'a> = (Vec<EvalValue<'a>>, usize, Option<Vec<u8>>);
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "single-function structured control-flow and declared-region reference interpreter"
-)]
-fn eval_structured_tier0<'a>(
+fn init_tier0_regions(
     program: &RulProgram,
-    inputs: &[&'a [f64]],
     input_bytes: &[u8],
-) -> Result<StructuredTier0Output<'a>, ExecError> {
+) -> Result<([Option<Tier0Region>; MAX_REGION_SLOTS], Option<usize>), ExecError> {
     let mut regions: [Option<Tier0Region>; MAX_REGION_SLOTS] = std::array::from_fn(|_i| None);
     let mut output_region_slot: Option<usize> = None;
     for proof in &program.proofs {
@@ -763,6 +777,870 @@ fn eval_structured_tier0<'a>(
             });
         }
     }
+    Ok((regions, output_region_slot))
+}
+
+fn take_output_region_bytes(
+    regions: &mut [Option<Tier0Region>; MAX_REGION_SLOTS],
+    output_region_slot: Option<usize>,
+) -> Option<Vec<u8>> {
+    output_region_slot.and_then(|slot| {
+        regions
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .and_then(|r| match &mut r.storage {
+                RegionStorage::U8(v) => Some(std::mem::take(v)),
+                RegionStorage::I64(_) | RegionStorage::F64(_) => None,
+            })
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Tier0FuncMeta {
+    start: usize,
+    end: usize,
+    node_count: usize,
+    frame_units: u32,
+    sig: FuncSigInfo,
+}
+
+struct Tier0Activation<'a> {
+    func_start: usize,
+    func_end: usize,
+    frame_units: u32,
+    pc: usize,
+    return_dest_rel: Option<usize>,
+    values: Vec<EvalValue<'a>>,
+    locals: [EvalValue<'a>; 64],
+    loop_fuel: Vec<u32>,
+    pending_call_args: Option<(EvalValue<'a>, Option<EvalValue<'a>>)>,
+}
+
+enum FuncStepAction<'a> {
+    Continue,
+    PushCall {
+        target_func_id: usize,
+        args: [EvalValue<'a>; 4],
+        arity: usize,
+        ret_dest_rel: Option<usize>,
+    },
+    ReturnVal(EvalValue<'a>),
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "heap-stack function-table reference interpreter with explicit depth and stack-unit guards"
+)]
+fn eval_functions_tier0<'a>(
+    program: &RulProgram,
+    inputs: &[&'a [f64]],
+    input_bytes: &[u8],
+) -> Result<StructuredTier0Output<'a>, ExecError> {
+    let (mut regions, output_region_slot) = init_tier0_regions(program, input_bytes)?;
+    let n = program.nodes.len();
+
+    let mut sigs_raw: Vec<FuncSigInfo> = Vec::new();
+    for proof in &program.proofs {
+        if proof.rule_kind == ProofRuleKind::FuncSig {
+            let sig = proof
+                .decode_func_sig()
+                .ok_or(ExecError::InvalidOperandState(0))?;
+            sigs_raw.push(sig);
+        }
+    }
+    let func_count = sigs_raw.len();
+    let mut sig_table: Vec<Option<FuncSigInfo>> = vec![None; func_count];
+    for sig in sigs_raw {
+        if let Some(slot) = sig_table.get_mut(usize::from(sig.func_id)) {
+            *slot = Some(sig);
+        }
+    }
+
+    let mut if_to_else: Vec<Option<usize>> = vec![None; n];
+    let mut else_to_if: Vec<usize> = vec![0; n];
+    let mut header_to_end: Vec<usize> = vec![0; n];
+    let mut br_target_header: Vec<usize> = vec![0; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut func_starts: Vec<usize> = vec![0; func_count];
+    let mut func_ends: Vec<usize> = vec![0; func_count];
+
+    for (idx, frame) in program.nodes.iter().enumerate() {
+        let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
+        match frame.opcode {
+            Opcode::Func => {
+                let fid = frame.in_a as usize;
+                if let Some(slot) = func_starts.get_mut(fid) {
+                    *slot = idx;
+                }
+                stack.push(idx);
+            }
+            Opcode::Block | Opcode::Loop | Opcode::If => {
+                stack.push(idx);
+            }
+            Opcode::Else => {
+                let if_hdr = stack
+                    .last()
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = if_to_else.get_mut(if_hdr) {
+                    *slot = Some(idx);
+                }
+                if let Some(slot) = else_to_if.get_mut(idx) {
+                    *slot = if_hdr;
+                }
+            }
+            Opcode::End => {
+                let hdr = stack
+                    .pop()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = header_to_end.get_mut(hdr) {
+                    *slot = idx;
+                }
+                if let Some(hdr_frame) = program.nodes.get(hdr) {
+                    if hdr_frame.opcode == Opcode::Func {
+                        let fid = hdr_frame.in_a as usize;
+                        if let Some(slot) = func_ends.get_mut(fid) {
+                            *slot = idx;
+                        }
+                    }
+                }
+            }
+            Opcode::Br => {
+                let depth = frame.in_a as usize;
+                let target_pos = stack
+                    .len()
+                    .checked_sub(1 + depth)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let hdr = stack
+                    .get(target_pos)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = br_target_header.get_mut(idx) {
+                    *slot = hdr;
+                }
+            }
+            Opcode::BrIf => {
+                let depth = frame.in_b as usize;
+                let target_pos = stack
+                    .len()
+                    .checked_sub(1 + depth)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let hdr = stack
+                    .get(target_pos)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                if let Some(slot) = br_target_header.get_mut(idx) {
+                    *slot = hdr;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut funcs: Vec<Tier0FuncMeta> = Vec::with_capacity(func_count);
+    for fid in 0..func_count {
+        let start = func_starts
+            .get(fid)
+            .copied()
+            .ok_or(ExecError::InvalidOperandState(0))?;
+        let end = func_ends
+            .get(fid)
+            .copied()
+            .ok_or(ExecError::InvalidOperandState(0))?;
+        let sig = sig_table
+            .get(fid)
+            .copied()
+            .flatten()
+            .ok_or(ExecError::InvalidOperandState(0))?;
+        let node_count = end.saturating_sub(start).saturating_add(1);
+        funcs.push(Tier0FuncMeta {
+            start,
+            end,
+            node_count,
+            frame_units: func_frame_units(node_count),
+            sig,
+        });
+    }
+
+    let entry_id = func_count
+        .checked_sub(1)
+        .ok_or(ExecError::InvalidOperandState(0))?;
+    let entry_meta = funcs
+        .get(entry_id)
+        .copied()
+        .ok_or(ExecError::InvalidOperandState(0))?;
+
+    let mut call_stack: Vec<Tier0Activation<'a>> = Vec::new();
+    let mut live_call_depth: u32 = 0;
+    let mut live_stack_units: u32 = 0;
+
+    let push_frame = |meta: Tier0FuncMeta,
+                      args: [EvalValue<'a>; 4],
+                      arity: usize,
+                      ret_dest_rel: Option<usize>,
+                      call_stack: &mut Vec<Tier0Activation<'a>>,
+                      live_call_depth: &mut u32,
+                      live_stack_units: &mut u32|
+     -> Result<(), ExecError> {
+        let next_depth = live_call_depth.saturating_add(1);
+        let next_units = live_stack_units.saturating_add(meta.frame_units);
+        if next_depth > MAX_CALL_DEPTH || next_units > MAX_STACK_UNITS {
+            return Err(ExecError::CallDepthExceeded {
+                call_depth: next_depth,
+                stack_units: next_units,
+            });
+        }
+        let mut values: Vec<EvalValue<'a>> = Vec::new();
+        values
+            .try_reserve_exact(meta.node_count)
+            .map_err(|_e| ExecError::CallDepthExceeded {
+                call_depth: next_depth,
+                stack_units: next_units,
+            })?;
+        values.resize(meta.node_count, EvalValue::Unused);
+
+        let mut loop_fuel: Vec<u32> = Vec::new();
+        loop_fuel.try_reserve_exact(meta.node_count).map_err(|_e| {
+            ExecError::CallDepthExceeded {
+                call_depth: next_depth,
+                stack_units: next_units,
+            }
+        })?;
+        loop_fuel.resize(meta.node_count, 0);
+
+        *live_call_depth = next_depth;
+        *live_stack_units = next_units;
+
+        let mut locals: [EvalValue<'a>; 64] = std::array::from_fn(|_i| EvalValue::Unused);
+        for (i, arg) in args.into_iter().take(arity).enumerate() {
+            if let Some(slot) = locals.get_mut(i) {
+                *slot = arg;
+            }
+        }
+        call_stack.push(Tier0Activation {
+            func_start: meta.start,
+            func_end: meta.end,
+            frame_units: meta.frame_units,
+            pc: meta.start + 1,
+            return_dest_rel: ret_dest_rel,
+            values,
+            locals,
+            loop_fuel,
+            pending_call_args: None,
+        });
+        Ok(())
+    };
+
+    push_frame(
+        entry_meta,
+        [
+            EvalValue::Unused,
+            EvalValue::Unused,
+            EvalValue::Unused,
+            EvalValue::Unused,
+        ],
+        0,
+        None,
+        &mut call_stack,
+        &mut live_call_depth,
+        &mut live_stack_units,
+    )?;
+
+    let mut intermediate_bytes = 0usize;
+    let mut entry_result: Option<EvalValue<'a>> = None;
+
+    while !call_stack.is_empty() {
+        let action = {
+            let act = call_stack
+                .last_mut()
+                .ok_or(ExecError::InvalidOperandState(0))?;
+            let pc = act.pc;
+            let node_idx = u32::try_from(pc).unwrap_or(u32::MAX);
+            let rel_pc = pc
+                .checked_sub(act.func_start)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let frame = program
+                .nodes
+                .get(pc)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+
+            match frame.opcode {
+                Opcode::ConstI64 => {
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = EvalValue::ScalarI64(frame.decode_const_i64());
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::LocalGet => {
+                    let val = act
+                        .locals
+                        .get(frame.in_a as usize)
+                        .cloned()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    if matches!(val, EvalValue::Unused) {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    }
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = val;
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::LocalSet => {
+                    let val = act
+                        .values
+                        .get(frame.in_b as usize)
+                        .cloned()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let local_slot = act
+                        .locals
+                        .get_mut(frame.in_a as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *local_slot = val.clone();
+                    let node_slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *node_slot = val;
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::Block => {
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::Loop => {
+                    if frame.proof_idx > 0 {
+                        let proof = program
+                            .proofs
+                            .get(usize::from(frame.proof_idx - 1))
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        let fuel_slot = act
+                            .loop_fuel
+                            .get_mut(rel_pc)
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        *fuel_slot = proof.bound_hi;
+                    }
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::If => {
+                    let cond_val = act
+                        .values
+                        .get(frame.in_a as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarMask(cond_bool) = *cond_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    if cond_bool {
+                        act.pc += 1;
+                    } else if let Some(else_pc) = if_to_else.get(pc).copied().flatten() {
+                        act.pc = else_pc + 1;
+                    } else {
+                        let end_pc = header_to_end
+                            .get(pc)
+                            .copied()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        act.pc = end_pc + 1;
+                    }
+                    FuncStepAction::Continue
+                }
+                Opcode::Else => {
+                    let if_hdr = else_to_if
+                        .get(pc)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let end_pc = header_to_end
+                        .get(if_hdr)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    if frame.in_b != 0 {
+                        let then_val = act
+                            .values
+                            .get(frame.in_a as usize)
+                            .cloned()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        let end_rel = end_pc
+                            .checked_sub(act.func_start)
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        let end_slot = act
+                            .values
+                            .get_mut(end_rel)
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        *end_slot = then_val;
+                    }
+                    act.pc = end_pc + 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::End => {
+                    if pc == act.func_end {
+                        let ret_val = if frame.in_b != 0 {
+                            act.values
+                                .get(frame.in_a as usize)
+                                .cloned()
+                                .ok_or(ExecError::InvalidOperandState(node_idx))?
+                        } else {
+                            EvalValue::Unused
+                        };
+                        FuncStepAction::ReturnVal(ret_val)
+                    } else {
+                        if frame.in_b != 0 {
+                            let res_val = act
+                                .values
+                                .get(frame.in_a as usize)
+                                .cloned()
+                                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                            let end_slot = act
+                                .values
+                                .get_mut(rel_pc)
+                                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                            *end_slot = res_val;
+                        }
+                        act.pc += 1;
+                        FuncStepAction::Continue
+                    }
+                }
+                Opcode::Br => {
+                    let hdr = br_target_header
+                        .get(pc)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    act.pc = step_func_branch_target(
+                        program,
+                        hdr,
+                        act.func_start,
+                        node_idx,
+                        &header_to_end,
+                        &mut act.loop_fuel,
+                    )?;
+                    FuncStepAction::Continue
+                }
+                Opcode::BrIf => {
+                    let cond_val = act
+                        .values
+                        .get(frame.in_a as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarMask(cond_bool) = *cond_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    if cond_bool {
+                        let hdr = br_target_header
+                            .get(pc)
+                            .copied()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                        act.pc = step_func_branch_target(
+                            program,
+                            hdr,
+                            act.func_start,
+                            node_idx,
+                            &header_to_end,
+                            &mut act.loop_fuel,
+                        )?;
+                    } else {
+                        act.pc += 1;
+                    }
+                    FuncStepAction::Continue
+                }
+                Opcode::Return => {
+                    let ret_val = if frame.in_a != 0 {
+                        act.values
+                            .get(frame.in_a as usize)
+                            .cloned()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?
+                    } else {
+                        EvalValue::Unused
+                    };
+                    FuncStepAction::ReturnVal(ret_val)
+                }
+                Opcode::CallArg => {
+                    let arg2 = act
+                        .values
+                        .get(frame.in_a as usize)
+                        .cloned()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let arg3 = if frame.in_b == u32::from(CALL_ARG_SENTINEL) {
+                        None
+                    } else {
+                        Some(
+                            act.values
+                                .get(frame.in_b as usize)
+                                .cloned()
+                                .ok_or(ExecError::InvalidOperandState(node_idx))?,
+                        )
+                    };
+                    act.pending_call_args = Some((arg2, arg3));
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::Call => {
+                    let target_func_id = frame.in_a as usize;
+                    let callee = funcs
+                        .get(target_func_id)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+                    let sentinel = u32::from(CALL_ARG_SENTINEL);
+                    let mut args = [
+                        EvalValue::Unused,
+                        EvalValue::Unused,
+                        EvalValue::Unused,
+                        EvalValue::Unused,
+                    ];
+                    if arg0_raw != sentinel {
+                        args[0] = act
+                            .values
+                            .get(arg0_raw as usize)
+                            .cloned()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    }
+                    if arg1_raw != sentinel {
+                        args[1] = act
+                            .values
+                            .get(arg1_raw as usize)
+                            .cloned()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    }
+                    if let Some((a2, a3_opt)) = act.pending_call_args.take() {
+                        args[2] = a2;
+                        if let Some(a3) = a3_opt {
+                            args[3] = a3;
+                        }
+                    }
+                    act.pc += 1;
+                    let ret_dest_rel = callee.sig.ret_elem.map(|_| rel_pc);
+                    FuncStepAction::PushCall {
+                        target_func_id,
+                        args,
+                        arity: usize::from(callee.sig.arity),
+                        ret_dest_rel,
+                    }
+                }
+                Opcode::RegionNew => {
+                    let slot_idx = frame.in_a as usize;
+                    let len_val = act
+                        .values
+                        .get(frame.in_b as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarI64(len_i64) = *len_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    let region = regions
+                        .get_mut(slot_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    let Ok(new_len) = usize::try_from(len_i64) else {
+                        return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                    };
+                    if new_len < region.min_len || new_len > region.max_len {
+                        return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                    }
+                    region.storage.reset_zeroed(new_len, frame.in_a)?;
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::RegionGrow => {
+                    let slot_idx = frame.in_a as usize;
+                    let add_val = act
+                        .values
+                        .get(frame.in_b as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarI64(add_i64) = *add_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    let region = regions
+                        .get_mut(slot_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    let Ok(add_len) = usize::try_from(add_i64) else {
+                        return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                    };
+                    let Some(new_len) = region.storage.len().checked_add(add_len) else {
+                        return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                    };
+                    if new_len < region.min_len || new_len > region.max_len {
+                        return Err(ExecError::RegionAllocationFailed { slot: frame.in_a });
+                    }
+                    region.storage.grow_zeroed(add_len, frame.in_a)?;
+                    let new_len_i64 = i64::try_from(new_len)
+                        .map_err(|_e| ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = EvalValue::ScalarI64(new_len_i64);
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::RegionLen => {
+                    let slot_idx = frame.in_a as usize;
+                    let region = regions
+                        .get(slot_idx)
+                        .and_then(Option::as_ref)
+                        .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    let cur_len = i64::try_from(region.storage.len())
+                        .map_err(|_e| ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = EvalValue::ScalarI64(cur_len);
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::RegionLoad => {
+                    let slot_idx = frame.in_a as usize;
+                    let idx_val = act
+                        .values
+                        .get(frame.in_b as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarI64(idx_i64) = *idx_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    let region = regions
+                        .get(slot_idx)
+                        .and_then(Option::as_ref)
+                        .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    let len = region.storage.len();
+                    let Ok(idx_usize) = usize::try_from(idx_i64) else {
+                        return Err(ExecError::RegionBoundsOutOfRange {
+                            node_idx,
+                            slot: frame.in_a,
+                            index: idx_i64,
+                            len,
+                        });
+                    };
+                    let loaded = match &region.storage {
+                        RegionStorage::U8(v) => v.get(idx_usize).copied().map(EvalValue::ScalarU8),
+                        RegionStorage::I64(v) => {
+                            v.get(idx_usize).copied().map(EvalValue::ScalarI64)
+                        }
+                        RegionStorage::F64(v) => v.get(idx_usize).copied().map(EvalValue::Scalar),
+                    }
+                    .ok_or(ExecError::RegionBoundsOutOfRange {
+                        node_idx,
+                        slot: frame.in_a,
+                        index: idx_i64,
+                        len,
+                    })?;
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = loaded;
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::RegionStore => {
+                    let slot_idx = frame.in_a as usize;
+                    let (idx_node, val_node) = frame.decode_u16_pair();
+                    let idx_val = act
+                        .values
+                        .get(idx_node as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarI64(idx_i64) = *idx_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    let val = act
+                        .values
+                        .get(val_node as usize)
+                        .cloned()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let region = regions
+                        .get_mut(slot_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    let len = region.storage.len();
+                    let Ok(idx_usize) = usize::try_from(idx_i64) else {
+                        return Err(ExecError::RegionBoundsOutOfRange {
+                            node_idx,
+                            slot: frame.in_a,
+                            index: idx_i64,
+                            len,
+                        });
+                    };
+                    match (&mut region.storage, val) {
+                        (RegionStorage::U8(v), EvalValue::ScalarU8(b)) => {
+                            let dst =
+                                v.get_mut(idx_usize)
+                                    .ok_or(ExecError::RegionBoundsOutOfRange {
+                                        node_idx,
+                                        slot: frame.in_a,
+                                        index: idx_i64,
+                                        len,
+                                    })?;
+                            *dst = b;
+                        }
+                        (RegionStorage::I64(v), EvalValue::ScalarI64(x)) => {
+                            let dst =
+                                v.get_mut(idx_usize)
+                                    .ok_or(ExecError::RegionBoundsOutOfRange {
+                                        node_idx,
+                                        slot: frame.in_a,
+                                        index: idx_i64,
+                                        len,
+                                    })?;
+                            *dst = x;
+                        }
+                        (RegionStorage::F64(v), EvalValue::Scalar(x)) => {
+                            let dst =
+                                v.get_mut(idx_usize)
+                                    .ok_or(ExecError::RegionBoundsOutOfRange {
+                                        node_idx,
+                                        slot: frame.in_a,
+                                        index: idx_i64,
+                                        len,
+                                    })?;
+                            *dst = x;
+                        }
+                        _ => return Err(ExecError::InvalidOperandState(node_idx)),
+                    }
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::RegionFree => {
+                    let slot_idx = frame.in_a as usize;
+                    let region = regions
+                        .get_mut(slot_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
+                    region.storage.free_storage();
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::Func => return Err(ExecError::InvalidOperandState(node_idx)),
+                _ => {
+                    let val = eval_node_tier0(
+                        program,
+                        frame,
+                        node_idx,
+                        inputs,
+                        &act.values,
+                        &mut intermediate_bytes,
+                    )?;
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = val;
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+            }
+        };
+
+        match action {
+            FuncStepAction::Continue => {}
+            FuncStepAction::PushCall {
+                target_func_id,
+                args,
+                arity,
+                ret_dest_rel,
+            } => {
+                let callee = funcs
+                    .get(target_func_id)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(0))?;
+                push_frame(
+                    callee,
+                    args,
+                    arity,
+                    ret_dest_rel,
+                    &mut call_stack,
+                    &mut live_call_depth,
+                    &mut live_stack_units,
+                )?;
+            }
+            FuncStepAction::ReturnVal(ret_val) => {
+                let popped = call_stack.pop().ok_or(ExecError::InvalidOperandState(0))?;
+                live_call_depth = live_call_depth.saturating_sub(1);
+                live_stack_units = live_stack_units.saturating_sub(popped.frame_units);
+                if let Some(caller) = call_stack.last_mut() {
+                    if let Some(dest_rel) = popped.return_dest_rel {
+                        let slot = caller
+                            .values
+                            .get_mut(dest_rel)
+                            .ok_or(ExecError::InvalidOperandState(0))?;
+                        *slot = ret_val;
+                    }
+                } else {
+                    entry_result = Some(ret_val);
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut out_values: Vec<EvalValue<'a>> = vec![EvalValue::Unused; n];
+    if let (Some(slot), Some(val)) = (
+        out_values.get_mut(program.output_node as usize),
+        entry_result,
+    ) {
+        *slot = val;
+    }
+    let output_bytes = take_output_region_bytes(&mut regions, output_region_slot);
+    Ok((out_values, intermediate_bytes, output_bytes))
+}
+
+fn step_func_branch_target(
+    program: &RulProgram,
+    hdr: usize,
+    func_start: usize,
+    branch_node: u32,
+    header_to_end: &[usize],
+    loop_fuel: &mut [u32],
+) -> Result<usize, ExecError> {
+    let hdr_frame = program
+        .nodes
+        .get(hdr)
+        .ok_or(ExecError::InvalidOperandState(branch_node))?;
+    if hdr_frame.opcode == Opcode::Loop {
+        if hdr_frame.proof_idx > 0 {
+            let proof = program
+                .proofs
+                .get(usize::from(hdr_frame.proof_idx - 1))
+                .ok_or(ExecError::InvalidOperandState(branch_node))?;
+            let rel_hdr = hdr
+                .checked_sub(func_start)
+                .ok_or(ExecError::InvalidOperandState(branch_node))?;
+            let fuel_slot = loop_fuel
+                .get_mut(rel_hdr)
+                .ok_or(ExecError::InvalidOperandState(branch_node))?;
+            if *fuel_slot == 0 {
+                return Err(ExecError::LoopBoundExceeded {
+                    loop_node: u32::try_from(hdr).unwrap_or(u32::MAX),
+                    limit: proof.bound_hi,
+                });
+            }
+            *fuel_slot -= 1;
+        }
+        Ok(hdr + 1)
+    } else {
+        let end_pc = header_to_end
+            .get(hdr)
+            .copied()
+            .ok_or(ExecError::InvalidOperandState(branch_node))?;
+        Ok(end_pc + 1)
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-function structured control-flow and declared-region reference interpreter"
+)]
+fn eval_structured_tier0<'a>(
+    program: &RulProgram,
+    inputs: &[&'a [f64]],
+    input_bytes: &[u8],
+) -> Result<StructuredTier0Output<'a>, ExecError> {
+    if program.has_functions() {
+        return eval_functions_tier0(program, inputs, input_bytes);
+    }
+    let (mut regions, output_region_slot) = init_tier0_regions(program, input_bytes)?;
 
     let n = program.nodes.len();
     let mut if_to_else: Vec<Option<usize>> = vec![None; n];
@@ -1196,15 +2074,7 @@ fn eval_structured_tier0<'a>(
         }
     }
 
-    let output_bytes = output_region_slot.and_then(|slot| {
-        regions
-            .get_mut(slot)
-            .and_then(Option::as_mut)
-            .and_then(|r| match &mut r.storage {
-                RegionStorage::U8(v) => Some(std::mem::take(v)),
-                RegionStorage::I64(_) | RegionStorage::F64(_) => None,
-            })
-    });
+    let output_bytes = take_output_region_bytes(&mut regions, output_region_slot);
 
     Ok((values, intermediate_bytes, output_bytes))
 }
@@ -1635,7 +2505,11 @@ fn eval_node_tier0<'a>(
         | Opcode::RegionLen
         | Opcode::RegionLoad
         | Opcode::RegionStore
-        | Opcode::RegionFree => Err(ExecError::UnsupportedInColumnarTier),
+        | Opcode::RegionFree
+        | Opcode::Func
+        | Opcode::Return
+        | Opcode::Call
+        | Opcode::CallArg => Err(ExecError::UnsupportedInColumnarTier),
     }
 }
 
@@ -2288,7 +3162,11 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
             | Opcode::RegionLen
             | Opcode::RegionLoad
             | Opcode::RegionStore
-            | Opcode::RegionFree => return None,
+            | Opcode::RegionFree
+            | Opcode::Func
+            | Opcode::Return
+            | Opcode::Call
+            | Opcode::CallArg => return None,
         };
         if let Some(slot) = phases.get_mut(idx) {
             *slot = phase;
