@@ -2,7 +2,26 @@
 
 All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Tier execution engine, and `ELF64` AOT compiler are documented in this file.
 
-## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`), `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`), `v0-5-tc-core-2` (`I64`/`U8` Arithmetic, Declared Regions & Byte I/O) & `v0-5-tc-core-3` (Function Table, Recursion, Stack Budget & Brainf\*ck Proof)
+## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`), `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`), `v0-5-tc-core-2` (`I64`/`U8` Arithmetic, Declared Regions & Byte I/O), `v0-5-tc-core-3` (Function Table, Recursion, Stack Budget & Brainf\*ck Proof) & `v0-5-tc-core-4` (Scalar Register Allocation & Performance Gate)
+
+### Added (`v0-5-tc-core-4` — Single-Pass Structured Scalar Register Allocator & `v0.5` Performance Gate)
+- **Single-pass linear-scan scalar register allocator (`src/aot.rs`, `docs/rul_spec_v0.md` §4)**:
+  - Replaced the one-stack-slot-per-node structured `x86_64` `ELF64` emitter with one `O(N)` liveness pre-scan (16-byte compact `ScNodeInfo` records with loop-extended `last_use`, lazy barrier prefix counts, loop-depth-weighted local scores, scope-result reservation, and adjacent compare-branch fusion) plus one forward linear-scan register-allocating emission pass with forward `rel32` patching.
+  - Allocated 10 GPRs (4 caller-saved `rdi`/`rsi`/`rdx`/`rcx` + 6 callee-saved `rbx`/`r12`/`r13`/`r8`/`r9`/`r10`) for `I64`/`U8`/`BoolMask`/loop fuel and 14 caller-saved `XMM` registers (`xmm2..=xmm15`) for `F64`, with reused 8-byte frame spill slots strictly bounded by `<= 8 * func_frame_units(node_count) = 8 * (72 + node_count)` bytes.
+  - Added single-pass instruction selection: on-demand `ConstI64`/`ConstF64`/`Cast(ConstI64, U8)` materialization, fused integer `Cmp*` / `MaskNot(Cmp*)` branches, 32-bit `mov` lowering for `BitAnd 0xFFFF_FFFF`, 3-operand `lea` for `I64` `Add`/`Sub`, dying-operand two-operand register reuse, transient `rax` spill avoidance for immediately-consumed commutative ops, packed 32-bit-delta `r14` call-depth + stack-unit budget checks with a shared out-of-line `exit(75)` stub, zero-NOP function prologues, and non-mutating early-return base-case guards.
+  - Kept the `.rl` binary format, opcode set, proof rules, `src/verifier.rs`, `src/engine.rs` (`Tier 0`), and the columnar AVX2 AOT path unchanged.
+- **`v0.5` Exit Benchmarks, Rust References & Regression Gates (`perf/v0_5_exit/`, `src/tc_core4_tests.rs`)**:
+  - Added standalone `.rls` programs and safe-Rust `std`-only references under `perf/v0_5_exit/` for `fib`, `quicksort`, `sieve`, `sha256`, and `brainfuck`.
+  - Added `test_tc_core4_regalloc_differential` (520 deterministic fixed-seed structured programs including 120 high-pressure >16 live GPR + >16 live `F64` cases across loops, `If`/`Else`, and `Call`, verifying `Tier 0 == ELF64 AOT` and byte-identical deterministic `ELF64` output), `test_tc_core4_spilled_frames_stay_within_stack_budget` (>40 live `I64` values across recursive `Call` verifying exact `MAX_STACK_UNITS` boundary and exit `75` under `ulimit -s 64`), `test_tc_core4_performance_gate` (`#[ignore]`), and `test_tc_core4_codegen_time_is_linear` (`#[ignore]`).
+  - **Measured `v0.5` Performance Gate (`x86_64`, release build, 5 alternating single-threaded runs, `ELF64 AOT == rustc -O`; `Tier 0 == ELF64 AOT` verified at `tc-core-3` sizes)**:
+    - `fib(40)`: `378.47 ms` vs `rustc -O` `190.77 ms` (**`1.98x`** <= `2.0x`, `1,262 B` ELF64, `4.28 us` min codegen)
+    - `quicksort` (2,000,000 `I64`s): `179.36 ms` vs `rustc -O` `122.80 ms` (**`1.46x`** <= `2.0x`, `2,084 B` ELF64, `8.54 us` min codegen)
+    - `sieve` (`N = 50,000,000`): `408.08 ms` vs `rustc -O` `362.25 ms` (**`1.13x`** <= `2.0x`, `1,752 B` ELF64, `6.10 us` min codegen)
+    - `sha256` (64 MiB): `396.71 ms` vs `rustc -O` `239.52 ms` (**`1.66x`** <= `2.0x`, `5,368 B` ELF64, `30.12 us` min codegen)
+    - `brainfuck` (3x nested loop): `510.44 ms` vs `rustc -O` `326.14 ms` (**`1.57x`** <= `2.0x`, `2,964 B` ELF64, `10.02 us` min codegen)
+  - **Measured Codegen Linearity (`AotCompileReport.codegen_ns`, min of 5 release compilations)**:
+    - `stress_6k` (6,000 nodes, >=64 live): `189.64 us` (`31.61 ns/node` <= `50 ns/node`)
+    - `stress_60k` (60,000 nodes, >=64 live): `1,932.44 us` (`32.21 ns/node` <= `50 ns/node`, **`10.19x`** scaling <= `15.0x`)
 
 ### Added (`v0-5-tc-core-3` — 60-Opcode ISA: Modular Function Table, `CAP_DIVERGE`-Gated Recursion, Host-Independent Stack Budget & Five `v0.5` Exit Programs)
 - **Modular function scopes & `FuncSig` (`src/bytecode.rs`, `src/verifier.rs`)**:
