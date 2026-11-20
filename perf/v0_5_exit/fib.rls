@@ -1,0 +1,89 @@
+# v0.5 Exit Benchmark: recursive fib(n)
+# Input: 8-byte little-endian i64 n
+# Output: 8-byte little-endian i64 fib(n)
+cap DIVERGE
+proof 1 rule=region_decl target=0 lo=0 hi=8 witness=u8:input
+proof 2 rule=func_sig target=0 lo=1 hi=i64 witness=i64
+proof 3 rule=func_sig target=1 lo=1 hi=i64 witness=i64
+proof 4 rule=func_sig target=2 lo=0 hi=0 witness=i64
+node $fn_0 = Func i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ci_0 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $lg_1 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $rld_2 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$lg_1
+node $cast_3 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_2 b=0
+node $ci_4 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $op_5 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_1 b=$ci_4
+node $rld_6 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$op_5
+node $cast_7 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_6 b=0
+node $ci_8 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=8
+node $op_9 = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_7 b=$ci_8
+node $op_10 = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_3 b=$op_9
+node $ci_11 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2
+node $op_12 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_1 b=$ci_11
+node $rld_13 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$op_12
+node $cast_14 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_13 b=0
+node $ci_15 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=16
+node $op_16 = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_14 b=$ci_15
+node $op_17 = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_10 b=$op_16
+node $ci_18 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=3
+node $op_19 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_1 b=$ci_18
+node $rld_20 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$op_19
+node $cast_21 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_20 b=0
+node $ci_22 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=24
+node $op_23 = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_21 b=$ci_22
+node $op_24 = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_17 b=$op_23
+node $ci_25 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=4
+node $op_26 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_1 b=$ci_25
+node $rld_27 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$op_26
+node $cast_28 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_27 b=0
+node $ci_29 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=32
+node $op_30 = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_28 b=$ci_29
+node $op_31 = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_24 b=$op_30
+node $ci_32 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=5
+node $op_33 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_1 b=$ci_32
+node $rld_34 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$op_33
+node $cast_35 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_34 b=0
+node $ci_36 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=40
+node $op_37 = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_35 b=$ci_36
+node $op_38 = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_31 b=$op_37
+node $ci_39 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=6
+node $op_40 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_1 b=$ci_39
+node $rld_41 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$op_40
+node $cast_42 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_41 b=0
+node $ci_43 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=48
+node $op_44 = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_42 b=$ci_43
+node $op_45 = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_38 b=$op_44
+node $ci_46 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=7
+node $op_47 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_1 b=$ci_46
+node $rld_48 = RegionLoad u8x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$op_47
+node $cast_49 = Cast i64x1 fg=0 pol=l1 proof=0 tok=pure a=$rld_48 b=0
+node $ci_50 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=56
+node $op_51 = Shl i64x1 fg=0 pol=l1 proof=0 tok=pure a=$cast_49 b=$ci_50
+node $op_52 = BitOr i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_45 b=$op_51
+node $end_53 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_52 b=1
+node $fn_1 = Func i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=0
+node $lg_54 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ci_55 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2
+node $op_56 = CmpLt maskx1 fg=0 pol=l1 proof=0 tok=pure a=$lg_54 b=$ci_55
+node $if_57 = If i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_56 b=0
+node $lg_58 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ret_59 = Return i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_58 b=0
+node $end_60 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $lg_61 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ci_62 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=1
+node $op_63 = Sub i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_61 b=$ci_62
+node $call_64 = Call i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$op_63 c=none
+node $lg_65 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $ci_66 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=2
+node $op_67 = Sub i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_65 b=$ci_66
+node $ls_68 = LocalSet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$call_64
+node $lg_69 = LocalGet i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=0
+node $call_70 = Call i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$op_67 c=none
+node $op_71 = Add i64x1 fg=0 pol=l1 proof=0 tok=pure a=$lg_69 b=$call_70
+node $end_72 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=$op_71 b=1
+node $fn_2 = Func i64x1 fg=0 pol=l1 proof=0 tok=pure a=2 b=0
+node $ci_73 = ConstI64 i64x1 fg=0 pol=l1 proof=0 tok=pure const_i64=0
+node $call_74 = Call i64x1 fg=0 pol=l1 proof=0 tok=pure a=0 b=$ci_73 c=none
+node $call_75 = Call i64x1 fg=0 pol=l1 proof=0 tok=pure a=1 b=$call_74 c=none
+node $end_76 = End i64x1 fg=0 pol=l1 proof=0 tok=pure a=$call_75 b=1
+output $fn_2

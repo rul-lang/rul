@@ -966,39 +966,184 @@ pub fn run_compiled_scalar_executable(exe_path: impl AsRef<Path>) -> Result<f64,
     Ok(f64::from_le_bytes(bytes))
 }
 
-const SC_STDOUT_DISP: i32 = -520;
-const SC_CALL_DEPTH_OFF: i32 = 2048;
-const SC_STACK_UNITS_OFF: i32 = 2056;
 const SC_SCRATCH_IO_OFF: i32 = 2064;
+const SC_R15_SAVE_OFF: i32 = 2080;
 
-fn sc_local_disp(slot: u32) -> i32 {
-    let slot_i32 = i32::try_from(slot).unwrap_or(0);
-    (-8i32).saturating_mul(slot_i32.saturating_add(1))
+const REG_RAX: u8 = 0;
+const REG_RCX: u8 = 1;
+const REG_RDX: u8 = 2;
+const REG_RBX: u8 = 3;
+const REG_RBP: u8 = 5;
+const REG_RSI: u8 = 6;
+const REG_RDI: u8 = 7;
+const REG_R8: u8 = 8;
+const REG_R9: u8 = 9;
+const REG_R10: u8 = 10;
+const REG_R11: u8 = 11;
+const REG_R12: u8 = 12;
+const REG_R13: u8 = 13;
+const REG_R14: u8 = 14;
+
+const SC_ARG_GPRS: [u8; 4] = [REG_RDI, REG_RSI, REG_RDX, REG_RCX];
+const SC_CALLEE_SAVED_GPRS: [u8; 6] = [REG_RBX, REG_R12, REG_R13, REG_R8, REG_R9, REG_R10];
+const SC_ALL_GPRS_ORDER: [u8; 10] = [
+    REG_RDI, REG_RSI, REG_RDX, REG_RCX, REG_RBX, REG_R12, REG_R13, REG_R8, REG_R9, REG_R10,
+];
+const SC_CALLEE_SAVED_MASK: u16 =
+    (1 << 3) | (1 << 12) | (1 << 13) | (1 << 8) | (1 << 9) | (1 << 10);
+const SC_CALLER_SAVED_MASK: u16 = (1 << 7) | (1 << 6) | (1 << 2) | (1 << 1);
+const SC_ALLOC_GPR_MASK: u16 = SC_CALLER_SAVED_MASK | SC_CALLEE_SAVED_MASK;
+const SC_ALLOC_XMM_MASK: u16 = 0xFFFC; // xmm2..=xmm15
+const SC_R15_SAVE_GPRS: [u8; 7] = [REG_RBX, REG_R12, REG_R13, REG_R8, REG_R9, REG_R10, REG_R14];
+
+const HOME_NONE: u8 = 0;
+const HOME_GPR: u8 = 1;
+const HOME_ALIAS_GPR: u8 = 2;
+const HOME_XMM: u8 = 3;
+const HOME_ALIAS_XMM: u8 = 4;
+const HOME_SPILL: u8 = 5;
+const HOME_CONST_I64: u8 = 6;
+const HOME_CONST_U8: u8 = 7;
+const HOME_CONST_F64: u8 = 8;
+
+const FLAG_SCOPE_HAS_RESULT: u8 = 0x10;
+const FLAG_BRANCH_FUSE_DIRECT: u8 = 0x20;
+const FLAG_BRANCH_FUSE_INV: u8 = 0x40;
+const FLAG_FUSED_BY_NEXT1: u8 = 0x80;
+const FLAG_FUSED_BY_NEXT2: u8 = 0x08;
+
+#[inline]
+const fn encode_elem(elem: ElemType) -> u8 {
+    match elem {
+        ElemType::F64 => 0,
+        ElemType::I64 => 1,
+        ElemType::BoolMask => 2,
+        ElemType::U8 => 3,
+    }
 }
 
-fn sc_node_disp(node_idx: usize) -> i32 {
-    let idx_i32 = i32::try_from(node_idx).unwrap_or(0);
-    (-528i32).saturating_sub(idx_i32.saturating_mul(8))
+#[inline]
+const fn decode_elem(elem_flags: u8) -> ElemType {
+    match elem_flags & 0x07 {
+        0 => ElemType::F64,
+        1 => ElemType::I64,
+        2 => ElemType::BoolMask,
+        _ => ElemType::U8,
+    }
+}
+
+/// Compact 16-byte per-node analysis and allocation record (4 records per 64-byte cache line).
+#[derive(Clone, Copy)]
+struct ScNodeInfo {
+    last_use: u32,
+    outer_loop_header: u32,
+    /// `scope_end` for `Block`/`Loop`/`If`, or `next_local_set` (and intrusive list link during scan) for `LocalGet`.
+    aux: u32,
+    /// Holds `def_loop_depth` during `sc_analyze_unit`, and `home_reg` / `spill_slot` during `sc_emit_unit`.
+    home_data: u16,
+    /// Low 4 bits = `home_tag` (`0..=8`), bits 4..6 = saturated use count (`0`, `1`, `2+`).
+    home_tag_uc: u8,
+    /// Low 3 bits = `ElemType`, bits 3..7 = scope/fusion flags.
+    elem_flags: u8,
+}
+
+impl ScNodeInfo {
+    const DEFAULT: Self = Self {
+        last_use: 0,
+        outer_loop_header: u32::MAX,
+        aux: u32::MAX,
+        home_data: 0,
+        home_tag_uc: HOME_NONE,
+        elem_flags: 1, // ElemType::I64
+    };
+
+    #[inline]
+    const fn elem(self) -> ElemType {
+        decode_elem(self.elem_flags)
+    }
+
+    #[inline]
+    fn set_elem(&mut self, elem: ElemType) {
+        self.elem_flags = (self.elem_flags & !0x07) | encode_elem(elem);
+    }
+
+    #[inline]
+    const fn home_tag(self) -> u8 {
+        self.home_tag_uc & 0x0F
+    }
+
+    #[inline]
+    const fn use_count(self) -> u8 {
+        self.home_tag_uc >> 4
+    }
+
+    #[inline]
+    fn inc_use(&mut self) {
+        let uc = self.home_tag_uc >> 4;
+        if uc < 2 {
+            self.home_tag_uc = (self.home_tag_uc & 0x0F) | ((uc + 1) << 4);
+        }
+    }
+
+    #[inline]
+    fn set_home_tag(&mut self, tag: u8) {
+        self.home_tag_uc = (self.home_tag_uc & 0xF0) | (tag & 0x0F);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScHome {
+    None,
+    Gpr(u8),
+    AliasGpr(u8),
+    Xmm(u8),
+    AliasXmm(u8),
+    Spill(u32),
+    ConstI64(i64),
+    ConstU8(u8),
+    ConstF64(u64),
+}
+
+impl ScHome {
+    #[inline]
+    const fn gpr_reg(self) -> Option<u8> {
+        match self {
+            Self::Gpr(r) | Self::AliasGpr(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    const fn xmm_reg(self) -> Option<u8> {
+        match self {
+            Self::Xmm(x) | Self::AliasXmm(x) => Some(x),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScLocalHome {
+    Unused,
+    Gpr(u8),
+    Xmm(u8),
+    Slot(i32),
 }
 
 #[derive(Debug)]
 enum AotCtrlKind {
-    Block,
+    Block {
+        end_node_idx: usize,
+    },
     Loop {
         body_start_offset: usize,
         loop_node_idx: usize,
         bounded: bool,
     },
     If {
-        if_node_idx: usize,
+        end_node_idx: usize,
         false_jump_patch: usize,
         has_else: bool,
-    },
-    Func {
-        func_start: usize,
-        units_add_patch: usize,
-        frame_sub_patch: usize,
-        epilogue_patches: Vec<usize>,
     },
 }
 
@@ -1006,6 +1151,194 @@ enum AotCtrlKind {
 struct AotCtrlFrame {
     kind: AotCtrlKind,
     end_patches: Vec<usize>,
+}
+
+struct ScUnitScratch {
+    nodes: Vec<ScNodeInfo>,
+    call_prefix: Vec<u32>,
+    has_any_barrier: bool,
+    has_any_loop: bool,
+    local_get_head: [u32; 64],
+    loop_stack: Vec<u32>,
+    ctrl_scan: Vec<(Opcode, u32)>,
+    spill_expire_head: Vec<u32>,
+    spill_entries: Vec<(u32, u32)>,
+    free_spill_slots: Vec<u32>,
+    ctrl_stack: Vec<AotCtrlFrame>,
+    epilogue_patches: Vec<usize>,
+    fn_body: Vec<u8>,
+}
+
+impl ScUnitScratch {
+    fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            call_prefix: Vec::new(),
+            has_any_barrier: false,
+            has_any_loop: false,
+            local_get_head: [u32::MAX; 64],
+            loop_stack: Vec::new(),
+            ctrl_scan: Vec::new(),
+            spill_expire_head: Vec::new(),
+            spill_entries: Vec::new(),
+            free_spill_slots: Vec::new(),
+            ctrl_stack: Vec::new(),
+            epilogue_patches: Vec::new(),
+            fn_body: Vec::new(),
+        }
+    }
+
+    fn reset_for_unit(&mut self, len: usize) {
+        self.nodes.clear();
+        self.nodes.resize(len, ScNodeInfo::DEFAULT);
+        self.call_prefix.clear();
+        self.has_any_barrier = false;
+        self.has_any_loop = false;
+        self.local_get_head = [u32::MAX; 64];
+        self.loop_stack.clear();
+        self.ctrl_scan.clear();
+        self.spill_expire_head.clear();
+        self.spill_entries.clear();
+        self.free_spill_slots.clear();
+        self.ctrl_stack.clear();
+        self.epilogue_patches.clear();
+    }
+
+    #[inline]
+    fn get_home(&self, v: usize, unit_nodes: &[crate::bytecode::NodeFrame]) -> ScHome {
+        let Some(info) = self.nodes.get(v) else {
+            return ScHome::None;
+        };
+        match info.home_tag() {
+            HOME_GPR => ScHome::Gpr(info.home_data as u8),
+            HOME_ALIAS_GPR => ScHome::AliasGpr(info.home_data as u8),
+            HOME_XMM => ScHome::Xmm(info.home_data as u8),
+            HOME_ALIAS_XMM => ScHome::AliasXmm(info.home_data as u8),
+            HOME_SPILL => ScHome::Spill(u32::from(info.home_data)),
+            HOME_CONST_I64 => unit_nodes.get(v).map_or(ScHome::ConstI64(0), |f| {
+                ScHome::ConstI64(f.decode_const_i64())
+            }),
+            HOME_CONST_U8 => ScHome::ConstU8(info.home_data as u8),
+            HOME_CONST_F64 => unit_nodes.get(v).map_or(ScHome::ConstF64(0), |f| {
+                ScHome::ConstF64(f.decode_const_f64().to_bits())
+            }),
+            _ => ScHome::None,
+        }
+    }
+
+    #[inline]
+    fn set_home(&mut self, v: usize, home: ScHome) -> Result<(), AotError> {
+        let Some(info) = self.nodes.get_mut(v) else {
+            return Ok(());
+        };
+        match home {
+            ScHome::None => {
+                info.set_home_tag(HOME_NONE);
+            }
+            ScHome::Gpr(r) => {
+                info.set_home_tag(HOME_GPR);
+                info.home_data = u16::from(r);
+            }
+            ScHome::AliasGpr(r) => {
+                info.set_home_tag(HOME_ALIAS_GPR);
+                info.home_data = u16::from(r);
+            }
+            ScHome::Xmm(x) => {
+                info.set_home_tag(HOME_XMM);
+                info.home_data = u16::from(x);
+            }
+            ScHome::AliasXmm(x) => {
+                info.set_home_tag(HOME_ALIAS_XMM);
+                info.home_data = u16::from(x);
+            }
+            ScHome::Spill(s) => {
+                let spill_idx = u16::try_from(s)
+                    .map_err(|_e| AotError::UnsupportedGraph("spill slot index overflow"))?;
+                info.set_home_tag(HOME_SPILL);
+                info.home_data = spill_idx;
+            }
+            ScHome::ConstI64(_) => {
+                info.set_home_tag(HOME_CONST_I64);
+            }
+            ScHome::ConstU8(b) => {
+                info.set_home_tag(HOME_CONST_U8);
+                info.home_data = u16::from(b);
+            }
+            ScHome::ConstF64(_) => {
+                info.set_home_tag(HOME_CONST_F64);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn node_elem(&self, v: usize) -> ElemType {
+        self.nodes.get(v).map_or(ElemType::I64, |n| n.elem())
+    }
+
+    #[inline]
+    fn eff_last_use(&self, v: usize) -> usize {
+        let Some(info) = self.nodes.get(v) else {
+            return 0;
+        };
+        let lu = info.last_use as usize;
+        if !self.has_any_loop || info.outer_loop_header == u32::MAX {
+            lu
+        } else {
+            let lend = self
+                .nodes
+                .get(info.outer_loop_header as usize)
+                .map_or(0, |h| h.aux as usize);
+            lu.max(lend)
+        }
+    }
+
+    #[inline]
+    fn spans_barrier(&self, start_idx: usize, end_idx: usize) -> bool {
+        if !self.has_any_barrier || end_idx <= start_idx {
+            return false;
+        }
+        let c_start = self
+            .call_prefix
+            .get(start_idx.saturating_add(1))
+            .copied()
+            .unwrap_or(0);
+        let c_end = self.call_prefix.get(end_idx).copied().unwrap_or(0);
+        c_end > c_start
+    }
+
+    #[inline]
+    fn is_branch_fused(&self, branch_idx: usize) -> Option<(usize, bool)> {
+        let flags = self.nodes.get(branch_idx)?.elem_flags;
+        if (flags & FLAG_BRANCH_FUSE_DIRECT) != 0 {
+            let c = branch_idx.checked_sub(1)?;
+            if self.nodes.get(c)?.use_count() == 1 {
+                return Some((c, false));
+            }
+        } else if (flags & FLAG_BRANCH_FUSE_INV) != 0 {
+            let c = branch_idx.checked_sub(2)?;
+            if self.nodes.get(c)?.use_count() == 1
+                && self.nodes.get(c.saturating_add(1))?.use_count() == 1
+            {
+                return Some((c, true));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn is_node_fused_out(&self, idx: usize) -> bool {
+        let Some(info) = self.nodes.get(idx) else {
+            return false;
+        };
+        if (info.elem_flags & FLAG_FUSED_BY_NEXT1) != 0 {
+            self.is_branch_fused(idx.saturating_add(1)).is_some()
+        } else if (info.elem_flags & FLAG_FUSED_BY_NEXT2) != 0 {
+            self.is_branch_fused(idx.saturating_add(2)).is_some()
+        } else {
+            false
+        }
+    }
 }
 
 fn compile_structured_to_elf64_bytes(
@@ -1033,16 +1366,18 @@ fn compile_structured_to_elf64_bytes(
         ));
     }
 
-    let code = emit_x86_64_scalar_control_flow(program)?;
-    let machine_code_bytes = code.len();
-    let total_elf_size = ELF_CODE_OFFSET + machine_code_bytes;
-    let mut elf = Vec::with_capacity(total_elf_size);
-    write_elf64_headers(&mut elf, total_elf_size as u64);
-    elf.extend_from_slice(&code);
+    let mut elf = emit_x86_64_scalar_control_flow(program)?;
+    let total_elf_size = elf.len();
+    let machine_code_bytes = total_elf_size.saturating_sub(ELF_CODE_OFFSET);
+    let mut hdr = Vec::with_capacity(ELF_CODE_OFFSET);
+    write_elf64_headers(&mut hdr, total_elf_size as u64);
+    if let Some(dst) = elf.get_mut(..ELF_CODE_OFFSET) {
+        dst.copy_from_slice(&hdr);
+    }
 
     let codegen_ns = u64::try_from(t_cg.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let report = AotCompileReport {
-        elf_bytes: elf.len(),
+        elf_bytes: total_elf_size,
         machine_code_bytes,
         avx2_vectorized: false,
         verify_ns,
@@ -1052,35 +1387,612 @@ fn compile_structured_to_elf64_bytes(
     Ok((elf, report))
 }
 
-fn emit_mov_rax_rbp(code: &mut Vec<u8>, disp: i32) {
-    // mov rax, qword ptr [rbp + disp32]
-    code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-    code.extend_from_slice(&disp.to_le_bytes());
+#[inline]
+const fn sc_rex(w: bool, r: u8, x: u8, b: u8) -> u8 {
+    0x40 | ((w as u8) << 3) | (((r >> 3) & 1) << 2) | (((x >> 3) & 1) << 1) | ((b >> 3) & 1)
 }
 
-fn emit_mov_rbp_rax(code: &mut Vec<u8>, disp: i32) {
-    // mov qword ptr [rbp + disp32], rax
-    code.extend_from_slice(&[0x48, 0x89, 0x85]);
-    code.extend_from_slice(&disp.to_le_bytes());
+fn emit_push_gpr(code: &mut Vec<u8>, reg: u8) {
+    if reg >= 8 {
+        code.push(0x41);
+    }
+    code.push(0x50 + (reg & 7));
+}
+
+fn emit_pop_gpr(code: &mut Vec<u8>, reg: u8) {
+    if reg >= 8 {
+        code.push(0x41);
+    }
+    code.push(0x58 + (reg & 7));
+}
+
+fn emit_mov_gpr_gpr(code: &mut Vec<u8>, dst: u8, src: u8) {
+    if dst == src {
+        return;
+    }
+    code.extend_from_slice(&[
+        sc_rex(true, src, 0, dst),
+        0x89,
+        0xC0 | ((src & 7) << 3) | (dst & 7),
+    ]);
+}
+
+/// Emits `mov dst32, src32`, zero-extending the lower 32 bits into `dst64` even when `dst == src`.
+fn emit_mov_gpr32_gpr32(code: &mut Vec<u8>, dst: u8, src: u8) {
+    if dst >= 8 || src >= 8 {
+        code.push(sc_rex(false, src, 0, dst));
+    }
+    code.extend_from_slice(&[0x89, 0xC0 | ((src & 7) << 3) | (dst & 7)]);
+}
+
+fn emit_mov_gpr_imm64(code: &mut Vec<u8>, dst: u8, val: u64) {
+    if val == 0 {
+        if dst >= 8 {
+            code.push(sc_rex(false, dst, 0, dst));
+        }
+        code.extend_from_slice(&[0x31, 0xC0 | ((dst & 7) << 3) | (dst & 7)]);
+    } else if let Ok(v32) = u32::try_from(val) {
+        if dst >= 8 {
+            code.push(0x41);
+        }
+        code.push(0xB8 + (dst & 7));
+        code.extend_from_slice(&v32.to_le_bytes());
+    } else {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "checking if 64-bit bit pattern fits in sign-extended imm32"
+        )]
+        let signed = val as i64;
+        if let Ok(s32) = i32::try_from(signed) {
+            code.extend_from_slice(&[sc_rex(true, 0, 0, dst), 0xC7, 0xC0 | (dst & 7)]);
+            code.extend_from_slice(&s32.to_le_bytes());
+        } else {
+            emit_movabs_reg(code, dst, val);
+        }
+    }
+}
+
+fn emit_movabs_reg(code: &mut Vec<u8>, reg: u8, val: u64) {
+    let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 };
+    code.push(rex);
+    code.push(0xB8 + (reg & 7));
+    code.extend_from_slice(&val.to_le_bytes());
+}
+
+fn emit_rbp_disp_modrm(code: &mut Vec<u8>, reg_field: u8, disp: i32) {
+    if let Ok(d8) = i8::try_from(disp) {
+        code.push(0x45 | ((reg_field & 7) << 3));
+        code.push(d8.to_ne_bytes()[0]);
+    } else {
+        code.push(0x85 | ((reg_field & 7) << 3));
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+fn emit_load_gpr_rbp(code: &mut Vec<u8>, dst: u8, disp: i32) {
+    code.extend_from_slice(&[sc_rex(true, dst, 0, REG_RBP), 0x8B]);
+    emit_rbp_disp_modrm(code, dst, disp);
+}
+
+fn emit_load_gpr32_rbp(code: &mut Vec<u8>, dst: u8, disp: i32) {
+    if dst >= 8 {
+        code.push(sc_rex(false, dst, 0, REG_RBP));
+    }
+    code.push(0x8B);
+    emit_rbp_disp_modrm(code, dst, disp);
+}
+
+fn emit_store_rbp_gpr(code: &mut Vec<u8>, disp: i32, src: u8) {
+    code.extend_from_slice(&[sc_rex(true, src, 0, REG_RBP), 0x89]);
+    emit_rbp_disp_modrm(code, src, disp);
+}
+
+fn emit_load_xmm_rbp(code: &mut Vec<u8>, xmm: u8, disp: i32) {
+    code.push(0xF2);
+    if xmm >= 8 {
+        code.push(sc_rex(false, xmm, 0, REG_RBP));
+    }
+    code.extend_from_slice(&[0x0F, 0x10]);
+    emit_rbp_disp_modrm(code, xmm, disp);
+}
+
+fn emit_store_rbp_xmm(code: &mut Vec<u8>, disp: i32, xmm: u8) {
+    code.push(0xF2);
+    if xmm >= 8 {
+        code.push(sc_rex(false, xmm, 0, REG_RBP));
+    }
+    code.extend_from_slice(&[0x0F, 0x11]);
+    emit_rbp_disp_modrm(code, xmm, disp);
+}
+
+fn emit_mov_xmm_xmm(code: &mut Vec<u8>, dst: u8, src: u8) {
+    if dst == src {
+        return;
+    }
+    if dst >= 8 || src >= 8 {
+        code.push(sc_rex(false, dst, 0, src));
+    }
+    // movaps dst, src (whole 128-bit reg rename move, no partial-reg dependency)
+    code.extend_from_slice(&[0x0F, 0x28, 0xC0 | ((dst & 7) << 3) | (src & 7)]);
+}
+
+fn emit_movq_xmm_gpr(code: &mut Vec<u8>, xmm: u8, gpr: u8) {
+    code.extend_from_slice(&[
+        0x66,
+        sc_rex(true, xmm, 0, gpr),
+        0x0F,
+        0x6E,
+        0xC0 | ((xmm & 7) << 3) | (gpr & 7),
+    ]);
+}
+
+fn emit_movq_gpr_xmm(code: &mut Vec<u8>, gpr: u8, xmm: u8) {
+    code.extend_from_slice(&[
+        0x66,
+        sc_rex(true, xmm, 0, gpr),
+        0x0F,
+        0x7E,
+        0xC0 | ((xmm & 7) << 3) | (gpr & 7),
+    ]);
+}
+
+fn emit_movzx_gpr32_gpr8(code: &mut Vec<u8>, dst: u8, src: u8) {
+    // Always emit REX so `src` 4..7 addresses `spl/bpl/sil/dil` instead of `ah/ch/dh/bh`.
+    code.extend_from_slice(&[
+        sc_rex(false, dst, 0, src),
+        0x0F,
+        0xB6,
+        0xC0 | ((dst & 7) << 3) | (src & 7),
+    ]);
+}
+
+fn emit_alu64_rr(code: &mut Vec<u8>, op: u8, dst: u8, src: u8) {
+    // `op` in {0x03 add, 0x2B sub, 0x23 and, 0x0B or, 0x33 xor, 0x3B cmp} (reg=dst, rm=src)
+    code.extend_from_slice(&[
+        sc_rex(true, dst, 0, src),
+        op,
+        0xC0 | ((dst & 7) << 3) | (src & 7),
+    ]);
+}
+
+fn emit_alu64_rm_rbp(code: &mut Vec<u8>, op: u8, dst: u8, disp: i32) {
+    code.extend_from_slice(&[sc_rex(true, dst, 0, REG_RBP), op]);
+    emit_rbp_disp_modrm(code, dst, disp);
+}
+
+fn emit_alu64_ri(code: &mut Vec<u8>, ext: u8, dst: u8, imm: i64) {
+    // `ext`: 0=add, 1=or, 4=and, 5=sub, 6=xor, 7=cmp
+    if let Ok(i8v) = i8::try_from(imm) {
+        code.extend_from_slice(&[
+            sc_rex(true, 0, 0, dst),
+            0x83,
+            0xC0 | (ext << 3) | (dst & 7),
+            i8v.to_ne_bytes()[0],
+        ]);
+    } else if let Ok(i32v) = i32::try_from(imm) {
+        code.extend_from_slice(&[sc_rex(true, 0, 0, dst), 0x81, 0xC0 | (ext << 3) | (dst & 7)]);
+        code.extend_from_slice(&i32v.to_le_bytes());
+    } else {
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "two's-complement 64-bit immediate materialization"
+        )]
+        emit_mov_gpr_imm64(code, REG_R11, imm as u64);
+        let op = match ext {
+            0 => 0x03,
+            1 => 0x0B,
+            4 => 0x23,
+            5 => 0x2B,
+            6 => 0x33,
+            _ => 0x3B,
+        };
+        emit_alu64_rr(code, op, dst, REG_R11);
+    }
+}
+
+fn emit_alu32_rr(code: &mut Vec<u8>, op: u8, dst: u8, src: u8) {
+    if dst >= 8 || src >= 8 {
+        code.push(sc_rex(false, dst, 0, src));
+    }
+    code.extend_from_slice(&[op, 0xC0 | ((dst & 7) << 3) | (src & 7)]);
+}
+
+fn emit_alu32_rm_rbp(code: &mut Vec<u8>, op: u8, dst: u8, disp: i32) {
+    if dst >= 8 {
+        code.push(sc_rex(false, dst, 0, REG_RBP));
+    }
+    code.push(op);
+    emit_rbp_disp_modrm(code, dst, disp);
+}
+
+fn emit_alu32_ri(code: &mut Vec<u8>, ext: u8, dst: u8, imm: i32) {
+    if dst >= 8 {
+        code.push(sc_rex(false, 0, 0, dst));
+    }
+    if let Ok(i8v) = i8::try_from(imm) {
+        code.extend_from_slice(&[0x83, 0xC0 | (ext << 3) | (dst & 7), i8v.to_ne_bytes()[0]]);
+    } else {
+        code.extend_from_slice(&[0x81, 0xC0 | (ext << 3) | (dst & 7)]);
+        code.extend_from_slice(&imm.to_le_bytes());
+    }
+}
+
+fn emit_imul64_rr(code: &mut Vec<u8>, dst: u8, src: u8) {
+    code.extend_from_slice(&[
+        sc_rex(true, dst, 0, src),
+        0x0F,
+        0xAF,
+        0xC0 | ((dst & 7) << 3) | (src & 7),
+    ]);
+}
+
+fn emit_imul64_rm_rbp(code: &mut Vec<u8>, dst: u8, disp: i32) {
+    code.extend_from_slice(&[sc_rex(true, dst, 0, REG_RBP), 0x0F, 0xAF]);
+    emit_rbp_disp_modrm(code, dst, disp);
+}
+
+fn emit_imul64_rri(code: &mut Vec<u8>, dst: u8, src: u8, imm: i32) {
+    if let Ok(i8v) = i8::try_from(imm) {
+        code.extend_from_slice(&[
+            sc_rex(true, dst, 0, src),
+            0x6B,
+            0xC0 | ((dst & 7) << 3) | (src & 7),
+            i8v.to_ne_bytes()[0],
+        ]);
+    } else {
+        code.extend_from_slice(&[
+            sc_rex(true, dst, 0, src),
+            0x69,
+            0xC0 | ((dst & 7) << 3) | (src & 7),
+        ]);
+        code.extend_from_slice(&imm.to_le_bytes());
+    }
+}
+
+fn emit_lea_reg_disp(code: &mut Vec<u8>, dst: u8, base: u8, disp: i32) {
+    if disp == 0 {
+        emit_mov_gpr_gpr(code, dst, base);
+        return;
+    }
+    code.extend_from_slice(&[sc_rex(true, dst, 0, base), 0x8D]);
+    if let Ok(d8) = i8::try_from(disp) {
+        code.push(0x40 | ((dst & 7) << 3) | (base & 7));
+        if (base & 7) == 4 {
+            code.push(0x24);
+        }
+        code.push(d8.to_ne_bytes()[0]);
+    } else {
+        code.push(0x80 | ((dst & 7) << 3) | (base & 7));
+        if (base & 7) == 4 {
+            code.push(0x24);
+        }
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+fn emit_lea_reg_plus_reg(code: &mut Vec<u8>, dst: u8, a: u8, b: u8) {
+    // Neither `a` nor `b` is `rsp (4)`; if `a` is `r13` (`a & 7 == 5`), swap so base has disp0.
+    let (base, index) = if (a & 7) == 5 && (b & 7) != 5 {
+        (b, a)
+    } else {
+        (a, b)
+    };
+    code.extend_from_slice(&[sc_rex(true, dst, index, base), 0x8D]);
+    if (base & 7) == 5 {
+        code.push(0x44 | ((dst & 7) << 3));
+        code.push(((index & 7) << 3) | (base & 7));
+        code.push(0x00);
+    } else {
+        code.push(0x04 | ((dst & 7) << 3));
+        code.push(((index & 7) << 3) | (base & 7));
+    }
+}
+
+fn emit_shift64_ri(code: &mut Vec<u8>, ext: u8, dst: u8, count: u8) {
+    let c = count & 63;
+    if c == 0 {
+        return;
+    }
+    code.extend_from_slice(&[
+        sc_rex(true, 0, 0, dst),
+        0xC1,
+        0xC0 | (ext << 3) | (dst & 7),
+        c,
+    ]);
+}
+
+fn emit_shift32_ri(code: &mut Vec<u8>, ext: u8, dst: u8, count: u8) {
+    let c = count & 31;
+    if c == 0 {
+        return;
+    }
+    if dst >= 8 {
+        code.push(sc_rex(false, 0, 0, dst));
+    }
+    code.extend_from_slice(&[0xC1, 0xC0 | (ext << 3) | (dst & 7), c]);
+}
+
+fn emit_sse2_sd_rr(code: &mut Vec<u8>, op: u8, dst: u8, src: u8) {
+    code.push(0xF2);
+    if dst >= 8 || src >= 8 {
+        code.push(sc_rex(false, dst, 0, src));
+    }
+    code.extend_from_slice(&[0x0F, op, 0xC0 | ((dst & 7) << 3) | (src & 7)]);
+}
+
+fn emit_sse2_sd_rm_rbp(code: &mut Vec<u8>, op: u8, dst: u8, disp: i32) {
+    code.push(0xF2);
+    if dst >= 8 {
+        code.push(sc_rex(false, dst, 0, REG_RBP));
+    }
+    code.extend_from_slice(&[0x0F, op]);
+    emit_rbp_disp_modrm(code, dst, disp);
+}
+
+fn emit_roundsd_rr(code: &mut Vec<u8>, dst: u8, src: u8, mode: u8) {
+    code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        code.push(sc_rex(false, dst, 0, src));
+    }
+    code.extend_from_slice(&[0x0F, 0x3A, 0x0B, 0xC0 | ((dst & 7) << 3) | (src & 7), mode]);
+}
+
+fn emit_vex_fma213_xmm_rr(code: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    let r_inv = if (dst & 8) == 0 { 0x80 } else { 0x00 };
+    let b_inv = if (src2 & 8) == 0 { 0x20 } else { 0x00 };
+    let byte1 = r_inv | 0x40 | b_inv | 0x02;
+    let vvvv_inv = (!src1) & 0x0F;
+    let byte2 = 0x80 | (vvvv_inv << 3) | 0x01;
+    let modrm = 0xC0 | ((dst & 7) << 3) | (src2 & 7);
+    code.extend_from_slice(&[0xC4, byte1, byte2, 0xA9, modrm]);
+}
+
+fn emit_load_reg_r15(code: &mut Vec<u8>, reg: u8, disp: i32) {
+    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
+    if let Ok(d8) = i8::try_from(disp) {
+        let modrm = 0x47 | ((reg & 7) << 3);
+        code.extend_from_slice(&[rex, 0x8B, modrm, d8.to_ne_bytes()[0]]);
+    } else {
+        let modrm = 0x87 | ((reg & 7) << 3);
+        code.extend_from_slice(&[rex, 0x8B, modrm]);
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+fn emit_store_r15_reg(code: &mut Vec<u8>, reg: u8, disp: i32) {
+    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
+    if let Ok(d8) = i8::try_from(disp) {
+        let modrm = 0x47 | ((reg & 7) << 3);
+        code.extend_from_slice(&[rex, 0x89, modrm, d8.to_ne_bytes()[0]]);
+    } else {
+        let modrm = 0x87 | ((reg & 7) << 3);
+        code.extend_from_slice(&[rex, 0x89, modrm]);
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+fn emit_cmp_reg_r15(code: &mut Vec<u8>, reg: u8, disp: i32) {
+    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
+    if let Ok(d8) = i8::try_from(disp) {
+        let modrm = 0x47 | ((reg & 7) << 3);
+        code.extend_from_slice(&[rex, 0x3B, modrm, d8.to_ne_bytes()[0]]);
+    } else {
+        let modrm = 0x87 | ((reg & 7) << 3);
+        code.extend_from_slice(&[rex, 0x3B, modrm]);
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+fn emit_sc_save_callee_to_r15(code: &mut Vec<u8>) {
+    for (k, &reg) in SC_R15_SAVE_GPRS.iter().enumerate() {
+        let off = SC_R15_SAVE_OFF.saturating_add(i32::try_from(k).unwrap_or(0).saturating_mul(8));
+        emit_store_r15_reg(code, reg, off);
+    }
+}
+
+fn emit_sc_restore_callee_from_r15(code: &mut Vec<u8>) {
+    for (k, &reg) in SC_R15_SAVE_GPRS.iter().enumerate() {
+        let off = SC_R15_SAVE_OFF.saturating_add(i32::try_from(k).unwrap_or(0).saturating_mul(8));
+        emit_load_reg_r15(code, reg, off);
+    }
+}
+
+/// Resolves up to 4 simultaneous GPR-to-GPR moves `(dst, src)` with distinct `dst`s,
+/// using `rax` as cycle-breaking temporary. Neither `dst` nor `src` may be `rax`.
+fn emit_parallel_gpr_moves(code: &mut Vec<u8>, pairs: &[(u8, u8)]) {
+    let mut pending: [(u8, u8); 4] = [(0, 0); 4];
+    let mut len = 0usize;
+    for &(d, s) in pairs {
+        if d != s {
+            if let Some(slot) = pending.get_mut(len) {
+                *slot = (d, s);
+                len += 1;
+            }
+        }
+    }
+    while len > 0 {
+        let mut ready = None;
+        for i in 0..len {
+            let Some(&(d, _)) = pending.get(i) else {
+                break;
+            };
+            let used_as_src = (0..len).any(|j| pending.get(j).is_some_and(|&(_, s)| s == d));
+            if !used_as_src {
+                ready = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = ready {
+            if let Some(&(d, s)) = pending.get(i) {
+                emit_mov_gpr_gpr(code, d, s);
+            }
+            len -= 1;
+            if i < len {
+                if let Some(&last) = pending.get(len) {
+                    if let Some(slot) = pending.get_mut(i) {
+                        *slot = last;
+                    }
+                }
+            }
+        } else if let Some(&(d0, s0)) = pending.first() {
+            // Break cycle using `rax`.
+            emit_mov_gpr_gpr(code, REG_RAX, d0);
+            emit_mov_gpr_gpr(code, d0, s0);
+            len -= 1;
+            if len > 0 {
+                if let Some(&last) = pending.get(len) {
+                    if let Some(slot) = pending.first_mut() {
+                        *slot = last;
+                    }
+                }
+            }
+            for j in 0..len {
+                if let Some(slot) = pending.get_mut(j) {
+                    if slot.1 == d0 {
+                        slot.1 = REG_RAX;
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+#[inline]
+fn sc_spill_disp(spill_base_slot: u32, spill_idx: u32) -> i32 {
+    let total = spill_base_slot.saturating_add(spill_idx).saturating_add(1);
+    (-8i32).saturating_mul(i32::try_from(total).unwrap_or(1))
+}
+
+fn emit_load_home_into_gpr(code: &mut Vec<u8>, dst: u8, home: ScHome, spill_base_slot: u32) {
+    match home {
+        ScHome::None => {}
+        ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_mov_gpr_gpr(code, dst, r),
+        ScHome::Xmm(x) | ScHome::AliasXmm(x) => emit_movq_gpr_xmm(code, dst, x),
+        ScHome::Spill(s) => emit_load_gpr_rbp(code, dst, sc_spill_disp(spill_base_slot, s)),
+        ScHome::ConstI64(v) => {
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "two's-complement 64-bit constant bit pattern"
+            )]
+            emit_mov_gpr_imm64(code, dst, v as u64);
+        }
+        ScHome::ConstU8(b) => emit_mov_gpr_imm64(code, dst, u64::from(b)),
+        ScHome::ConstF64(bits) => emit_mov_gpr_imm64(code, dst, bits),
+    }
+}
+
+fn emit_store_gpr_into_home(code: &mut Vec<u8>, home: ScHome, src: u8, spill_base_slot: u32) {
+    match home {
+        ScHome::None | ScHome::ConstI64(_) | ScHome::ConstU8(_) | ScHome::ConstF64(_) => {}
+        ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_mov_gpr_gpr(code, r, src),
+        ScHome::Xmm(x) | ScHome::AliasXmm(x) => emit_movq_xmm_gpr(code, x, src),
+        ScHome::Spill(s) => emit_store_rbp_gpr(code, sc_spill_disp(spill_base_slot, s), src),
+    }
+}
+
+fn emit_load_home_into_xmm(code: &mut Vec<u8>, dst_xmm: u8, home: ScHome, spill_base_slot: u32) {
+    match home {
+        ScHome::None => {}
+        ScHome::Xmm(x) | ScHome::AliasXmm(x) => emit_mov_xmm_xmm(code, dst_xmm, x),
+        ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_movq_xmm_gpr(code, dst_xmm, r),
+        ScHome::Spill(s) => emit_load_xmm_rbp(code, dst_xmm, sc_spill_disp(spill_base_slot, s)),
+        ScHome::ConstF64(bits) => {
+            if bits == 0 {
+                // xorpd dst_xmm, dst_xmm
+                code.push(0x66);
+                if dst_xmm >= 8 {
+                    code.push(sc_rex(false, dst_xmm, 0, dst_xmm));
+                }
+                code.extend_from_slice(&[0x0F, 0x57, 0xC0 | ((dst_xmm & 7) << 3) | (dst_xmm & 7)]);
+            } else {
+                emit_mov_gpr_imm64(code, REG_RAX, bits);
+                emit_movq_xmm_gpr(code, dst_xmm, REG_RAX);
+            }
+        }
+        ScHome::ConstI64(v) => {
+            #[expect(clippy::cast_sign_loss, reason = "exact 64-bit constant bit pattern")]
+            emit_mov_gpr_imm64(code, REG_RAX, v as u64);
+            emit_movq_xmm_gpr(code, dst_xmm, REG_RAX);
+        }
+        ScHome::ConstU8(b) => {
+            emit_mov_gpr_imm64(code, REG_RAX, u64::from(b));
+            emit_movq_xmm_gpr(code, dst_xmm, REG_RAX);
+        }
+    }
+}
+
+fn emit_store_xmm_into_home(code: &mut Vec<u8>, home: ScHome, src_xmm: u8, spill_base_slot: u32) {
+    match home {
+        ScHome::None | ScHome::ConstI64(_) | ScHome::ConstU8(_) | ScHome::ConstF64(_) => {}
+        ScHome::Xmm(x) | ScHome::AliasXmm(x) => emit_mov_xmm_xmm(code, x, src_xmm),
+        ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_movq_gpr_xmm(code, r, src_xmm),
+        ScHome::Spill(s) => emit_store_rbp_xmm(code, sc_spill_disp(spill_base_slot, s), src_xmm),
+    }
+}
+
+fn emit_move_home_to_home(code: &mut Vec<u8>, dst: ScHome, src: ScHome, spill_base_slot: u32) {
+    if dst == src {
+        return;
+    }
+    match dst {
+        ScHome::None | ScHome::ConstI64(_) | ScHome::ConstU8(_) | ScHome::ConstF64(_) => {}
+        ScHome::Gpr(r) | ScHome::AliasGpr(r) => {
+            emit_load_home_into_gpr(code, r, src, spill_base_slot);
+        }
+        ScHome::Xmm(x) | ScHome::AliasXmm(x) => {
+            emit_load_home_into_xmm(code, x, src, spill_base_slot);
+        }
+        ScHome::Spill(s) => {
+            let disp = sc_spill_disp(spill_base_slot, s);
+            match src {
+                ScHome::None => {}
+                ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_store_rbp_gpr(code, disp, r),
+                ScHome::Xmm(x) | ScHome::AliasXmm(x) => emit_store_rbp_xmm(code, disp, x),
+                ScHome::Spill(_)
+                | ScHome::ConstI64(_)
+                | ScHome::ConstU8(_)
+                | ScHome::ConstF64(_) => {
+                    emit_load_home_into_gpr(code, REG_RAX, src, spill_base_slot);
+                    emit_store_rbp_gpr(code, disp, REG_RAX);
+                }
+            }
+        }
+    }
 }
 
 fn emit_loop_backedge_jump(
     code: &mut Vec<u8>,
     body_start_offset: usize,
-    loop_node_idx: usize,
+    fuel_home: ScHome,
+    spill_base_slot: u32,
     bounded: bool,
 ) -> Result<(), AotError> {
     if bounded {
-        let fuel_disp = sc_node_disp(loop_node_idx);
-        emit_mov_rax_rbp(code, fuel_disp);
-        // test rax, rax
-        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
-        // jnz +12 (skip 12-byte SYS_exit(70))
-        code.extend_from_slice(&[0x75, 0x0C]);
-        emit_sys_exit(code, AOT_EXIT_CONTRACT_FAILED as u32);
-        // dec rax
-        code.extend_from_slice(&[0x48, 0xFF, 0xC8]);
-        emit_mov_rbp_rax(code, fuel_disp);
+        match fuel_home {
+            ScHome::Gpr(r) | ScHome::AliasGpr(r) => {
+                // test r, r; jnz +12; exit(70); dec r
+                code.extend_from_slice(&[
+                    sc_rex(true, r, 0, r),
+                    0x85,
+                    0xC0 | ((r & 7) << 3) | (r & 7),
+                    0x75,
+                    0x0C,
+                ]);
+                emit_sys_exit(code, AOT_EXIT_CONTRACT_FAILED as u32);
+                code.extend_from_slice(&[sc_rex(true, 0, 0, r), 0xFF, 0xC8 | (r & 7)]);
+            }
+            ScHome::Spill(s) => {
+                let disp = sc_spill_disp(spill_base_slot, s);
+                emit_load_gpr_rbp(code, REG_RAX, disp);
+                code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x75, 0x0C]);
+                emit_sys_exit(code, AOT_EXIT_CONTRACT_FAILED as u32);
+                code.extend_from_slice(&[0x48, 0xFF, 0xC8]);
+                emit_store_rbp_gpr(code, disp, REG_RAX);
+            }
+            _ => {}
+        }
     }
     // jmp rel32 -> body_start_offset
     code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
@@ -1105,77 +2017,34 @@ fn sc_region_off(slot: usize, field_off: i32) -> i32 {
     slot_i32.saturating_mul(32).saturating_add(field_off)
 }
 
-fn emit_movabs_reg(code: &mut Vec<u8>, reg: u8, val: u64) {
-    let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 };
-    code.push(rex);
-    code.push(0xB8 + (reg & 7));
-    code.extend_from_slice(&val.to_le_bytes());
-}
-
-fn emit_load_reg_r15(code: &mut Vec<u8>, reg: u8, disp: i32) {
-    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
-    let modrm = 0x87 | ((reg & 7) << 3);
-    code.extend_from_slice(&[rex, 0x8B, modrm]);
-    code.extend_from_slice(&disp.to_le_bytes());
-}
-
-fn emit_store_r15_reg(code: &mut Vec<u8>, reg: u8, disp: i32) {
-    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
-    let modrm = 0x87 | ((reg & 7) << 3);
-    code.extend_from_slice(&[rex, 0x89, modrm]);
-    code.extend_from_slice(&disp.to_le_bytes());
-}
-
-fn emit_cmp_reg_r15(code: &mut Vec<u8>, reg: u8, disp: i32) {
-    let rex = 0x49 | if reg >= 8 { 0x04 } else { 0 };
-    let modrm = 0x87 | ((reg & 7) << 3);
-    code.extend_from_slice(&[rex, 0x3B, modrm]);
-    code.extend_from_slice(&disp.to_le_bytes());
-}
-
 /// Emits `SYS_mmap(NULL, rsi, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`
 /// and fails closed with exit `74` if the kernel returns an error (`rax >= -4095`).
 fn emit_sc_sys_mmap_anon(code: &mut Vec<u8>) {
-    // xor edi, edi
-    code.extend_from_slice(&[0x31, 0xFF]);
-    // mov edx, 3 (PROT_READ | PROT_WRITE)
-    code.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]);
-    // mov r10d, 0x22 (MAP_PRIVATE | MAP_ANONYMOUS)
-    code.extend_from_slice(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]);
-    // mov r8, -1
-    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]);
-    // xor r9d, r9d
-    code.extend_from_slice(&[0x45, 0x31, 0xC9]);
-    // mov eax, 9 (SYS_mmap)
-    code.extend_from_slice(&[0xB8, 0x09, 0x00, 0x00, 0x00]);
-    // syscall
-    code.extend_from_slice(&[0x0F, 0x05]);
-    // cmp rax, -4095; jb +12 (skip exit(74))
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    code.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]); // mov edx, 3
+    code.extend_from_slice(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]); // mov r10d, 0x22
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8, -1
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0xB8, 0x09, 0x00, 0x00, 0x00]); // mov eax, 9
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
     code.extend_from_slice(&[0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF, 0x72, 0x0C]);
     emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
 }
 
 /// Emits `SYS_mremap(rdi, rsi, rdx, MREMAP_MAYMOVE=1, 0)` and fails closed with exit `74` on error.
 fn emit_sc_sys_mremap(code: &mut Vec<u8>) {
-    // mov r10d, 1 (MREMAP_MAYMOVE)
-    code.extend_from_slice(&[0x41, 0xBA, 0x01, 0x00, 0x00, 0x00]);
-    // xor r8d, r8d
-    code.extend_from_slice(&[0x45, 0x31, 0xC0]);
-    // mov eax, 25 (SYS_mremap)
-    code.extend_from_slice(&[0xB8, 0x19, 0x00, 0x00, 0x00]);
-    // syscall
-    code.extend_from_slice(&[0x0F, 0x05]);
-    // cmp rax, -4095; jb +12 (skip exit(74))
+    code.extend_from_slice(&[0x41, 0xBA, 0x01, 0x00, 0x00, 0x00]); // mov r10d, 1
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    code.extend_from_slice(&[0xB8, 0x19, 0x00, 0x00, 0x00]); // mov eax, 25
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
     code.extend_from_slice(&[0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF, 0x72, 0x0C]);
     emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
 }
 
 /// Emits `SYS_munmap(rdi, rsi)`.
 fn emit_sc_sys_munmap(code: &mut Vec<u8>) {
-    // mov eax, 11 (SYS_munmap)
-    code.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]);
-    // syscall
-    code.extend_from_slice(&[0x0F, 0x05]);
+    code.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]); // mov eax, 11
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
 }
 
 /// Allocates the 4096-byte program-global region table in `r15` (unless already mapped),
@@ -1186,12 +2055,9 @@ fn emit_sc_region_startup(
     r15_already_mapped: bool,
 ) -> Result<(), AotError> {
     if !r15_already_mapped {
-        // Allocate 1 page (4096 bytes) for 64 x 32-byte region descriptors `(base, len, cap, pad)` plus runtime counters.
-        // mov esi, 4096
         code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]);
         emit_sc_sys_mmap_anon(code);
-        // mov r15, rax
-        code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+        code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
     }
 
     for (slot, opt_decl) in regions.iter().enumerate() {
@@ -1204,53 +2070,40 @@ fn emit_sc_region_startup(
 
         if decl.role == RegionRole::Input {
             if decl.max_len == 0 {
-                // Verify stdin is immediately at EOF; any byte exceeds max_len == 0 -> exit(74).
                 let probe_pos = code.len();
-                // xor edi, edi
                 code.extend_from_slice(&[0x31, 0xFF]);
-                // lea rsi, [r15 + SC_SCRATCH_IO_OFF]
                 code.extend_from_slice(&[0x49, 0x8D, 0xB7]);
                 code.extend_from_slice(&SC_SCRATCH_IO_OFF.to_le_bytes());
-                // mov edx, 1
                 code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
-                // xor eax, eax (SYS_read)
-                code.extend_from_slice(&[0x31, 0xC0]);
-                // syscall
-                code.extend_from_slice(&[0x0F, 0x05]);
-                // cmp rax, -4 (EINTR); je probe_pos
+                code.extend_from_slice(&[0x31, 0xC0, 0x0F, 0x05]);
                 code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]);
                 code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                 let eintr_patch = code.len() - 4;
                 patch_rel32(code, eintr_patch, probe_pos)?;
-                // test rax, rax; jz +12 (EOF -> ok); else exit(74)
                 code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x74, 0x0C]);
                 emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
             } else {
                 let max_cap = align_up_4096(decl.max_len);
-                // r12 = cur_len, r13 = cur_cap, r14 = cur_base
                 code.extend_from_slice(&[0x45, 0x31, 0xE4]); // xor r12d, r12d
                 code.extend_from_slice(&[0x45, 0x31, 0xED]); // xor r13d, r13d
                 code.extend_from_slice(&[0x45, 0x31, 0xF6]); // xor r14d, r14d
 
                 let read_loop_pos = code.len();
                 emit_movabs_reg(code, 0, decl.max_len);
-                // cmp r12, rax; jb not_full
                 code.extend_from_slice(&[0x49, 0x39, 0xC4]);
                 code.extend_from_slice(&[0x0F, 0x82, 0x00, 0x00, 0x00, 0x00]);
                 let not_full_patch = code.len() - 4;
 
-                // cur_len == max_len: probe 1 byte for EOF.
                 let probe_eof_pos = code.len();
-                code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+                code.extend_from_slice(&[0x31, 0xFF]);
                 code.extend_from_slice(&[0x49, 0x8D, 0xB7]);
                 code.extend_from_slice(&SC_SCRATCH_IO_OFF.to_le_bytes());
-                code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
-                code.extend_from_slice(&[0x31, 0xC0, 0x0F, 0x05]); // xor eax, eax; syscall
-                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4
+                code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x31, 0xC0, 0x0F, 0x05]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]);
                 code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                 let probe_eintr_patch = code.len() - 4;
                 patch_rel32(code, probe_eintr_patch, probe_eof_pos)?;
-                // test rax, rax; jz input_done; else exit(74)
                 code.extend_from_slice(&[0x48, 0x85, 0xC0]);
                 code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                 let probe_done_patch = code.len() - 4;
@@ -1259,60 +2112,53 @@ fn emit_sc_region_startup(
                 let not_full_pos = code.len();
                 patch_rel32(code, not_full_patch, not_full_pos)?;
 
-                // cmp r12, r13; jb have_cap
                 code.extend_from_slice(&[0x4D, 0x39, 0xEC]);
                 code.extend_from_slice(&[0x0F, 0x82, 0x00, 0x00, 0x00, 0x00]);
                 let have_cap_patch_1 = code.len() - 4;
 
-                // Need capacity: if r13 == 0 map initial 4096B, else mremap doubling up to max_cap.
-                code.extend_from_slice(&[0x4D, 0x85, 0xED]); // test r13, r13
+                code.extend_from_slice(&[0x4D, 0x85, 0xED]);
                 code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
                 let grow_mremap_patch = code.len() - 4;
 
-                // Initial 4096-byte page
-                code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+                code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]);
                 emit_sc_sys_mmap_anon(code);
-                code.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax
-                code.extend_from_slice(&[0x41, 0xBD, 0x00, 0x10, 0x00, 0x00]); // mov r13d, 4096
+                code.extend_from_slice(&[0x49, 0x89, 0xC6]);
+                code.extend_from_slice(&[0x41, 0xBD, 0x00, 0x10, 0x00, 0x00]);
                 code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
                 let have_cap_patch_2 = code.len() - 4;
 
                 let grow_mremap_pos = code.len();
                 patch_rel32(code, grow_mremap_patch, grow_mremap_pos)?;
-                code.extend_from_slice(&[0x4C, 0x89, 0xEA]); // mov rdx, r13
-                code.extend_from_slice(&[0x48, 0xD1, 0xE2]); // shl rdx, 1
+                code.extend_from_slice(&[0x4C, 0x89, 0xEA]);
+                code.extend_from_slice(&[0x48, 0xD1, 0xE2]);
                 emit_movabs_reg(code, 0, max_cap);
-                // cmp rdx, rax; cmova rdx, rax
                 code.extend_from_slice(&[0x48, 0x39, 0xC2, 0x48, 0x0F, 0x47, 0xD0]);
-                code.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx
-                code.extend_from_slice(&[0x4C, 0x89, 0xF7]); // mov rdi, r14
-                code.extend_from_slice(&[0x4C, 0x89, 0xEE]); // mov rsi, r13
+                code.extend_from_slice(&[0x48, 0x89, 0xD3]);
+                code.extend_from_slice(&[0x4C, 0x89, 0xF7]);
+                code.extend_from_slice(&[0x4C, 0x89, 0xEE]);
                 emit_sc_sys_mremap(code);
-                code.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax
-                code.extend_from_slice(&[0x49, 0x89, 0xDD]); // mov r13, rbx
+                code.extend_from_slice(&[0x49, 0x89, 0xC6]);
+                code.extend_from_slice(&[0x49, 0x89, 0xDD]);
 
                 let have_cap_pos = code.len();
                 patch_rel32(code, have_cap_patch_1, have_cap_pos)?;
                 patch_rel32(code, have_cap_patch_2, have_cap_pos)?;
 
-                // avail = min(r13, max_len) - r12
-                emit_movabs_reg(code, 2, decl.max_len); // movabs rdx, max_len
-                code.extend_from_slice(&[0x49, 0x39, 0xD5, 0x49, 0x0F, 0x42, 0xD5]); // cmp r13, rdx; cmovb rdx, r13
-                code.extend_from_slice(&[0x4C, 0x29, 0xE2]); // sub rdx, r12
-                code.extend_from_slice(&[0x4C, 0x89, 0xF6]); // mov rsi, r14
-                code.extend_from_slice(&[0x4C, 0x01, 0xE6]); // add rsi, r12
-                code.extend_from_slice(&[0x31, 0xFF, 0x31, 0xC0, 0x0F, 0x05]); // xor edi, edi; xor eax, eax; syscall
-                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4
+                emit_movabs_reg(code, 2, decl.max_len);
+                code.extend_from_slice(&[0x49, 0x39, 0xD5, 0x49, 0x0F, 0x42, 0xD5]);
+                code.extend_from_slice(&[0x4C, 0x29, 0xE2]);
+                code.extend_from_slice(&[0x4C, 0x89, 0xF6]);
+                code.extend_from_slice(&[0x4C, 0x01, 0xE6]);
+                code.extend_from_slice(&[0x31, 0xFF, 0x31, 0xC0, 0x0F, 0x05]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]);
                 code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                 let read_eintr_patch = code.len() - 4;
                 patch_rel32(code, read_eintr_patch, read_loop_pos)?;
-                // test rax, rax; jns +12; exit(74)
                 code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x79, 0x0C]);
                 emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
-                // jz input_done
                 code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                 let read_done_patch = code.len() - 4;
-                code.extend_from_slice(&[0x49, 0x01, 0xC4]); // add r12, rax
+                code.extend_from_slice(&[0x49, 0x01, 0xC4]);
                 code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
                 let loop_back_patch = code.len() - 4;
                 patch_rel32(code, loop_back_patch, read_loop_pos)?;
@@ -1328,13 +2174,13 @@ fn emit_sc_region_startup(
         } else if decl.min_len > 0 {
             let elem_bytes = decl.elem.region_elem_bytes() as u64;
             let init_cap = align_up_4096(decl.min_len.saturating_mul(elem_bytes));
-            emit_movabs_reg(code, 6, init_cap); // rsi = init_cap
+            emit_movabs_reg(code, 6, init_cap);
             emit_sc_sys_mmap_anon(code);
-            emit_store_r15_reg(code, 0, off_base); // base_ptr = rax
+            emit_store_r15_reg(code, 0, off_base);
             emit_movabs_reg(code, 0, decl.min_len);
-            emit_store_r15_reg(code, 0, off_len); // len_elems = min_len
+            emit_store_r15_reg(code, 0, off_len);
             emit_movabs_reg(code, 0, init_cap);
-            emit_store_r15_reg(code, 0, off_cap); // cap_bytes = init_cap
+            emit_store_r15_reg(code, 0, off_cap);
         }
     }
     Ok(())
@@ -1344,48 +2190,43 @@ fn emit_sc_region_new(
     code: &mut Vec<u8>,
     slot: usize,
     decl: AotRegionDecl,
-    disp_b: i32,
+    len_home: ScHome,
+    spill_base_slot: u32,
 ) -> Result<(), AotError> {
     let off_base = sc_region_off(slot, 0);
     let off_len = sc_region_off(slot, 8);
     let off_cap = sc_region_off(slot, 16);
     let elem_bytes = decl.elem.region_elem_bytes();
 
-    // mov r12, [rbp + disp_b] (new_len)
-    code.extend_from_slice(&[0x4C, 0x8B, 0xA5]);
-    code.extend_from_slice(&disp_b.to_le_bytes());
+    emit_load_home_into_gpr(code, REG_RAX, len_home, spill_base_slot);
+    emit_sc_save_callee_to_r15(code);
+    emit_mov_gpr_gpr(code, REG_R12, REG_RAX);
 
     if decl.min_len > 0 {
         emit_movabs_reg(code, 0, decl.min_len);
-        // cmp r12, rax; jae +12; exit(74)
         code.extend_from_slice(&[0x49, 0x39, 0xC4, 0x73, 0x0C]);
         emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
     }
     emit_movabs_reg(code, 0, decl.max_len);
-    // cmp r12, rax; jbe +12; exit(74) (also rejects negative i64 since high bit is set!)
     code.extend_from_slice(&[0x49, 0x39, 0xC4, 0x76, 0x0C]);
     emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
 
-    // rbx = needed_bytes = r12 * elem_bytes
     code.extend_from_slice(&[0x4C, 0x89, 0xE3]); // mov rbx, r12
     if elem_bytes == 8 {
-        code.extend_from_slice(&[0x48, 0xC1, 0xE3, 0x03]); // shl rbx, 3
+        code.extend_from_slice(&[0x48, 0xC1, 0xE3, 0x03]);
     }
 
-    // rsi = old_cap
     emit_load_reg_r15(code, 6, off_cap);
-    // cmp rbx, rsi; jbe reuse_cap
     code.extend_from_slice(&[0x48, 0x39, 0xF3]);
     code.extend_from_slice(&[0x0F, 0x86, 0x00, 0x00, 0x00, 0x00]);
     let reuse_patch = code.len() - 4;
 
-    // needed_bytes > old_cap: unmap old mapping if any, then mmap fresh zeroed pages.
-    code.extend_from_slice(&[0x48, 0x85, 0xF6]); // test rsi, rsi
+    code.extend_from_slice(&[0x48, 0x85, 0xF6]);
     code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     let skip_unmap_patch = code.len() - 4;
-    emit_load_reg_r15(code, 7, off_base); // rdi = old_base
+    emit_load_reg_r15(code, 7, off_base);
     emit_sc_sys_munmap(code);
-    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x31, 0xC0]);
     emit_store_r15_reg(code, 0, off_base);
     emit_store_r15_reg(code, 0, off_len);
     emit_store_r15_reg(code, 0, off_cap);
@@ -1393,10 +2234,9 @@ fn emit_sc_region_new(
     let skip_unmap_pos = code.len();
     patch_rel32(code, skip_unmap_patch, skip_unmap_pos)?;
 
-    // new_cap = align_up_4096(rbx)
-    code.extend_from_slice(&[0x48, 0x81, 0xC3, 0xFF, 0x0F, 0x00, 0x00]); // add rbx, 4095
-    code.extend_from_slice(&[0x48, 0x81, 0xE3, 0x00, 0xF0, 0xFF, 0xFF]); // and rbx, -4096
-    code.extend_from_slice(&[0x48, 0x89, 0xDE]); // mov rsi, rbx
+    code.extend_from_slice(&[0x48, 0x81, 0xC3, 0xFF, 0x0F, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x81, 0xE3, 0x00, 0xF0, 0xFF, 0xFF]);
+    code.extend_from_slice(&[0x48, 0x89, 0xDE]);
     emit_sc_sys_mmap_anon(code);
     emit_store_r15_reg(code, 0, off_base);
     emit_store_r15_reg(code, 12, off_len);
@@ -1406,14 +2246,14 @@ fn emit_sc_region_new(
 
     let reuse_pos = code.len();
     patch_rel32(code, reuse_patch, reuse_pos)?;
-    // Zero [0..needed_bytes] and update len_elems.
-    emit_load_reg_r15(code, 7, off_base); // rdi = base_ptr
-    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
-    code.extend_from_slice(&[0x31, 0xC0, 0xFC, 0xF3, 0xAA]); // xor eax, eax; cld; rep stosb
+    emit_load_reg_r15(code, 7, off_base);
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]);
+    code.extend_from_slice(&[0x31, 0xC0, 0xFC, 0xF3, 0xAA]);
     emit_store_r15_reg(code, 12, off_len);
 
     let done_pos = code.len();
     patch_rel32(code, done_patch, done_pos)?;
+    emit_sc_restore_callee_from_r15(code);
     Ok(())
 }
 
@@ -1421,8 +2261,9 @@ fn emit_sc_region_grow(
     code: &mut Vec<u8>,
     slot: usize,
     decl: AotRegionDecl,
-    disp_b: i32,
-    disp: i32,
+    add_home: ScHome,
+    dst_home: ScHome,
+    spill_base_slot: u32,
 ) -> Result<(), AotError> {
     let off_base = sc_region_off(slot, 0);
     let off_len = sc_region_off(slot, 8);
@@ -1430,52 +2271,44 @@ fn emit_sc_region_grow(
     let elem_bytes = decl.elem.region_elem_bytes();
     let max_cap = align_up_4096(decl.max_len.saturating_mul(elem_bytes as u64));
 
-    // r12 = add_len
-    code.extend_from_slice(&[0x4C, 0x8B, 0xA5]);
-    code.extend_from_slice(&disp_b.to_le_bytes());
+    emit_load_home_into_gpr(code, REG_RAX, add_home, spill_base_slot);
+    emit_sc_save_callee_to_r15(code);
+    emit_mov_gpr_gpr(code, REG_R12, REG_RAX);
 
-    // Reject add_len < 0 or add_len > max_len via unsigned comparison.
     emit_movabs_reg(code, 0, decl.max_len);
-    code.extend_from_slice(&[0x49, 0x39, 0xC4, 0x76, 0x0C]); // cmp r12, rax; jbe +12
+    code.extend_from_slice(&[0x49, 0x39, 0xC4, 0x76, 0x0C]);
     emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
 
-    // r13 = old_len, r14 = old_len + add_len
     emit_load_reg_r15(code, 13, off_len);
     code.extend_from_slice(&[0x4D, 0x89, 0xEE]); // mov r14, r13
     code.extend_from_slice(&[0x4D, 0x01, 0xE6]); // add r14, r12
-                                                 // cmp r14, rax (max_len); jbe +12
     code.extend_from_slice(&[0x49, 0x39, 0xC6, 0x76, 0x0C]);
     emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
 
-    // If add_len == 0, return old_len directly.
-    code.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12
+    code.extend_from_slice(&[0x4D, 0x85, 0xE4]);
     code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     let done_patch = code.len() - 4;
 
-    // rbx = new_bytes = r14 * elem_bytes
-    code.extend_from_slice(&[0x4C, 0x89, 0xF3]); // mov rbx, r14
+    code.extend_from_slice(&[0x4C, 0x89, 0xF3]);
     if elem_bytes == 8 {
-        code.extend_from_slice(&[0x48, 0xC1, 0xE3, 0x03]); // shl rbx, 3
+        code.extend_from_slice(&[0x48, 0xC1, 0xE3, 0x03]);
     }
 
-    // rsi = old_cap; if new_bytes <= old_cap skip mmap/mremap
     emit_load_reg_r15(code, 6, off_cap);
-    code.extend_from_slice(&[0x48, 0x39, 0xF3]); // cmp rbx, rsi
+    code.extend_from_slice(&[0x48, 0x39, 0xF3]);
     code.extend_from_slice(&[0x0F, 0x86, 0x00, 0x00, 0x00, 0x00]);
     let zero_tail_patch_1 = code.len() - 4;
 
-    // rdx = align_up_4096(new_bytes)
-    code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
-    code.extend_from_slice(&[0x48, 0x81, 0xC2, 0xFF, 0x0F, 0x00, 0x00]); // add rdx, 4095
-    code.extend_from_slice(&[0x48, 0x81, 0xE2, 0x00, 0xF0, 0xFF, 0xFF]); // and rdx, -4096
+    code.extend_from_slice(&[0x48, 0x89, 0xDA]);
+    code.extend_from_slice(&[0x48, 0x81, 0xC2, 0xFF, 0x0F, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x81, 0xE2, 0x00, 0xF0, 0xFF, 0xFF]);
 
-    code.extend_from_slice(&[0x48, 0x85, 0xF6]); // test rsi, rsi
+    code.extend_from_slice(&[0x48, 0x85, 0xF6]);
     code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     let mremap_patch = code.len() - 4;
 
-    // old_cap == 0: SYS_mmap(rdx)
-    code.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx
-    code.extend_from_slice(&[0x48, 0x89, 0xD6]); // mov rsi, rdx
+    code.extend_from_slice(&[0x48, 0x89, 0xD3]);
+    code.extend_from_slice(&[0x48, 0x89, 0xD6]);
     emit_sc_sys_mmap_anon(code);
     emit_store_r15_reg(code, 0, off_base);
     emit_store_r15_reg(code, 3, off_cap);
@@ -1484,13 +2317,12 @@ fn emit_sc_region_grow(
 
     let mremap_pos = code.len();
     patch_rel32(code, mremap_patch, mremap_pos)?;
-    // new_cap = clamp(max(old_cap * 2, align_up_4096(new_bytes)), max_cap)
-    code.extend_from_slice(&[0x48, 0x89, 0xF0, 0x48, 0xD1, 0xE0]); // mov rax, rsi; shl rax, 1
-    code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x48, 0x0F, 0x47, 0xD0]); // cmp rax, rdx; cmova rdx, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xF0, 0x48, 0xD1, 0xE0]);
+    code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x48, 0x0F, 0x47, 0xD0]);
     emit_movabs_reg(code, 0, max_cap);
-    code.extend_from_slice(&[0x48, 0x39, 0xC2, 0x48, 0x0F, 0x47, 0xD0]); // cmp rdx, rax; cmova rdx, rax
-    code.extend_from_slice(&[0x48, 0x89, 0xD3]); // mov rbx, rdx
-    emit_load_reg_r15(code, 7, off_base); // rdi = old_base
+    code.extend_from_slice(&[0x48, 0x39, 0xC2, 0x48, 0x0F, 0x47, 0xD0]);
+    code.extend_from_slice(&[0x48, 0x89, 0xD3]);
+    emit_load_reg_r15(code, 7, off_base);
     emit_sc_sys_mremap(code);
     emit_store_r15_reg(code, 0, off_base);
     emit_store_r15_reg(code, 3, off_cap);
@@ -1499,24 +2331,24 @@ fn emit_sc_region_grow(
     patch_rel32(code, zero_tail_patch_1, zero_tail_pos)?;
     patch_rel32(code, zero_tail_patch_2, zero_tail_pos)?;
 
-    // Zero newly exposed bytes [old_len * elem_bytes .. new_len * elem_bytes]
-    emit_load_reg_r15(code, 7, off_base); // rdi = base_ptr
-    code.extend_from_slice(&[0x4C, 0x89, 0xE8]); // mov rax, r13 (old_len)
+    emit_load_reg_r15(code, 7, off_base);
+    code.extend_from_slice(&[0x4C, 0x89, 0xE8]);
     if elem_bytes == 8 {
-        code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]); // shl rax, 3
+        code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]);
     }
-    code.extend_from_slice(&[0x48, 0x01, 0xC7]); // add rdi, rax
-    code.extend_from_slice(&[0x4C, 0x89, 0xE1]); // mov rcx, r12 (add_len)
+    code.extend_from_slice(&[0x48, 0x01, 0xC7]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xE1]);
     if elem_bytes == 8 {
-        code.extend_from_slice(&[0x48, 0xC1, 0xE1, 0x03]); // shl rcx, 3
+        code.extend_from_slice(&[0x48, 0xC1, 0xE1, 0x03]);
     }
-    code.extend_from_slice(&[0x31, 0xC0, 0xFC, 0xF3, 0xAA]); // xor eax, eax; cld; rep stosb
+    code.extend_from_slice(&[0x31, 0xC0, 0xFC, 0xF3, 0xAA]);
     emit_store_r15_reg(code, 14, off_len);
 
     let done_pos = code.len();
     patch_rel32(code, done_patch, done_pos)?;
     code.extend_from_slice(&[0x4C, 0x89, 0xF0]); // mov rax, r14
-    emit_mov_rbp_rax(code, disp);
+    emit_sc_restore_callee_from_r15(code);
+    emit_store_gpr_into_home(code, dst_home, REG_RAX, spill_base_slot);
     Ok(())
 }
 
@@ -1525,20 +2357,22 @@ fn emit_sc_region_free(code: &mut Vec<u8>, slot: usize) -> Result<(), AotError> 
     let off_len = sc_region_off(slot, 8);
     let off_cap = sc_region_off(slot, 16);
 
-    emit_load_reg_r15(code, 6, off_cap); // rsi = cap_bytes
-    code.extend_from_slice(&[0x48, 0x85, 0xF6]); // test rsi, rsi
+    emit_sc_save_callee_to_r15(code);
+    emit_load_reg_r15(code, 6, off_cap);
+    code.extend_from_slice(&[0x48, 0x85, 0xF6]);
     code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     let skip_patch = code.len() - 4;
 
-    emit_load_reg_r15(code, 7, off_base); // rdi = base_ptr
+    emit_load_reg_r15(code, 7, off_base);
     emit_sc_sys_munmap(code);
 
     let skip_pos = code.len();
     patch_rel32(code, skip_patch, skip_pos)?;
-    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x31, 0xC0]);
     emit_store_r15_reg(code, 0, off_base);
     emit_store_r15_reg(code, 0, off_len);
     emit_store_r15_reg(code, 0, off_cap);
+    emit_sc_restore_callee_from_r15(code);
     Ok(())
 }
 
@@ -1546,31 +2380,29 @@ fn emit_sc_output_region_epilogue(code: &mut Vec<u8>, out_slot: usize) -> Result
     let off_base = sc_region_off(out_slot, 0);
     let off_len = sc_region_off(out_slot, 8);
 
-    emit_load_reg_r15(code, 12, off_base); // r12 = base_ptr
-    emit_load_reg_r15(code, 13, off_len); // r13 = len
-    code.extend_from_slice(&[0x45, 0x31, 0xF6]); // xor r14d, r14d (written = 0)
+    emit_load_reg_r15(code, 12, off_base);
+    emit_load_reg_r15(code, 13, off_len);
+    code.extend_from_slice(&[0x45, 0x31, 0xF6]);
 
     let write_loop_pos = code.len();
-    code.extend_from_slice(&[0x4D, 0x39, 0xEE]); // cmp r14, r13
-    code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]); // jae write_done
+    code.extend_from_slice(&[0x4D, 0x39, 0xEE]);
+    code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
     let done_patch = code.len() - 4;
 
-    // SYS_write(1, r12 + r14, r13 - r14)
-    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1
-    code.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
-    code.extend_from_slice(&[0x4C, 0x01, 0xF6]); // add rsi, r14
-    code.extend_from_slice(&[0x4C, 0x89, 0xEA]); // mov rdx, r13
-    code.extend_from_slice(&[0x4C, 0x29, 0xF2]); // sub rdx, r14
-    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
-    code.extend_from_slice(&[0x0F, 0x05]); // syscall
-    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4 (EINTR)
+    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xE6]);
+    code.extend_from_slice(&[0x4C, 0x01, 0xF6]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xEA]);
+    code.extend_from_slice(&[0x4C, 0x29, 0xF2]);
+    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]);
     code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     let eintr_patch = code.len() - 4;
     patch_rel32(code, eintr_patch, write_loop_pos)?;
-    // test rax, rax; jg +12; exit(74)
     code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x7F, 0x0C]);
     emit_sys_exit(code, AOT_EXIT_REGION_OOM as u32);
-    code.extend_from_slice(&[0x49, 0x01, 0xC6]); // add r14, rax
+    code.extend_from_slice(&[0x49, 0x01, 0xC6]);
     code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
     let back_patch = code.len() - 4;
     patch_rel32(code, back_patch, write_loop_pos)?;
@@ -1581,32 +2413,41 @@ fn emit_sc_output_region_epilogue(code: &mut Vec<u8>, out_slot: usize) -> Result
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "self-contained checked integer division/remainder emitter"
+)]
 fn emit_sc_int_div_rem(
     code: &mut Vec<u8>,
     is_u8: bool,
     is_rem: bool,
-    disp_a: i32,
-    disp_b: i32,
-    disp: i32,
+    home_a: ScHome,
+    home_b: ScHome,
+    dst_home: ScHome,
+    rdx_live: bool,
+    spill_base_slot: u32,
 ) -> Result<(), AotError> {
-    // mov rcx, [rbp + disp_b]
-    code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
-    code.extend_from_slice(&disp_b.to_le_bytes());
-    // test rcx, rcx; jnz +12; exit(72)
-    code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x75, 0x0C]);
+    emit_load_home_into_gpr(code, REG_R11, home_b, spill_base_slot);
+    // test r11, r11; jnz +12; exit(72)
+    code.extend_from_slice(&[0x4D, 0x85, 0xDB, 0x75, 0x0C]);
     emit_sys_exit(code, AOT_EXIT_INT_DIV_ERR as u32);
 
-    emit_mov_rax_rbp(code, disp_a);
+    emit_load_home_into_gpr(code, REG_RAX, home_a, spill_base_slot);
+    let save_rdx = rdx_live && dst_home.gpr_reg() != Some(REG_RDX);
+    if save_rdx {
+        emit_push_gpr(code, REG_RDX);
+    }
+
     if is_u8 {
-        // xor edx, edx; div rcx
-        code.extend_from_slice(&[0x31, 0xD2, 0x48, 0xF7, 0xF1]);
+        // xor edx, edx; div r11
+        code.extend_from_slice(&[0x31, 0xD2, 0x49, 0xF7, 0xF3]);
     } else {
-        // Guard against i64::MIN / -1 and i64::MIN % -1 (x86_64 #DE trap) -> exit(72).
-        emit_movabs_reg(code, 2, 0x8000_0000_0000_0000); // rdx = i64::MIN
+        // Guard against i64::MIN / -1 and i64::MIN % -1 -> exit(72).
+        emit_movabs_reg(code, REG_RDX, 0x8000_0000_0000_0000);
         code.extend_from_slice(&[0x48, 0x39, 0xD0]); // cmp rax, rdx
         code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
         let ok_patch_1 = code.len() - 4;
-        code.extend_from_slice(&[0x48, 0x83, 0xF9, 0xFF]); // cmp rcx, -1
+        code.extend_from_slice(&[0x49, 0x83, 0xFB, 0xFF]); // cmp r11, -1
         code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
         let ok_patch_2 = code.len() - 4;
         emit_sys_exit(code, AOT_EXIT_INT_DIV_ERR as u32);
@@ -1614,17 +2455,17 @@ fn emit_sc_int_div_rem(
         let ok_pos = code.len();
         patch_rel32(code, ok_patch_1, ok_pos)?;
         patch_rel32(code, ok_patch_2, ok_pos)?;
-        // cqo; idiv rcx
-        code.extend_from_slice(&[0x48, 0x99, 0x48, 0xF7, 0xF9]);
+        // cqo; idiv r11
+        code.extend_from_slice(&[0x48, 0x99, 0x49, 0xF7, 0xFB]);
     }
 
     if is_rem {
-        // mov [rbp + disp], rdx
-        code.extend_from_slice(&[0x48, 0x89, 0x95]);
-        code.extend_from_slice(&disp.to_le_bytes());
-    } else {
-        emit_mov_rbp_rax(code, disp);
+        emit_mov_gpr_gpr(code, REG_RAX, REG_RDX);
     }
+    if save_rdx {
+        emit_pop_gpr(code, REG_RDX);
+    }
+    emit_store_gpr_into_home(code, dst_home, REG_RAX, spill_base_slot);
     Ok(())
 }
 
@@ -1632,65 +2473,107 @@ fn emit_sc_cast(
     code: &mut Vec<u8>,
     src_elem: ElemType,
     dst_elem: ElemType,
-    disp_a: i32,
-    disp: i32,
+    home_a: ScHome,
+    dst_home: ScHome,
+    spill_base_slot: u32,
 ) -> Result<(), AotError> {
     match (src_elem, dst_elem) {
         (ElemType::I64, ElemType::U8) | (ElemType::U8, ElemType::I64) => {
-            emit_mov_rax_rbp(code, disp_a);
-            // movzx eax, al
-            code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
-            emit_mov_rbp_rax(code, disp);
+            let dst_r = dst_home.gpr_reg().unwrap_or(REG_RAX);
+            if let Some(src_r) = home_a.gpr_reg() {
+                emit_movzx_gpr32_gpr8(code, dst_r, src_r);
+            } else {
+                emit_load_home_into_gpr(code, dst_r, home_a, spill_base_slot);
+                emit_movzx_gpr32_gpr8(code, dst_r, dst_r);
+            }
+            emit_store_gpr_into_home(code, dst_home, dst_r, spill_base_slot);
         }
         (ElemType::BoolMask, ElemType::I64) => {
-            emit_mov_rax_rbp(code, disp_a);
-            // and eax, 1
-            code.extend_from_slice(&[0x83, 0xE0, 0x01]);
-            emit_mov_rbp_rax(code, disp);
+            let dst_r = dst_home.gpr_reg().unwrap_or(REG_RAX);
+            emit_load_home_into_gpr(code, dst_r, home_a, spill_base_slot);
+            emit_alu32_ri(code, 4, dst_r, 1);
+            emit_store_gpr_into_home(code, dst_home, dst_r, spill_base_slot);
         }
         (ElemType::I64, ElemType::F64) => {
-            // cvtsi2sd xmm0, qword ptr [rbp + disp_a]
-            code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0x85]);
-            code.extend_from_slice(&disp_a.to_le_bytes());
-            emit_store_xmm0_rbp(code, disp);
+            let dst_x = dst_home.xmm_reg().unwrap_or(0);
+            if let Some(src_r) = home_a.gpr_reg() {
+                // cvtsi2sd dst_x, src_r
+                code.extend_from_slice(&[
+                    0xF2,
+                    sc_rex(true, dst_x, 0, src_r),
+                    0x0F,
+                    0x2A,
+                    0xC0 | ((dst_x & 7) << 3) | (src_r & 7),
+                ]);
+            } else if let ScHome::Spill(s) = home_a {
+                let disp = sc_spill_disp(spill_base_slot, s);
+                code.extend_from_slice(&[0xF2, sc_rex(true, dst_x, 0, REG_RBP), 0x0F, 0x2A]);
+                emit_rbp_disp_modrm(code, dst_x, disp);
+            } else {
+                emit_load_home_into_gpr(code, REG_RAX, home_a, spill_base_slot);
+                code.extend_from_slice(&[
+                    0xF2,
+                    sc_rex(true, dst_x, 0, REG_RAX),
+                    0x0F,
+                    0x2A,
+                    0xC0 | ((dst_x & 7) << 3),
+                ]);
+            }
+            emit_store_xmm_into_home(code, dst_home, dst_x, spill_base_slot);
         }
         (ElemType::U8, ElemType::F64) => {
-            emit_mov_rax_rbp(code, disp_a);
-            // movzx eax, al; cvtsi2sd xmm0, rax
-            code.extend_from_slice(&[0x0F, 0xB6, 0xC0, 0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
-            emit_store_xmm0_rbp(code, disp);
+            let dst_x = dst_home.xmm_reg().unwrap_or(0);
+            if let Some(src_r) = home_a.gpr_reg() {
+                emit_movzx_gpr32_gpr8(code, REG_RAX, src_r);
+            } else {
+                emit_load_home_into_gpr(code, REG_RAX, home_a, spill_base_slot);
+                emit_movzx_gpr32_gpr8(code, REG_RAX, REG_RAX);
+            }
+            code.extend_from_slice(&[
+                0xF2,
+                sc_rex(true, dst_x, 0, REG_RAX),
+                0x0F,
+                0x2A,
+                0xC0 | ((dst_x & 7) << 3),
+            ]);
+            emit_store_xmm_into_home(code, dst_home, dst_x, spill_base_slot);
         }
         (ElemType::F64, ElemType::I64) => {
-            emit_load_xmm0_rbp(code, disp_a);
-            // Reject NaN, -Inf, < -2^63: ucomisd xmm0, -2^63 -> jae +12 (CF=0 only when ordered and >= -2^63)
+            emit_load_home_into_xmm(code, 0, home_a, spill_base_slot);
             emit_movabs_reg(code, 0, (-9_223_372_036_854_775_808.0_f64).to_bits());
-            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // movq xmm1, rax
-            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1, 0x73, 0x0C]); // ucomisd xmm0, xmm1; jae +12
+            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]);
+            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1, 0x73, 0x0C]);
             emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
-            // Reject +Inf, >= +2^63, NaN: ucomisd +2^63, xmm0 -> ja +12 (CF=0 && ZF=0 only when ordered and +2^63 > xmm0)
             emit_movabs_reg(code, 0, (9_223_372_036_854_775_808.0_f64).to_bits());
-            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // movq xmm1, rax
-            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC8, 0x77, 0x0C]); // ucomisd xmm1, xmm0; ja +12
+            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]);
+            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC8, 0x77, 0x0C]);
             emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
-            // cvttsd2si rax, xmm0
-            code.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]);
-            emit_mov_rbp_rax(code, disp);
+            let dst_r = dst_home.gpr_reg().unwrap_or(REG_RAX);
+            code.extend_from_slice(&[
+                0xF2,
+                sc_rex(true, dst_r, 0, 0),
+                0x0F,
+                0x2C,
+                0xC0 | ((dst_r & 7) << 3),
+            ]);
+            emit_store_gpr_into_home(code, dst_home, dst_r, spill_base_slot);
         }
         (ElemType::F64, ElemType::U8) => {
-            emit_load_xmm0_rbp(code, disp_a);
-            // roundsd xmm0, xmm0, 0x0B (truncate toward zero, suppress precision exception)
+            emit_load_home_into_xmm(code, 0, home_a, spill_base_slot);
             code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0B]);
-            // xorpd xmm1, xmm1 (0.0); ucomisd xmm0, xmm1; jae +12 (rejects NaN, -Inf, < 0.0)
             code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xC9, 0x66, 0x0F, 0x2E, 0xC1, 0x73, 0x0C]);
             emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
-            // ucomisd 255.0, xmm0; jae +12 (accepts <= 255.0 only when ordered)
             emit_movabs_reg(code, 0, 255.0_f64.to_bits());
-            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // movq xmm1, rax
-            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC8, 0x73, 0x0C]); // ucomisd xmm1, xmm0; jae +12
+            code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]);
+            code.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC8, 0x73, 0x0C]);
             emit_sys_exit(code, AOT_EXIT_CAST_ERR as u32);
-            // cvttsd2si eax, xmm0 (zero-extends into rax)
-            code.extend_from_slice(&[0xF2, 0x0F, 0x2C, 0xC0]);
-            emit_mov_rbp_rax(code, disp);
+            let dst_r = dst_home.gpr_reg().unwrap_or(REG_RAX);
+            code.push(0xF2);
+            if dst_r >= 8 {
+                code.push(sc_rex(false, dst_r, 0, 0));
+            }
+            code.extend_from_slice(&[0x0F, 0x2C, 0xC0 | ((dst_r & 7) << 3)]);
+            emit_store_gpr_into_home(code, dst_home, dst_r, spill_base_slot);
         }
         _ => {
             return Err(AotError::UnsupportedGraph(
@@ -1701,14 +2584,3260 @@ fn emit_sc_cast(
     Ok(())
 }
 
+/// Emits integer comparison (`I64` signed, `U8` unsigned, or `CmpLtU` unsigned) and returns the
+/// `jcc rel32` second opcode byte (`0x82..=0x8F`) for the TRUE condition.
+fn emit_sc_int_cmp(
+    code: &mut Vec<u8>,
+    opcode: Opcode,
+    elem: ElemType,
+    home_a: ScHome,
+    home_b: ScHome,
+    spill_base_slot: u32,
+) -> u8 {
+    let mut op = opcode;
+    let mut ha = home_a;
+    let mut hb = home_b;
+
+    // If `a` is a constant and `b` is a register, swap operands and flip Lt/Gt so we can use `cmp r, imm`.
+    let a_is_const = matches!(ha, ScHome::ConstI64(_) | ScHome::ConstU8(_));
+    let b_is_gpr = hb.gpr_reg().is_some();
+    if a_is_const && b_is_gpr {
+        std::mem::swap(&mut ha, &mut hb);
+        op = match op {
+            Opcode::CmpLt => Opcode::CmpGt,
+            Opcode::CmpGt => Opcode::CmpLt,
+            Opcode::CmpLtU => Opcode::CmpGt, // handled below via swapped_unsigned flag
+            other => other,
+        };
+        if opcode == Opcode::CmpLtU {
+            // Original `const <u reg` == `reg >u const` -> `ja` (`0x87`).
+            if let Some(reg_a) = ha.gpr_reg() {
+                match hb {
+                    ScHome::ConstI64(v) => emit_alu64_ri(code, 7, reg_a, v),
+                    ScHome::ConstU8(b) => emit_alu64_ri(code, 7, reg_a, i64::from(b)),
+                    _ => {}
+                }
+                return 0x87;
+            }
+        }
+    }
+
+    let reg_a = if let Some(r) = ha.gpr_reg() {
+        r
+    } else {
+        emit_load_home_into_gpr(code, REG_RAX, ha, spill_base_slot);
+        REG_RAX
+    };
+    match hb {
+        ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_alu64_rr(code, 0x3B, reg_a, r),
+        ScHome::Spill(s) => emit_alu64_rm_rbp(code, 0x3B, reg_a, sc_spill_disp(spill_base_slot, s)),
+        ScHome::ConstI64(v) => emit_alu64_ri(code, 7, reg_a, v),
+        ScHome::ConstU8(b) => emit_alu64_ri(code, 7, reg_a, i64::from(b)),
+        _ => {
+            emit_load_home_into_gpr(code, REG_R11, hb, spill_base_slot);
+            emit_alu64_rr(code, 0x3B, reg_a, REG_R11);
+        }
+    }
+
+    if opcode == Opcode::CmpLtU {
+        0x82 // jb
+    } else if elem == ElemType::U8 {
+        match op {
+            Opcode::CmpGt => 0x87, // ja
+            Opcode::CmpLt => 0x82, // jb
+            _ => 0x84,             // je
+        }
+    } else {
+        match op {
+            Opcode::CmpGt => 0x8F, // jg
+            Opcode::CmpLt => 0x8C, // jl
+            _ => 0x84,             // je
+        }
+    }
+}
+
+fn emit_sc_int_binary(
+    code: &mut Vec<u8>,
+    opcode: Opcode,
+    elem: ElemType,
+    home_a: ScHome,
+    home_b: ScHome,
+    dst_home: ScHome,
+    spill_base_slot: u32,
+) {
+    // Fast path: `BitAnd` with `0xFFFF_FFFF` lowers to a single 32-bit zero-extending move.
+    if opcode == Opcode::BitAnd && elem == ElemType::I64 {
+        let masked_src = match (home_a, home_b) {
+            (other, ScHome::ConstI64(0xFFFF_FFFF)) | (ScHome::ConstI64(0xFFFF_FFFF), other) => {
+                Some(other)
+            }
+            _ => None,
+        };
+        if let Some(src) = masked_src {
+            let dst_r = dst_home.gpr_reg().unwrap_or(REG_RAX);
+            match src {
+                ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_mov_gpr32_gpr32(code, dst_r, r),
+                ScHome::Spill(s) => {
+                    emit_load_gpr32_rbp(code, dst_r, sc_spill_disp(spill_base_slot, s));
+                }
+                ScHome::ConstI64(v) => {
+                    #[expect(clippy::cast_sign_loss, reason = "masking lower 32 bits")]
+                    emit_mov_gpr_imm64(code, dst_r, (v as u64) & 0xFFFF_FFFF);
+                }
+                ScHome::ConstU8(b) => emit_mov_gpr_imm64(code, dst_r, u64::from(b)),
+                _ => {
+                    emit_load_home_into_gpr(code, dst_r, src, spill_base_slot);
+                    emit_mov_gpr32_gpr32(code, dst_r, dst_r);
+                }
+            }
+            emit_store_gpr_into_home(code, dst_home, dst_r, spill_base_slot);
+            return;
+        }
+    }
+
+    let is_u8 = elem == ElemType::U8;
+    let commutative = matches!(
+        opcode,
+        Opcode::Add
+            | Opcode::Mul
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::MaskAnd
+            | Opcode::MaskOr
+    );
+    let dst_r = dst_home.gpr_reg().unwrap_or(REG_RAX);
+
+    // 3-operand `lea` fast paths for `I64` `Add`/`Sub` when `dst_r` differs from source.
+    if !is_u8 && dst_home.gpr_reg().is_some() {
+        if opcode == Opcode::Add {
+            match (home_a, home_b) {
+                (ScHome::Gpr(ra) | ScHome::AliasGpr(ra), ScHome::ConstI64(v))
+                | (ScHome::ConstI64(v), ScHome::Gpr(ra) | ScHome::AliasGpr(ra))
+                    if ra != dst_r =>
+                {
+                    if let Ok(d32) = i32::try_from(v) {
+                        emit_lea_reg_disp(code, dst_r, ra, d32);
+                        return;
+                    }
+                }
+                (
+                    ScHome::Gpr(ra) | ScHome::AliasGpr(ra),
+                    ScHome::Gpr(rb) | ScHome::AliasGpr(rb),
+                ) if ra != dst_r && rb != dst_r => {
+                    emit_lea_reg_plus_reg(code, dst_r, ra, rb);
+                    return;
+                }
+                _ => {}
+            }
+        } else if opcode == Opcode::Sub {
+            if let (ScHome::Gpr(ra) | ScHome::AliasGpr(ra), ScHome::ConstI64(v)) = (home_a, home_b)
+            {
+                if ra != dst_r {
+                    if let Some(neg) = v.checked_neg().and_then(|n| i32::try_from(n).ok()) {
+                        emit_lea_reg_disp(code, dst_r, ra, neg);
+                        return;
+                    }
+                }
+            }
+        } else if opcode == Opcode::Mul {
+            match (home_a, home_b) {
+                (ScHome::Gpr(ra) | ScHome::AliasGpr(ra), ScHome::ConstI64(v))
+                | (ScHome::ConstI64(v), ScHome::Gpr(ra) | ScHome::AliasGpr(ra)) => {
+                    if let Ok(i32v) = i32::try_from(v) {
+                        emit_imul64_rri(code, dst_r, ra, i32v);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Order operands so if `dst_r == b` on a commutative op we swap `(a, b)`;
+    // on non-commutative `Sub`, if `dst_r == b`, compute in `REG_RAX` first.
+    let (mut ha, mut hb) = (home_a, home_b);
+    let mut work_r = dst_r;
+    if commutative
+        && ((hb.gpr_reg() == Some(dst_r) && ha.gpr_reg() != Some(dst_r))
+            || (matches!(ha, ScHome::ConstI64(_) | ScHome::ConstU8(_))
+                && !matches!(hb, ScHome::ConstI64(_) | ScHome::ConstU8(_))))
+    {
+        std::mem::swap(&mut ha, &mut hb);
+    }
+    if !commutative && hb.gpr_reg() == Some(work_r) && ha.gpr_reg() != Some(work_r) {
+        work_r = REG_RAX;
+    }
+
+    emit_load_home_into_gpr(code, work_r, ha, spill_base_slot);
+
+    if is_u8 {
+        match opcode {
+            Opcode::Add | Opcode::Sub => {
+                let (op, ext) = if opcode == Opcode::Add {
+                    (0x03, 0)
+                } else {
+                    (0x2B, 5)
+                };
+                match hb {
+                    ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_alu32_rr(code, op, work_r, r),
+                    ScHome::Spill(s) => {
+                        emit_alu32_rm_rbp(code, op, work_r, sc_spill_disp(spill_base_slot, s));
+                    }
+                    ScHome::ConstU8(b) => emit_alu32_ri(code, ext, work_r, i32::from(b)),
+                    ScHome::ConstI64(v) => {
+                        emit_alu32_ri(code, ext, work_r, i32::try_from(v & 0xFF).unwrap_or(0));
+                    }
+                    _ => {
+                        emit_load_home_into_gpr(code, REG_R11, hb, spill_base_slot);
+                        emit_alu32_rr(code, op, work_r, REG_R11);
+                    }
+                }
+                // and work_r32, 0xFF
+                emit_alu32_ri(code, 4, work_r, 0xFF);
+            }
+            Opcode::Mul => {
+                match hb {
+                    ScHome::Gpr(r) | ScHome::AliasGpr(r) => {
+                        if work_r >= 8 || r >= 8 {
+                            code.push(sc_rex(false, work_r, 0, r));
+                        }
+                        code.extend_from_slice(&[0x0F, 0xAF, 0xC0 | ((work_r & 7) << 3) | (r & 7)]);
+                    }
+                    ScHome::Spill(s) => {
+                        if work_r >= 8 {
+                            code.push(sc_rex(false, work_r, 0, REG_RBP));
+                        }
+                        code.extend_from_slice(&[0x0F, 0xAF]);
+                        emit_rbp_disp_modrm(code, work_r, sc_spill_disp(spill_base_slot, s));
+                    }
+                    ScHome::ConstU8(b) => {
+                        if work_r >= 8 {
+                            code.push(sc_rex(false, work_r, 0, work_r));
+                        }
+                        code.extend_from_slice(&[0x69, 0xC0 | ((work_r & 7) << 3) | (work_r & 7)]);
+                        code.extend_from_slice(&i32::from(b).to_le_bytes());
+                    }
+                    _ => {
+                        emit_load_home_into_gpr(code, REG_R11, hb, spill_base_slot);
+                        code.extend_from_slice(&[
+                            sc_rex(false, work_r, 0, REG_R11),
+                            0x0F,
+                            0xAF,
+                            0xC0 | ((work_r & 7) << 3) | (REG_R11 & 7),
+                        ]);
+                    }
+                }
+                emit_alu32_ri(code, 4, work_r, 0xFF);
+            }
+            Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
+                let (op, ext) = match opcode {
+                    Opcode::BitAnd => (0x23, 4),
+                    Opcode::BitOr => (0x0B, 1),
+                    _ => (0x33, 6),
+                };
+                match hb {
+                    ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_alu64_rr(code, op, work_r, r),
+                    ScHome::Spill(s) => {
+                        emit_alu64_rm_rbp(code, op, work_r, sc_spill_disp(spill_base_slot, s));
+                    }
+                    ScHome::ConstU8(b) => emit_alu64_ri(code, ext, work_r, i64::from(b)),
+                    _ => {
+                        emit_load_home_into_gpr(code, REG_R11, hb, spill_base_slot);
+                        emit_alu64_rr(code, op, work_r, REG_R11);
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else if opcode == Opcode::Mul {
+        match hb {
+            ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_imul64_rr(code, work_r, r),
+            ScHome::Spill(s) => {
+                emit_imul64_rm_rbp(code, work_r, sc_spill_disp(spill_base_slot, s));
+            }
+            ScHome::ConstI64(v) => {
+                if let Ok(i32v) = i32::try_from(v) {
+                    emit_imul64_rri(code, work_r, work_r, i32v);
+                } else {
+                    emit_load_home_into_gpr(code, REG_R11, hb, spill_base_slot);
+                    emit_imul64_rr(code, work_r, REG_R11);
+                }
+            }
+            _ => {
+                emit_load_home_into_gpr(code, REG_R11, hb, spill_base_slot);
+                emit_imul64_rr(code, work_r, REG_R11);
+            }
+        }
+    } else {
+        let (op, ext) = match opcode {
+            Opcode::Add => (0x03, 0),
+            Opcode::Sub => (0x2B, 5),
+            Opcode::BitAnd | Opcode::MaskAnd => (0x23, 4),
+            Opcode::BitOr | Opcode::MaskOr => (0x0B, 1),
+            _ => (0x33, 6), // BitXor
+        };
+        match hb {
+            ScHome::Gpr(r) | ScHome::AliasGpr(r) => emit_alu64_rr(code, op, work_r, r),
+            ScHome::Spill(s) => {
+                emit_alu64_rm_rbp(code, op, work_r, sc_spill_disp(spill_base_slot, s));
+            }
+            ScHome::ConstI64(v) => emit_alu64_ri(code, ext, work_r, v),
+            ScHome::ConstU8(b) => emit_alu64_ri(code, ext, work_r, i64::from(b)),
+            _ => {
+                emit_load_home_into_gpr(code, REG_R11, hb, spill_base_slot);
+                emit_alu64_rr(code, op, work_r, REG_R11);
+            }
+        }
+    }
+
+    emit_store_gpr_into_home(code, dst_home, work_r, spill_base_slot);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "self-contained shift emitter handling immediate and dynamic shift counts"
+)]
+fn emit_sc_shift(
+    code: &mut Vec<u8>,
+    opcode: Opcode,
+    elem: ElemType,
+    home_a: ScHome,
+    home_b: ScHome,
+    dst_home: ScHome,
+    rcx_live: bool,
+    spill_base_slot: u32,
+) {
+    let is_u8 = elem == ElemType::U8;
+    // Constant shift amount fast path (zero `rcx` traffic).
+    let const_cnt = match home_b {
+        ScHome::ConstI64(v) => Some(u8::try_from(v & 63).unwrap_or(0)),
+        ScHome::ConstU8(b) => Some(b),
+        _ => None,
+    };
+    if let Some(cnt) = const_cnt {
+        let dst_r = dst_home.gpr_reg().unwrap_or(REG_RAX);
+        emit_load_home_into_gpr(code, dst_r, home_a, spill_base_slot);
+        if is_u8 {
+            let c = cnt & 7;
+            if opcode == Opcode::Shl {
+                emit_shift32_ri(code, 4, dst_r, c);
+                emit_alu32_ri(code, 4, dst_r, 0xFF);
+            } else {
+                emit_shift32_ri(code, 5, dst_r, c);
+            }
+        } else {
+            let ext = match opcode {
+                Opcode::Shl => 4,
+                Opcode::ShrU => 5,
+                _ => 7,
+            };
+            emit_shift64_ri(code, ext, dst_r, cnt);
+        }
+        emit_store_gpr_into_home(code, dst_home, dst_r, spill_base_slot);
+        return;
+    }
+
+    // Dynamic shift amount requires `cl` (`REG_RCX`).
+    emit_load_home_into_gpr(code, REG_RAX, home_a, spill_base_slot);
+    let save_rcx = rcx_live && dst_home.gpr_reg() != Some(REG_RCX);
+    if save_rcx {
+        emit_push_gpr(code, REG_RCX);
+    }
+    emit_load_home_into_gpr(code, REG_RCX, home_b, spill_base_slot);
+    if is_u8 {
+        code.extend_from_slice(&[0x83, 0xE1, 0x07]); // and ecx, 7
+        if opcode == Opcode::Shl {
+            code.extend_from_slice(&[0xD3, 0xE0, 0x25, 0xFF, 0x00, 0x00, 0x00]);
+        } else {
+            code.extend_from_slice(&[0xD3, 0xE8]);
+        }
+    } else {
+        let shift_modrm = match opcode {
+            Opcode::Shl => 0xE0,
+            Opcode::ShrU => 0xE8,
+            _ => 0xF8,
+        };
+        code.extend_from_slice(&[0x48, 0xD3, shift_modrm]);
+    }
+    if save_rcx {
+        emit_pop_gpr(code, REG_RCX);
+    }
+    emit_store_gpr_into_home(code, dst_home, REG_RAX, spill_base_slot);
+}
+
+struct ScUnitMeta {
+    local_elem: [ElemType; 64],
+    local_used: [bool; 64],
+    local_score: [u64; 64],
+    has_x87: bool,
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "single-pass O(N) structured x86_64 scalar control-flow and region emitter"
+    reason = "single-pass O(N) liveness, loop-extension, local-scoring, and branch-fusion pre-scan"
 )]
+fn sc_analyze_unit(
+    unit_nodes: &[crate::bytecode::NodeFrame],
+    regions: &[Option<AotRegionDecl>; MAX_REGION_SLOTS],
+    func_sigs: &[Option<FuncSigInfo>],
+    cur_sig: Option<FuncSigInfo>,
+    output_node_opt: Option<usize>,
+    scratch: &mut ScUnitScratch,
+) -> Result<ScUnitMeta, AotError> {
+    let len = unit_nodes.len();
+    scratch.reset_for_unit(len);
+
+    let mut local_elem: [ElemType; 64] = [ElemType::I64; 64];
+    let mut local_used: [bool; 64] = [false; 64];
+    let mut local_score: [u64; 64] = [0; 64];
+    let mut has_x87 = false;
+    let mut pending_call_args: Option<(usize, Option<usize>)> = None;
+
+    if let Some(sig) = cur_sig {
+        for i in 0..usize::from(sig.arity) {
+            if let (Some(&pe), Some(le), Some(lu), Some(ls)) = (
+                sig.params.get(i),
+                local_elem.get_mut(i),
+                local_used.get_mut(i),
+                local_score.get_mut(i),
+            ) {
+                *le = pe;
+                *lu = true;
+                *ls = 1;
+            }
+        }
+    }
+
+    let record_use = |scratch: &mut ScUnitScratch, v: usize, at_idx: usize| {
+        let at_u32 = u32::try_from(at_idx).unwrap_or(u32::MAX);
+        if let Some(info) = scratch.nodes.get_mut(v) {
+            info.inc_use();
+            if at_u32 > info.last_use {
+                info.last_use = at_u32;
+            }
+            if !scratch.loop_stack.is_empty() {
+                let d = usize::from(info.home_data);
+                if let Some(&hdr) = scratch.loop_stack.get(d) {
+                    info.outer_loop_header = hdr;
+                }
+            }
+        }
+    };
+
+    let mut barriers: u32 = 0;
+
+    for (idx, frame) in unit_nodes.iter().enumerate() {
+        if scratch.has_any_barrier {
+            if let Some(cp) = scratch.call_prefix.get_mut(idx) {
+                *cp = barriers;
+            }
+        }
+        let loop_depth_u16 = u16::try_from(scratch.loop_stack.len()).unwrap_or(u16::MAX);
+        if let Some(info) = scratch.nodes.get_mut(idx) {
+            info.home_data = loop_depth_u16;
+        }
+        let idx_u32 = u32::try_from(idx).unwrap_or(0);
+        let a_idx = frame.in_a as usize;
+        let b_idx = frame.in_b as usize;
+
+        match frame.opcode {
+            Opcode::Func => {
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::I64);
+                }
+                scratch.ctrl_scan.push((Opcode::Func, idx_u32));
+            }
+            Opcode::ConstF64 => {
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::F64);
+                }
+            }
+            Opcode::ConstI64 => {
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::I64);
+                }
+            }
+            Opcode::LocalGet => {
+                let slot = frame.in_a as usize;
+                let el_val = local_elem
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(frame.type_lane.elem);
+                let prev_head = scratch
+                    .local_get_head
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(el_val);
+                    info.aux = prev_head;
+                }
+                if let Some(h) = scratch.local_get_head.get_mut(slot) {
+                    *h = idx_u32;
+                }
+                let weight = 1u64 << u32::from(loop_depth_u16.min(20));
+                if let Some(lu) = local_used.get_mut(slot) {
+                    *lu = true;
+                }
+                if let Some(ls) = local_score.get_mut(slot) {
+                    *ls = ls.saturating_add(weight);
+                }
+            }
+            Opcode::LocalSet => {
+                let slot = frame.in_a as usize;
+                record_use(scratch, b_idx, idx);
+                let el_val = scratch
+                    .nodes
+                    .get(b_idx)
+                    .map_or(frame.type_lane.elem, |n| n.elem());
+                if let Some(le) = local_elem.get_mut(slot) {
+                    *le = el_val;
+                }
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(el_val);
+                }
+                let weight = 1u64 << u32::from(loop_depth_u16.min(20));
+                if let Some(lu) = local_used.get_mut(slot) {
+                    *lu = true;
+                }
+                if let Some(ls) = local_score.get_mut(slot) {
+                    *ls = ls.saturating_add(weight);
+                }
+                let mut cur = scratch
+                    .local_get_head
+                    .get_mut(slot)
+                    .map_or(u32::MAX, |h| std::mem::replace(h, u32::MAX));
+                while cur != u32::MAX {
+                    if let Some(info) = scratch.nodes.get_mut(cur as usize) {
+                        let next = info.aux;
+                        info.aux = idx_u32;
+                        cur = next;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Rem
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::Shl
+            | Opcode::ShrU
+            | Opcode::ShrS => {
+                record_use(scratch, a_idx, idx);
+                record_use(scratch, b_idx, idx);
+                let el_a = scratch
+                    .nodes
+                    .get(a_idx)
+                    .map_or(frame.type_lane.elem, |n| n.elem());
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(el_a);
+                }
+            }
+            Opcode::Min | Opcode::Max => {
+                record_use(scratch, a_idx, idx);
+                record_use(scratch, b_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::F64);
+                }
+            }
+            Opcode::Fma => {
+                let (in_b, in_c) = frame.decode_fma_bc();
+                record_use(scratch, a_idx, idx);
+                record_use(scratch, in_b as usize, idx);
+                record_use(scratch, in_c as usize, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::F64);
+                }
+            }
+            Opcode::Abs | Opcode::Sqrt | Opcode::Floor | Opcode::Ceil => {
+                record_use(scratch, a_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::F64);
+                }
+            }
+            Opcode::Ln | Opcode::Exp => {
+                has_x87 = true;
+                record_use(scratch, a_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::F64);
+                }
+            }
+            Opcode::MaskNot => {
+                record_use(scratch, a_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::BoolMask);
+                }
+            }
+            Opcode::Cast => {
+                record_use(scratch, a_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(frame.type_lane.elem);
+                }
+            }
+            Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq | Opcode::CmpLtU => {
+                record_use(scratch, a_idx, idx);
+                record_use(scratch, b_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::BoolMask);
+                }
+            }
+            Opcode::MaskAnd | Opcode::MaskOr => {
+                record_use(scratch, a_idx, idx);
+                record_use(scratch, b_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::BoolMask);
+                }
+            }
+            Opcode::SelectZero => {
+                record_use(scratch, a_idx, idx);
+                record_use(scratch, b_idx, idx);
+                let el_b = scratch
+                    .nodes
+                    .get(b_idx)
+                    .map_or(frame.type_lane.elem, |n| n.elem());
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(el_b);
+                }
+            }
+            Opcode::RingEnqueue | Opcode::AssertContract => {
+                record_use(scratch, a_idx, idx);
+                let el_a = scratch
+                    .nodes
+                    .get(a_idx)
+                    .map_or(frame.type_lane.elem, |n| n.elem());
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(el_a);
+                }
+            }
+            Opcode::Block => {
+                scratch.ctrl_scan.push((Opcode::Block, idx_u32));
+            }
+            Opcode::Loop => {
+                scratch.has_any_loop = true;
+                scratch.ctrl_scan.push((Opcode::Loop, idx_u32));
+                scratch.loop_stack.push(idx_u32);
+            }
+            Opcode::If | Opcode::BrIf => {
+                record_use(scratch, a_idx, idx);
+                // Detect adjacent integer `Cmp*` or `MaskNot(Cmp*)` fusion candidate.
+                let mut cand: Option<(usize, bool)> = None;
+                if a_idx.saturating_add(1) == idx {
+                    if let Some(cf) = unit_nodes.get(a_idx) {
+                        let is_int_cmp = matches!(
+                            cf.opcode,
+                            Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq | Opcode::CmpLtU
+                        ) && matches!(
+                            scratch.nodes.get(cf.in_a as usize).map(|n| n.elem()),
+                            Some(ElemType::I64 | ElemType::U8)
+                        );
+                        if is_int_cmp {
+                            cand = Some((a_idx, false));
+                        } else if cf.opcode == Opcode::MaskNot && a_idx > 0 {
+                            let c_idx = cf.in_a as usize;
+                            if c_idx.saturating_add(1) == a_idx {
+                                if let Some(cf2) = unit_nodes.get(c_idx) {
+                                    let is_int_cmp2 = matches!(
+                                        cf2.opcode,
+                                        Opcode::CmpGt
+                                            | Opcode::CmpLt
+                                            | Opcode::CmpEq
+                                            | Opcode::CmpLtU
+                                    ) && matches!(
+                                        scratch.nodes.get(cf2.in_a as usize).map(|n| n.elem()),
+                                        Some(ElemType::I64 | ElemType::U8)
+                                    );
+                                    if is_int_cmp2 {
+                                        cand = Some((c_idx, true));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((c_idx, inverted)) = cand {
+                    if let Some(info) = scratch.nodes.get_mut(idx) {
+                        info.elem_flags |= if inverted {
+                            FLAG_BRANCH_FUSE_INV
+                        } else {
+                            FLAG_BRANCH_FUSE_DIRECT
+                        };
+                    }
+                    if let Some(info) = scratch.nodes.get_mut(c_idx) {
+                        info.elem_flags |= if inverted {
+                            FLAG_FUSED_BY_NEXT2
+                        } else {
+                            FLAG_FUSED_BY_NEXT1
+                        };
+                    }
+                    if inverted {
+                        if let Some(info) = scratch.nodes.get_mut(c_idx.saturating_add(1)) {
+                            info.elem_flags |= FLAG_FUSED_BY_NEXT1;
+                        }
+                    }
+                    // Extend operand lifetimes of `c_idx` to `idx` so they remain live at the branch.
+                    if let Some(cf) = unit_nodes.get(c_idx) {
+                        let ca = cf.in_a as usize;
+                        let cb = cf.in_b as usize;
+                        if let Some(info) = scratch.nodes.get_mut(ca) {
+                            if idx_u32 > info.last_use {
+                                info.last_use = idx_u32;
+                            }
+                        }
+                        if let Some(info) = scratch.nodes.get_mut(cb) {
+                            if idx_u32 > info.last_use {
+                                info.last_use = idx_u32;
+                            }
+                        }
+                    }
+                }
+                if frame.opcode == Opcode::If {
+                    scratch.ctrl_scan.push((Opcode::If, idx_u32));
+                }
+            }
+            Opcode::Else => {
+                if frame.in_b != 0 {
+                    record_use(scratch, a_idx, idx);
+                }
+            }
+            Opcode::End => {
+                if frame.in_b != 0 {
+                    record_use(scratch, a_idx, idx);
+                    let el_res = scratch
+                        .nodes
+                        .get(a_idx)
+                        .map_or(frame.type_lane.elem, |n| n.elem());
+                    if let Some(info) = scratch.nodes.get_mut(idx) {
+                        info.set_elem(el_res);
+                    }
+                }
+                let Some((hdr_op, hdr_idx)) = scratch.ctrl_scan.pop() else {
+                    return Err(AotError::UnsupportedGraph("End without open block"));
+                };
+                if let Some(hdr_info) = scratch.nodes.get_mut(hdr_idx as usize) {
+                    hdr_info.aux = idx_u32;
+                    if matches!(hdr_op, Opcode::If | Opcode::Block) && frame.in_b != 0 {
+                        hdr_info.elem_flags |= FLAG_SCOPE_HAS_RESULT;
+                    }
+                }
+                if hdr_op == Opcode::Loop {
+                    let _ = scratch.loop_stack.pop();
+                }
+                // Update `def_loop_depth` (stored in `home_data` during analysis) of `End` to match its header.
+                let hdr_depth = scratch
+                    .nodes
+                    .get(hdr_idx as usize)
+                    .map_or(0, |n| n.home_data);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.home_data = hdr_depth;
+                }
+            }
+            Opcode::Br => {}
+            Opcode::Return => {
+                if frame.in_a != 0 {
+                    record_use(scratch, a_idx, idx);
+                }
+            }
+            Opcode::CallArg => {
+                let a2 = frame.in_a as usize;
+                let a3 = if frame.in_b == u32::from(CALL_ARG_SENTINEL) {
+                    None
+                } else {
+                    Some(frame.in_b as usize)
+                };
+                pending_call_args = Some((a2, a3));
+            }
+            Opcode::Call => {
+                let target_id = frame.in_a as usize;
+                let callee_sig = func_sigs
+                    .get(target_id)
+                    .copied()
+                    .flatten()
+                    .ok_or(AotError::UnsupportedGraph("unknown callee FuncSig"))?;
+                let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+                let sentinel = u32::from(CALL_ARG_SENTINEL);
+                if arg0_raw != sentinel {
+                    record_use(scratch, arg0_raw as usize, idx);
+                }
+                if arg1_raw != sentinel {
+                    record_use(scratch, arg1_raw as usize, idx);
+                }
+                if let Some((a2, a3_opt)) = pending_call_args.take() {
+                    record_use(scratch, a2, idx);
+                    if let Some(a3) = a3_opt {
+                        record_use(scratch, a3, idx);
+                    }
+                }
+                if let Some(ret_elem) = callee_sig.ret_elem {
+                    if let Some(info) = scratch.nodes.get_mut(idx) {
+                        info.set_elem(ret_elem);
+                    }
+                }
+                if !scratch.has_any_barrier {
+                    scratch.has_any_barrier = true;
+                    scratch.call_prefix.resize(len.saturating_add(1), 0);
+                }
+                barriers = barriers.saturating_add(1);
+            }
+            Opcode::RegionNew => {
+                record_use(scratch, b_idx, idx);
+                if !scratch.has_any_barrier {
+                    scratch.has_any_barrier = true;
+                    scratch.call_prefix.resize(len.saturating_add(1), 0);
+                }
+                barriers = barriers.saturating_add(1);
+            }
+            Opcode::RegionGrow => {
+                record_use(scratch, b_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::I64);
+                }
+                if !scratch.has_any_barrier {
+                    scratch.has_any_barrier = true;
+                    scratch.call_prefix.resize(len.saturating_add(1), 0);
+                }
+                barriers = barriers.saturating_add(1);
+            }
+            Opcode::RegionFree => {
+                if !scratch.has_any_barrier {
+                    scratch.has_any_barrier = true;
+                    scratch.call_prefix.resize(len.saturating_add(1), 0);
+                }
+                barriers = barriers.saturating_add(1);
+            }
+            Opcode::RegionLen => {
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::I64);
+                }
+            }
+            Opcode::RegionLoad => {
+                record_use(scratch, b_idx, idx);
+                let slot = frame.in_a as usize;
+                let decl = regions
+                    .get(slot)
+                    .and_then(|d| *d)
+                    .ok_or(AotError::UnsupportedGraph("undeclared RegionLoad slot"))?;
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(decl.elem);
+                }
+            }
+            Opcode::RegionStore => {
+                let (idx_node, val_node) = frame.decode_u16_pair();
+                record_use(scratch, idx_node as usize, idx);
+                record_use(scratch, val_node as usize, idx);
+            }
+            Opcode::ArenaInput
+            | Opcode::ArenaSlice
+            | Opcode::ArenaMutate
+            | Opcode::FilterCompact
+            | Opcode::ReduceSum
+            | Opcode::ReduceMax
+            | Opcode::ReduceMin
+            | Opcode::Gather => {
+                return Err(AotError::UnsupportedGraph(
+                    "columnar opcode in scalar structured control-flow AOT",
+                ));
+            }
+        }
+    }
+
+    if scratch.has_any_barrier {
+        if let Some(cp) = scratch.call_prefix.get_mut(len) {
+            *cp = barriers;
+        }
+    }
+    if let Some(out_idx) = output_node_opt {
+        record_use(scratch, out_idx, len);
+    }
+    // Any remaining unclosed `LocalGet` nodes have no later `LocalSet` (`aux = u32::MAX`).
+    for head in &mut scratch.local_get_head {
+        let mut cur = std::mem::replace(head, u32::MAX);
+        while cur != u32::MAX {
+            if let Some(info) = scratch.nodes.get_mut(cur as usize) {
+                let next = info.aux;
+                info.aux = u32::MAX;
+                cur = next;
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(ScUnitMeta {
+        local_elem,
+        local_used,
+        local_score,
+        has_x87,
+    })
+}
+
+struct ScRegAllocState {
+    free_gpr_mask: u16,
+    free_xmm_mask: u16,
+    gpr_expire: [u32; 16],
+    xmm_expire: [u32; 16],
+    min_gpr_expire: u32,
+    min_xmm_expire: u32,
+    min_spill_expire: u32,
+    used_callee_saved_mask: u16,
+    next_spill_slot: u32,
+}
+
+impl ScRegAllocState {
+    fn new(free_gpr_mask: u16, free_xmm_mask: u16, used_callee_saved_mask: u16) -> Self {
+        Self {
+            free_gpr_mask,
+            free_xmm_mask,
+            gpr_expire: [u32::MAX; 16],
+            xmm_expire: [u32::MAX; 16],
+            min_gpr_expire: u32::MAX,
+            min_xmm_expire: u32::MAX,
+            min_spill_expire: u32::MAX,
+            used_callee_saved_mask,
+            next_spill_slot: 0,
+        }
+    }
+
+    #[inline]
+    fn alloc_spill(&mut self, eff_last_use: usize, scratch: &mut ScUnitScratch) -> u32 {
+        let slot = if let Some(slot) = scratch.free_spill_slots.pop() {
+            slot
+        } else {
+            let slot = self.next_spill_slot;
+            self.next_spill_slot = self.next_spill_slot.saturating_add(1);
+            slot
+        };
+        let len_plus_1 = scratch.nodes.len().saturating_add(1);
+        if scratch.spill_expire_head.is_empty() {
+            scratch.spill_expire_head.resize(len_plus_1, u32::MAX);
+        }
+        let lu_bucket = eff_last_use.min(len_plus_1.saturating_sub(1));
+        let lu_u32 = u32::try_from(lu_bucket).unwrap_or(u32::MAX);
+        if lu_u32 < self.min_spill_expire {
+            self.min_spill_expire = lu_u32;
+        }
+        if let Some(eh) = scratch.spill_expire_head.get_mut(lu_bucket) {
+            let entry_idx = u32::try_from(scratch.spill_entries.len()).unwrap_or(u32::MAX);
+            scratch.spill_entries.push((slot, *eh));
+            *eh = entry_idx;
+        }
+        slot
+    }
+
+    #[inline]
+    fn alloc_home(
+        &mut self,
+        node_idx: usize,
+        elem: ElemType,
+        eff_last_use: usize,
+        spans_barrier: bool,
+        scratch: &mut ScUnitScratch,
+    ) -> ScHome {
+        let dist = eff_last_use.saturating_sub(node_idx);
+        let lu_u32 = u32::try_from(eff_last_use).unwrap_or(u32::MAX);
+
+        if elem == ElemType::F64 {
+            if spans_barrier {
+                ScHome::Spill(self.alloc_spill(eff_last_use, scratch))
+            } else {
+                let avail = self.free_xmm_mask;
+                if avail != 0 && !(avail.count_ones() <= 2 && dist > 256) {
+                    let reg = u8::try_from(avail.trailing_zeros()).unwrap_or(2);
+                    self.free_xmm_mask &= !(1u16 << reg);
+                    if let Some(ex) = self.xmm_expire.get_mut(usize::from(reg)) {
+                        *ex = lu_u32;
+                    }
+                    if lu_u32 < self.min_xmm_expire {
+                        self.min_xmm_expire = lu_u32;
+                    }
+                    ScHome::Xmm(reg)
+                } else {
+                    ScHome::Spill(self.alloc_spill(eff_last_use, scratch))
+                }
+            }
+        } else {
+            let candidate_mask = if spans_barrier {
+                self.free_gpr_mask & SC_CALLEE_SAVED_MASK
+            } else {
+                self.free_gpr_mask
+            };
+            let prefer_spill = candidate_mask.count_ones() <= 2 && dist > 256 && !spans_barrier;
+            let chosen = if candidate_mask != 0 && !prefer_spill {
+                let order: &[u8] = if spans_barrier {
+                    &SC_CALLEE_SAVED_GPRS
+                } else {
+                    &SC_ALL_GPRS_ORDER
+                };
+                order
+                    .iter()
+                    .copied()
+                    .find(|&r| (candidate_mask & (1u16 << r)) != 0)
+            } else {
+                None
+            };
+            if let Some(reg) = chosen {
+                self.free_gpr_mask &= !(1u16 << reg);
+                if (SC_CALLEE_SAVED_MASK & (1u16 << reg)) != 0 {
+                    self.used_callee_saved_mask |= 1u16 << reg;
+                }
+                if let Some(ex) = self.gpr_expire.get_mut(usize::from(reg)) {
+                    *ex = lu_u32;
+                }
+                if lu_u32 < self.min_gpr_expire {
+                    self.min_gpr_expire = lu_u32;
+                }
+                ScHome::Gpr(reg)
+            } else {
+                ScHome::Spill(self.alloc_spill(eff_last_use, scratch))
+            }
+        }
+    }
+
+    #[inline]
+    fn try_reuse_gpr(
+        &mut self,
+        src_idx: usize,
+        dst_idx: usize,
+        dst_eff_lu: usize,
+        dst_spans_barrier: bool,
+        scratch: &ScUnitScratch,
+    ) -> Option<ScHome> {
+        let info = scratch.nodes.get(src_idx)?;
+        if info.home_tag() != HOME_GPR {
+            return None;
+        }
+        let r = info.home_data as u8;
+        if scratch.eff_last_use(src_idx) != dst_idx {
+            return None;
+        }
+        if dst_spans_barrier && (SC_CALLEE_SAVED_MASK & (1u16 << r)) == 0 {
+            return None;
+        }
+        let lu_u32 = u32::try_from(dst_eff_lu).unwrap_or(u32::MAX);
+        if let Some(ex) = self.gpr_expire.get_mut(usize::from(r)) {
+            *ex = lu_u32;
+        }
+        if lu_u32 < self.min_gpr_expire {
+            self.min_gpr_expire = lu_u32;
+        }
+        Some(ScHome::Gpr(r))
+    }
+
+    #[inline]
+    fn try_reuse_xmm(
+        &mut self,
+        src_idx: usize,
+        dst_idx: usize,
+        dst_eff_lu: usize,
+        dst_spans_barrier: bool,
+        scratch: &ScUnitScratch,
+    ) -> Option<ScHome> {
+        if dst_spans_barrier {
+            return None;
+        }
+        let info = scratch.nodes.get(src_idx)?;
+        if info.home_tag() != HOME_XMM {
+            return None;
+        }
+        let x = info.home_data as u8;
+        if scratch.eff_last_use(src_idx) != dst_idx {
+            return None;
+        }
+        let lu_u32 = u32::try_from(dst_eff_lu).unwrap_or(u32::MAX);
+        if let Some(ex) = self.xmm_expire.get_mut(usize::from(x)) {
+            *ex = lu_u32;
+        }
+        if lu_u32 < self.min_xmm_expire {
+            self.min_xmm_expire = lu_u32;
+        }
+        Some(ScHome::Xmm(x))
+    }
+
+    #[inline]
+    fn expire_at(&mut self, idx: usize, scratch: &mut ScUnitScratch) {
+        let idx_u32 = u32::try_from(idx).unwrap_or(u32::MAX);
+        if idx_u32 >= self.min_gpr_expire {
+            let mut next_min = u32::MAX;
+            for &r in &SC_ALL_GPRS_ORDER {
+                if let Some(ex) = self.gpr_expire.get_mut(usize::from(r)) {
+                    let v = *ex;
+                    if v <= idx_u32 {
+                        *ex = u32::MAX;
+                        self.free_gpr_mask |= 1u16 << r;
+                    } else if v < next_min {
+                        next_min = v;
+                    }
+                }
+            }
+            self.min_gpr_expire = next_min;
+        }
+        if idx_u32 >= self.min_xmm_expire {
+            let mut next_min = u32::MAX;
+            for x in 2u8..16u8 {
+                if let Some(ex) = self.xmm_expire.get_mut(usize::from(x)) {
+                    let v = *ex;
+                    if v <= idx_u32 {
+                        *ex = u32::MAX;
+                        self.free_xmm_mask |= 1u16 << x;
+                    } else if v < next_min {
+                        next_min = v;
+                    }
+                }
+            }
+            self.min_xmm_expire = next_min;
+        }
+        if idx_u32 >= self.min_spill_expire {
+            let mut cur = scratch
+                .spill_expire_head
+                .get_mut(idx)
+                .map_or(u32::MAX, |h| std::mem::replace(h, u32::MAX));
+            while cur != u32::MAX {
+                if let Some(&(slot, next)) = scratch.spill_entries.get(cur as usize) {
+                    scratch.free_spill_slots.push(slot);
+                    cur = next;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Detects a pure early-return base-case `If` guard at the entry of a `Func`
+/// (`Func`, prelude of `LocalGet(0..arity)`/`ConstI64`/`Cmp*`/`MaskNot`, `If`,
+/// body of `LocalGet(0..arity)`/`ConstI64` ending in `Return`, `End`) where no
+/// node in `1..=guard_end` is referenced after `guard_end`.
+fn detect_early_return_guard(
+    unit_nodes: &[crate::bytecode::NodeFrame],
+    scratch: &ScUnitScratch,
+    sig: FuncSigInfo,
+) -> Option<(usize, usize)> {
+    let len = unit_nodes.len();
+    if len <= 3 {
+        return None;
+    }
+    let arity = usize::from(sig.arity);
+    let mut if_idx = None;
+    for i in 1..len.min(7) {
+        let f = unit_nodes.get(i)?;
+        match f.opcode {
+            Opcode::LocalGet => {
+                if (f.in_a as usize) >= arity || scratch.node_elem(i) == ElemType::F64 {
+                    return None;
+                }
+            }
+            Opcode::ConstI64 | Opcode::MaskNot => {}
+            Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq | Opcode::CmpLtU => {
+                if scratch.node_elem(f.in_a as usize) == ElemType::F64 {
+                    return None;
+                }
+            }
+            Opcode::If => {
+                if_idx = Some(i);
+                break;
+            }
+            _ => return None,
+        }
+    }
+    let if_idx = if_idx?;
+    let if_info = scratch.nodes.get(if_idx)?;
+    if (if_info.elem_flags & FLAG_SCOPE_HAS_RESULT) != 0 {
+        return None;
+    }
+    let guard_end = if_info.aux as usize;
+    if guard_end <= if_idx + 1 || guard_end >= len - 1 || guard_end > 14 {
+        return None;
+    }
+    let (cmp_idx, _inv) = scratch.is_branch_fused(if_idx)?;
+    let cmp_f = unit_nodes.get(cmp_idx)?;
+    for op_idx in [cmp_f.in_a as usize, cmp_f.in_b as usize] {
+        let op_f = unit_nodes.get(op_idx)?;
+        match op_f.opcode {
+            Opcode::ConstI64 => {}
+            Opcode::LocalGet if (op_f.in_a as usize) < arity => {}
+            _ => return None,
+        }
+    }
+    let ret_idx = guard_end - 1;
+    let ret_f = unit_nodes.get(ret_idx)?;
+    if ret_f.opcode != Opcode::Return {
+        return None;
+    }
+    for k in (if_idx + 1)..ret_idx {
+        let kf = unit_nodes.get(k)?;
+        match kf.opcode {
+            Opcode::ConstI64 => {}
+            Opcode::LocalGet
+                if (kf.in_a as usize) < arity && scratch.node_elem(k) != ElemType::F64 => {}
+            _ => return None,
+        }
+    }
+    if ret_f.in_a != 0 {
+        let rv = ret_f.in_a as usize;
+        if rv == 0 || rv >= ret_idx {
+            return None;
+        }
+        let rvf = unit_nodes.get(rv)?;
+        match rvf.opcode {
+            Opcode::ConstI64 => {}
+            Opcode::LocalGet if (rvf.in_a as usize) < arity => {}
+            _ => return None,
+        }
+    }
+    for k in 1..=guard_end {
+        if scratch.eff_last_use(k) > guard_end {
+            return None;
+        }
+    }
+    Some((if_idx, guard_end))
+}
+
+fn early_guard_arg_home(unit_nodes: &[crate::bytecode::NodeFrame], idx: usize) -> Option<ScHome> {
+    let f = unit_nodes.get(idx)?;
+    match f.opcode {
+        Opcode::ConstI64 => Some(ScHome::ConstI64(f.decode_const_i64())),
+        Opcode::LocalGet => SC_ARG_GPRS
+            .get(f.in_a as usize)
+            .copied()
+            .map(ScHome::AliasGpr),
+        _ => None,
+    }
+}
+
+/// Emits pure-register macro-fused `sub reg, imm32(delta); js target; test reg32, 0x0020_0000; jnz target`.
+/// When `short_patches` is `Some`, emits 2-byte `js rel8` / `jnz rel8` and pushes the patch offsets.
+fn emit_sc_budget_sub_check(
+    code: &mut Vec<u8>,
+    reg: u8,
+    delta: u32,
+    stack_overflow_stub: usize,
+    mut short_patches: Option<&mut Vec<usize>>,
+) -> Result<(), AotError> {
+    if reg == REG_RAX {
+        // sub rax, imm32 (6B)
+        code.extend_from_slice(&[0x48, 0x2D]);
+        code.extend_from_slice(&delta.to_le_bytes());
+    } else {
+        // sub reg, imm32 (7B)
+        code.extend_from_slice(&[sc_rex(true, 0, 0, reg), 0x81, 0xE8 | (reg & 7)]);
+        code.extend_from_slice(&delta.to_le_bytes());
+    }
+    if let Some(patches) = short_patches.as_deref_mut() {
+        code.extend_from_slice(&[0x78, 0x00]); // js rel8
+        patches.push(code.len() - 1);
+    } else {
+        // js rel32 (macro-fused with `sub`)
+        code.extend_from_slice(&[0x0F, 0x88, 0x00, 0x00, 0x00, 0x00]);
+        let p1 = code.len() - 4;
+        patch_rel32(code, p1, stack_overflow_stub)?;
+    }
+    if reg == REG_RAX {
+        // test eax, 0x0020_0000 (5B)
+        code.extend_from_slice(&[0xA9, 0x00, 0x00, 0x20, 0x00]);
+    } else {
+        // test reg32, 0x0020_0000 (7B)
+        code.extend_from_slice(&[
+            sc_rex(false, 0, 0, reg),
+            0xF7,
+            0xC0 | (reg & 7),
+            0x00,
+            0x00,
+            0x20,
+            0x00,
+        ]);
+    }
+    if let Some(patches) = short_patches {
+        code.extend_from_slice(&[0x75, 0x00]); // jnz rel8
+        patches.push(code.len() - 1);
+        Ok(())
+    } else {
+        // jnz rel32 (macro-fused with `test`)
+        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+        let p2 = code.len() - 4;
+        patch_rel32(code, p2, stack_overflow_stub)
+    }
+}
+
+/// Returns true when an integer-class node that would otherwise spill to the stack
+/// can stay in scratch `REG_RAX` because its only use is the immediately following
+/// commutative integer binary op whose other operand is already in a non-`rax` GPR.
+#[inline]
+fn can_use_transient_rax(
+    unit_nodes: &[crate::bytecode::NodeFrame],
+    scratch: &ScUnitScratch,
+    idx: usize,
+    elem: ElemType,
+    uc: u8,
+    eff_lu: usize,
+    spans_bar: bool,
+) -> bool {
+    if elem == ElemType::F64 || spans_bar || uc != 1 || eff_lu != idx.saturating_add(1) {
+        return false;
+    }
+    let next_idx = idx.saturating_add(1);
+    let Some(next_f) = unit_nodes.get(next_idx) else {
+        return false;
+    };
+    if !matches!(
+        next_f.opcode,
+        Opcode::Add
+            | Opcode::Mul
+            | Opcode::BitAnd
+            | Opcode::BitOr
+            | Opcode::BitXor
+            | Opcode::MaskAnd
+            | Opcode::MaskOr
+    ) || scratch.node_elem(next_idx) == ElemType::F64
+    {
+        return false;
+    }
+    let other_idx = if next_f.in_a as usize == idx {
+        next_f.in_b as usize
+    } else if next_f.in_b as usize == idx {
+        next_f.in_a as usize
+    } else {
+        return false;
+    };
+    if other_idx == idx {
+        return false;
+    }
+    scratch
+        .get_home(other_idx, unit_nodes)
+        .gpr_reg()
+        .is_some_and(|r| r != REG_RAX)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "single-pass O(N) structured x86_64 register-allocating unit emitter"
+)]
+fn sc_emit_unit(
+    code: &mut Vec<u8>,
+    program: &RulProgram,
+    unit_nodes: &[crate::bytecode::NodeFrame],
+    regions: &[Option<AotRegionDecl>; MAX_REGION_SLOTS],
+    func_sigs: &[Option<FuncSigInfo>],
+    cur_sig: Option<FuncSigInfo>,
+    output_region_slot: Option<usize>,
+    stack_overflow_stub: Option<usize>,
+    call_patches: &mut Vec<(usize, usize)>,
+    scratch: &mut ScUnitScratch,
+) -> Result<(), AotError> {
+    let func_mode = cur_sig.is_some();
+    let len = unit_nodes.len();
+    let output_node_opt = if func_mode {
+        None
+    } else {
+        Some(program.output_node as usize)
+    };
+
+    let ScUnitMeta {
+        local_elem,
+        local_used,
+        local_score,
+        has_x87,
+    } = sc_analyze_unit(
+        unit_nodes,
+        regions,
+        func_sigs,
+        cur_sig,
+        output_node_opt,
+        scratch,
+    )?;
+
+    let has_any_barrier = scratch.has_any_barrier;
+
+    // Assign homes to hot locals (pinned registers first, ties broken by slot number).
+    let mut gpr_candidates: Vec<(u64, usize)> = Vec::new();
+    let mut xmm_candidates: Vec<(u64, usize)> = Vec::new();
+    for slot in 0..64usize {
+        if !local_used.get(slot).copied().unwrap_or(false) {
+            continue;
+        }
+        let score = local_score.get(slot).copied().unwrap_or(0);
+        if local_elem.get(slot).copied() == Some(ElemType::F64) {
+            xmm_candidates.push((score, slot));
+        } else {
+            gpr_candidates.push((score, slot));
+        }
+    }
+    gpr_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    xmm_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut local_home: [ScLocalHome; 64] = [ScLocalHome::Unused; 64];
+    let mut free_gpr_mask = SC_ALLOC_GPR_MASK;
+    let mut free_xmm_mask = SC_ALLOC_XMM_MASK;
+    let mut used_callee_saved_mask: u16 = 0;
+
+    let max_pinned_gpr = if has_any_barrier { 5usize } else { 7usize };
+    let winner_count = gpr_candidates.len().min(max_pinned_gpr);
+    let gpr_winners = gpr_candidates.get(..winner_count).unwrap_or(&[]);
+
+    // In leaf functions, if an incoming param `slot < arity` earned a top-scored pinned spot,
+    // assign it to its incoming arg register `SC_ARG_GPRS[slot]` to eliminate a prologue move.
+    if !has_any_barrier {
+        if let Some(sig) = cur_sig {
+            let arity = usize::from(sig.arity);
+            for &(_score, slot) in gpr_winners {
+                if slot < arity {
+                    if let Some(&arg_reg) = SC_ARG_GPRS.get(slot) {
+                        if (free_gpr_mask & (1u16 << arg_reg)) != 0 {
+                            free_gpr_mask &= !(1u16 << arg_reg);
+                            if let Some(lh) = local_home.get_mut(slot) {
+                                *lh = ScLocalHome::Gpr(arg_reg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let gpr_pool: &[u8] = if has_any_barrier {
+        &SC_CALLEE_SAVED_GPRS
+    } else {
+        &SC_ALL_GPRS_ORDER
+    };
+    for &(_score, slot) in gpr_winners {
+        if local_home.get(slot).copied() != Some(ScLocalHome::Unused) {
+            continue;
+        }
+        if let Some(reg) = gpr_pool
+            .iter()
+            .copied()
+            .find(|&r| (free_gpr_mask & (1u16 << r)) != 0)
+        {
+            free_gpr_mask &= !(1u16 << reg);
+            if (SC_CALLEE_SAVED_MASK & (1u16 << reg)) != 0 {
+                used_callee_saved_mask |= 1u16 << reg;
+            }
+            if let Some(lh) = local_home.get_mut(slot) {
+                *lh = ScLocalHome::Gpr(reg);
+            }
+        }
+    }
+
+    if !has_any_barrier {
+        for (pinned_xmm_count, &(_score, slot)) in xmm_candidates.iter().enumerate() {
+            if pinned_xmm_count >= 10 || free_xmm_mask == 0 {
+                break;
+            }
+            let xreg = u8::try_from(free_xmm_mask.trailing_zeros()).unwrap_or(2);
+            free_xmm_mask &= !(1u16 << xreg);
+            if let Some(lh) = local_home.get_mut(slot) {
+                *lh = ScLocalHome::Xmm(xreg);
+            }
+        }
+    }
+
+    // Assign frame slots to all remaining used locals, optional x87 scratch, and non-func stdout staging.
+    let mut fixed_slots: u32 = 0;
+    for slot in 0..64usize {
+        if local_used.get(slot).copied().unwrap_or(false)
+            && local_home.get(slot).copied() == Some(ScLocalHome::Unused)
+        {
+            let disp =
+                (-8i32).saturating_mul(i32::try_from(fixed_slots.saturating_add(1)).unwrap_or(1));
+            if let Some(lh) = local_home.get_mut(slot) {
+                *lh = ScLocalHome::Slot(disp);
+            }
+            fixed_slots = fixed_slots.saturating_add(1);
+        }
+    }
+    let x87_scratch_disp = if has_x87 {
+        let disp =
+            (-8i32).saturating_mul(i32::try_from(fixed_slots.saturating_add(1)).unwrap_or(1));
+        fixed_slots = fixed_slots.saturating_add(1);
+        disp
+    } else {
+        0
+    };
+    let stdout_disp = if !func_mode && output_region_slot.is_none() {
+        let disp =
+            (-8i32).saturating_mul(i32::try_from(fixed_slots.saturating_add(1)).unwrap_or(1));
+        fixed_slots = fixed_slots.saturating_add(1);
+        disp
+    } else {
+        0
+    };
+    let spill_base_slot = fixed_slots;
+
+    let mut alloc = ScRegAllocState::new(free_gpr_mask, free_xmm_mask, used_callee_saved_mask);
+
+    let mut top_frame_sub_patch: Option<usize> = None;
+    let fn_frame_units = func_frame_units(len);
+    let budget_delta_u32: u32 = (1u32 << 22) | fn_frame_units;
+    let early_guard = cur_sig.and_then(|sig| detect_early_return_guard(unit_nodes, scratch, sig));
+    let start_idx: usize = early_guard.map_or(0, |(_if_idx, guard_end)| guard_end + 1);
+
+    if !func_mode {
+        // Top-level structured program prologue.
+        code.extend_from_slice(&[0x48, 0x83, 0xE4, 0xE0]); // and rsp, -32
+        code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+        code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x00, 0x00, 0x00]); // sub rsp, imm32
+        top_frame_sub_patch = Some(code.len() - 4);
+        if regions.iter().any(Option::is_some) {
+            emit_sc_region_startup(code, regions, false)?;
+        }
+    }
+
+    let mut fn_body_buf = std::mem::take(&mut scratch.fn_body);
+    fn_body_buf.clear();
+    let body_call_patch_start = call_patches.len();
+    let mut pending_call_args: Option<(usize, Option<usize>)> = None;
+
+    {
+        let out: &mut Vec<u8> = if func_mode { &mut fn_body_buf } else { code };
+
+        // Helper: check if `cur_idx` can write directly into the pinned register of an immediately following `LocalSet`.
+        let direct_local_dst = |unit_nodes: &[crate::bytecode::NodeFrame],
+                                scratch: &ScUnitScratch,
+                                local_home: &[ScLocalHome; 64],
+                                cur_idx: usize|
+         -> Option<ScHome> {
+            if scratch.nodes.get(cur_idx).map_or(0, |n| n.use_count()) != 1 {
+                return None;
+            }
+            let next_idx = cur_idx.saturating_add(1);
+            let next_f = unit_nodes.get(next_idx)?;
+            if next_f.opcode != Opcode::LocalSet || next_f.in_b as usize != cur_idx {
+                return None;
+            }
+            if scratch.nodes.get(next_idx).map_or(0, |n| n.use_count()) != 0 {
+                return None;
+            }
+            match local_home.get(next_f.in_a as usize).copied()? {
+                ScLocalHome::Gpr(r) => Some(ScHome::AliasGpr(r)),
+                ScLocalHome::Xmm(x) => Some(ScHome::AliasXmm(x)),
+                ScLocalHome::Slot(_) | ScLocalHome::Unused => None,
+            }
+        };
+
+        // Helper: check if an integer node `cur_idx` is immediately returned by `Return` or `Func End`.
+        let is_immediate_func_return = |cur_idx: usize| -> bool {
+            if !func_mode {
+                return false;
+            }
+            let next_idx = cur_idx.saturating_add(1);
+            let Some(next_f) = unit_nodes.get(next_idx) else {
+                return false;
+            };
+            (next_f.opcode == Opcode::Return && next_f.in_a as usize == cur_idx)
+                || (next_idx.saturating_add(1) == len
+                    && next_f.opcode == Opcode::End
+                    && next_f.in_b != 0
+                    && next_f.in_a as usize == cur_idx)
+        };
+
+        for (idx, frame) in unit_nodes.iter().enumerate().skip(start_idx) {
+            let a_idx = frame.in_a as usize;
+            let b_idx = frame.in_b as usize;
+            let home_a = scratch.get_home(a_idx, unit_nodes);
+            let home_b = scratch.get_home(b_idx, unit_nodes);
+            let uc = scratch.nodes.get(idx).map_or(0, |n| n.use_count());
+            let eff_lu = scratch.eff_last_use(idx);
+            let spans_bar = scratch.spans_barrier(idx, eff_lu);
+
+            match frame.opcode {
+                Opcode::Func => {}
+                Opcode::ConstF64 => {
+                    scratch.set_home(idx, ScHome::ConstF64(0))?;
+                }
+                Opcode::ConstI64 => {
+                    scratch.set_home(idx, ScHome::ConstI64(0))?;
+                }
+                Opcode::LocalGet => {
+                    if uc > 0 {
+                        let slot = frame.in_a as usize;
+                        let nls = scratch.nodes.get(idx).map_or(u32::MAX, |n| n.aux) as usize;
+                        let can_alias = eff_lu < nls;
+                        let lh = local_home.get(slot).copied().unwrap_or(ScLocalHome::Unused);
+                        let dst = match lh {
+                            ScLocalHome::Gpr(r) if can_alias => ScHome::AliasGpr(r),
+                            ScLocalHome::Xmm(x) if can_alias => ScHome::AliasXmm(x),
+                            ScLocalHome::Gpr(r) => {
+                                let h = alloc.alloc_home(
+                                    idx,
+                                    scratch.node_elem(idx),
+                                    eff_lu,
+                                    spans_bar,
+                                    scratch,
+                                );
+                                emit_store_gpr_into_home(out, h, r, spill_base_slot);
+                                h
+                            }
+                            ScLocalHome::Xmm(x) => {
+                                let h = alloc.alloc_home(
+                                    idx,
+                                    ElemType::F64,
+                                    eff_lu,
+                                    spans_bar,
+                                    scratch,
+                                );
+                                emit_store_xmm_into_home(out, h, x, spill_base_slot);
+                                h
+                            }
+                            ScLocalHome::Slot(disp) => {
+                                let el = scratch.node_elem(idx);
+                                let h = if alloc.free_gpr_mask == 0
+                                    && can_use_transient_rax(
+                                        unit_nodes, scratch, idx, el, uc, eff_lu, spans_bar,
+                                    ) {
+                                    ScHome::AliasGpr(REG_RAX)
+                                } else {
+                                    alloc.alloc_home(idx, el, eff_lu, spans_bar, scratch)
+                                };
+                                match h {
+                                    ScHome::Gpr(r) | ScHome::AliasGpr(r) => {
+                                        emit_load_gpr_rbp(out, r, disp);
+                                    }
+                                    ScHome::Xmm(x) | ScHome::AliasXmm(x) => {
+                                        emit_load_xmm_rbp(out, x, disp);
+                                    }
+                                    ScHome::Spill(s) => {
+                                        emit_load_gpr_rbp(out, REG_RAX, disp);
+                                        emit_store_rbp_gpr(
+                                            out,
+                                            sc_spill_disp(spill_base_slot, s),
+                                            REG_RAX,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                h
+                            }
+                            ScLocalHome::Unused => ScHome::None,
+                        };
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::LocalSet => {
+                    let slot = frame.in_a as usize;
+                    let lh = local_home.get(slot).copied().unwrap_or(ScLocalHome::Unused);
+                    match lh {
+                        ScLocalHome::Gpr(r) => {
+                            if home_b.gpr_reg() != Some(r) {
+                                emit_load_home_into_gpr(out, r, home_b, spill_base_slot);
+                            }
+                        }
+                        ScLocalHome::Xmm(x) => {
+                            if home_b.xmm_reg() != Some(x) {
+                                emit_load_home_into_xmm(out, x, home_b, spill_base_slot);
+                            }
+                        }
+                        ScLocalHome::Slot(disp) => match home_b {
+                            ScHome::Gpr(r) | ScHome::AliasGpr(r) => {
+                                emit_store_rbp_gpr(out, disp, r);
+                            }
+                            ScHome::Xmm(x) | ScHome::AliasXmm(x) => {
+                                emit_store_rbp_xmm(out, disp, x);
+                            }
+                            _ => {
+                                emit_load_home_into_gpr(out, REG_RAX, home_b, spill_base_slot);
+                                emit_store_rbp_gpr(out, disp, REG_RAX);
+                            }
+                        },
+                        ScLocalHome::Unused => {}
+                    }
+                    if uc > 0 {
+                        let el = scratch.node_elem(idx);
+                        let dst = alloc.alloc_home(idx, el, eff_lu, spans_bar, scratch);
+                        emit_move_home_to_home(out, dst, home_b, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Add | Opcode::Sub | Opcode::Mul => {
+                    if uc > 0 {
+                        let elem_a = scratch.node_elem(a_idx);
+                        if elem_a == ElemType::F64 {
+                            let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                                .or_else(|| {
+                                    alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch)
+                                })
+                                .or_else(|| {
+                                    if frame.opcode != Opcode::Sub {
+                                        alloc.try_reuse_xmm(b_idx, idx, eff_lu, spans_bar, scratch)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                                });
+                            let op_byte = match frame.opcode {
+                                Opcode::Add => 0x58,
+                                Opcode::Sub => 0x5C,
+                                _ => 0x59,
+                            };
+                            let (mut ha, mut hb) = (home_a, home_b);
+                            let mut work_x = dst.xmm_reg().unwrap_or(0);
+                            if frame.opcode != Opcode::Sub
+                                && hb.xmm_reg() == Some(work_x)
+                                && ha.xmm_reg() != Some(work_x)
+                            {
+                                std::mem::swap(&mut ha, &mut hb);
+                            }
+                            if frame.opcode == Opcode::Sub
+                                && hb.xmm_reg() == Some(work_x)
+                                && ha.xmm_reg() != Some(work_x)
+                            {
+                                work_x = 0;
+                            }
+                            emit_load_home_into_xmm(out, work_x, ha, spill_base_slot);
+                            match hb {
+                                ScHome::Xmm(x) | ScHome::AliasXmm(x) => {
+                                    emit_sse2_sd_rr(out, op_byte, work_x, x);
+                                }
+                                ScHome::Spill(s) => {
+                                    emit_sse2_sd_rm_rbp(
+                                        out,
+                                        op_byte,
+                                        work_x,
+                                        sc_spill_disp(spill_base_slot, s),
+                                    );
+                                }
+                                _ => {
+                                    emit_load_home_into_xmm(out, 1, hb, spill_base_slot);
+                                    emit_sse2_sd_rr(out, op_byte, work_x, 1);
+                                }
+                            }
+                            emit_store_xmm_into_home(out, dst, work_x, spill_base_slot);
+                            scratch.set_home(idx, dst)?;
+                        } else {
+                            let direct_ret = if uc == 1
+                                && is_immediate_func_return(idx)
+                                && !(frame.opcode == Opcode::Sub
+                                    && home_b.gpr_reg() == Some(REG_RAX))
+                            {
+                                Some(ScHome::AliasGpr(REG_RAX))
+                            } else {
+                                None
+                            };
+                            let dst = direct_ret
+                                .or_else(|| direct_local_dst(unit_nodes, scratch, &local_home, idx))
+                                .or_else(|| {
+                                    alloc.try_reuse_gpr(a_idx, idx, eff_lu, spans_bar, scratch)
+                                })
+                                .or_else(|| {
+                                    if frame.opcode != Opcode::Sub {
+                                        alloc.try_reuse_gpr(b_idx, idx, eff_lu, spans_bar, scratch)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    if alloc.free_gpr_mask == 0
+                                        && can_use_transient_rax(
+                                            unit_nodes, scratch, idx, elem_a, uc, eff_lu, spans_bar,
+                                        )
+                                    {
+                                        ScHome::AliasGpr(REG_RAX)
+                                    } else {
+                                        alloc.alloc_home(idx, elem_a, eff_lu, spans_bar, scratch)
+                                    }
+                                });
+                            emit_sc_int_binary(
+                                out,
+                                frame.opcode,
+                                elem_a,
+                                home_a,
+                                home_b,
+                                dst,
+                                spill_base_slot,
+                            );
+                            scratch.set_home(idx, dst)?;
+                        }
+                    }
+                }
+                Opcode::Div => {
+                    let elem_a = scratch.node_elem(a_idx);
+                    if matches!(elem_a, ElemType::I64 | ElemType::U8) {
+                        // Integer division can trap (`exit(72)`), so always emit even if `uc == 0`.
+                        let dst = if uc > 0 {
+                            direct_local_dst(unit_nodes, scratch, &local_home, idx).unwrap_or_else(
+                                || alloc.alloc_home(idx, elem_a, eff_lu, spans_bar, scratch),
+                            )
+                        } else {
+                            ScHome::None
+                        };
+                        let rdx_live = (alloc.free_gpr_mask & (1u16 << REG_RDX)) == 0;
+                        emit_sc_int_div_rem(
+                            out,
+                            elem_a == ElemType::U8,
+                            false,
+                            home_a,
+                            home_b,
+                            dst,
+                            rdx_live,
+                            spill_base_slot,
+                        )?;
+                        scratch.set_home(idx, dst)?;
+                    } else if uc > 0 {
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                            });
+                        let mut work_x = dst.xmm_reg().unwrap_or(0);
+                        if home_b.xmm_reg() == Some(work_x) && home_a.xmm_reg() != Some(work_x) {
+                            work_x = 0;
+                        }
+                        emit_load_home_into_xmm(out, work_x, home_a, spill_base_slot);
+                        match home_b {
+                            ScHome::Xmm(x) | ScHome::AliasXmm(x) => {
+                                emit_sse2_sd_rr(out, 0x5E, work_x, x);
+                            }
+                            ScHome::Spill(s) => {
+                                emit_sse2_sd_rm_rbp(
+                                    out,
+                                    0x5E,
+                                    work_x,
+                                    sc_spill_disp(spill_base_slot, s),
+                                );
+                            }
+                            _ => {
+                                emit_load_home_into_xmm(out, 1, home_b, spill_base_slot);
+                                emit_sse2_sd_rr(out, 0x5E, work_x, 1);
+                            }
+                        }
+                        emit_store_xmm_into_home(out, dst, work_x, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Rem => {
+                    let elem_a = scratch.node_elem(a_idx);
+                    let dst = if uc > 0 {
+                        direct_local_dst(unit_nodes, scratch, &local_home, idx).unwrap_or_else(
+                            || alloc.alloc_home(idx, elem_a, eff_lu, spans_bar, scratch),
+                        )
+                    } else {
+                        ScHome::None
+                    };
+                    let rdx_live = (alloc.free_gpr_mask & (1u16 << REG_RDX)) == 0;
+                    emit_sc_int_div_rem(
+                        out,
+                        elem_a == ElemType::U8,
+                        true,
+                        home_a,
+                        home_b,
+                        dst,
+                        rdx_live,
+                        spill_base_slot,
+                    )?;
+                    scratch.set_home(idx, dst)?;
+                }
+                Opcode::BitAnd
+                | Opcode::BitOr
+                | Opcode::BitXor
+                | Opcode::MaskAnd
+                | Opcode::MaskOr => {
+                    if uc > 0 {
+                        let elem = scratch.node_elem(idx);
+                        let direct_ret = if uc == 1 && is_immediate_func_return(idx) {
+                            Some(ScHome::AliasGpr(REG_RAX))
+                        } else {
+                            None
+                        };
+                        let dst = direct_ret
+                            .or_else(|| direct_local_dst(unit_nodes, scratch, &local_home, idx))
+                            .or_else(|| alloc.try_reuse_gpr(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .or_else(|| alloc.try_reuse_gpr(b_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                if alloc.free_gpr_mask == 0
+                                    && can_use_transient_rax(
+                                        unit_nodes, scratch, idx, elem, uc, eff_lu, spans_bar,
+                                    )
+                                {
+                                    ScHome::AliasGpr(REG_RAX)
+                                } else {
+                                    alloc.alloc_home(idx, elem, eff_lu, spans_bar, scratch)
+                                }
+                            });
+                        emit_sc_int_binary(
+                            out,
+                            frame.opcode,
+                            elem,
+                            home_a,
+                            home_b,
+                            dst,
+                            spill_base_slot,
+                        );
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Shl | Opcode::ShrU | Opcode::ShrS => {
+                    if uc > 0 {
+                        let elem_a = scratch.node_elem(a_idx);
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_gpr(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                if alloc.free_gpr_mask == 0
+                                    && can_use_transient_rax(
+                                        unit_nodes, scratch, idx, elem_a, uc, eff_lu, spans_bar,
+                                    )
+                                {
+                                    ScHome::AliasGpr(REG_RAX)
+                                } else {
+                                    alloc.alloc_home(idx, elem_a, eff_lu, spans_bar, scratch)
+                                }
+                            });
+                        let rcx_live = (alloc.free_gpr_mask & (1u16 << REG_RCX)) == 0;
+                        emit_sc_shift(
+                            out,
+                            frame.opcode,
+                            elem_a,
+                            home_a,
+                            home_b,
+                            dst,
+                            rcx_live,
+                            spill_base_slot,
+                        );
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::MaskNot => {
+                    if uc > 0 && !scratch.is_node_fused_out(idx) {
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_gpr(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(
+                                    idx,
+                                    ElemType::BoolMask,
+                                    eff_lu,
+                                    spans_bar,
+                                    scratch,
+                                )
+                            });
+                        let dst_r = dst.gpr_reg().unwrap_or(REG_RAX);
+                        emit_load_home_into_gpr(out, dst_r, home_a, spill_base_slot);
+                        emit_alu32_ri(out, 6, dst_r, 1);
+                        emit_store_gpr_into_home(out, dst, dst_r, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Cast => {
+                    let src_elem = scratch.node_elem(a_idx);
+                    let dst_elem = frame.type_lane.elem;
+                    // Fold `Cast(ConstI64(v), U8)` directly into `ScHome::ConstU8` (zero instructions).
+                    if src_elem == ElemType::I64 && dst_elem == ElemType::U8 {
+                        if let ScHome::ConstI64(v) = home_a {
+                            scratch.set_home(
+                                idx,
+                                ScHome::ConstU8(u8::try_from(v & 0xFF).unwrap_or(0)),
+                            )?;
+                            alloc.expire_at(idx, scratch);
+                            continue;
+                        }
+                    }
+                    let can_trap = src_elem == ElemType::F64
+                        && matches!(dst_elem, ElemType::I64 | ElemType::U8);
+                    if uc > 0 || can_trap {
+                        let dst = if uc > 0 {
+                            direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                                .or_else(|| {
+                                    if dst_elem != ElemType::F64 && src_elem != ElemType::F64 {
+                                        alloc.try_reuse_gpr(a_idx, idx, eff_lu, spans_bar, scratch)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    alloc.alloc_home(idx, dst_elem, eff_lu, spans_bar, scratch)
+                                })
+                        } else {
+                            ScHome::None
+                        };
+                        emit_sc_cast(out, src_elem, dst_elem, home_a, dst, spill_base_slot)?;
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Min | Opcode::Max => {
+                    if uc > 0 {
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                            });
+                        let op_byte = if frame.opcode == Opcode::Min {
+                            0x5D
+                        } else {
+                            0x5F
+                        };
+                        let mut work_x = dst.xmm_reg().unwrap_or(0);
+                        if home_b.xmm_reg() == Some(work_x) && home_a.xmm_reg() != Some(work_x) {
+                            work_x = 0;
+                        }
+                        emit_load_home_into_xmm(out, work_x, home_a, spill_base_slot);
+                        match home_b {
+                            ScHome::Xmm(x) | ScHome::AliasXmm(x) => {
+                                emit_sse2_sd_rr(out, op_byte, work_x, x);
+                            }
+                            ScHome::Spill(s) => {
+                                emit_sse2_sd_rm_rbp(
+                                    out,
+                                    op_byte,
+                                    work_x,
+                                    sc_spill_disp(spill_base_slot, s),
+                                );
+                            }
+                            _ => {
+                                emit_load_home_into_xmm(out, 1, home_b, spill_base_slot);
+                                emit_sse2_sd_rr(out, op_byte, work_x, 1);
+                            }
+                        }
+                        emit_store_xmm_into_home(out, dst, work_x, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Fma => {
+                    if uc > 0 {
+                        let (in_b, in_c) = frame.decode_fma_bc();
+                        let hb_fma = scratch.get_home(in_b as usize, unit_nodes);
+                        let hc_fma = scratch.get_home(in_c as usize, unit_nodes);
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                            });
+                        let mut work_x = dst.xmm_reg().unwrap_or(0);
+                        if (hb_fma.xmm_reg() == Some(work_x) || hc_fma.xmm_reg() == Some(work_x))
+                            && home_a.xmm_reg() != Some(work_x)
+                        {
+                            work_x = 0;
+                        }
+                        emit_load_home_into_xmm(out, work_x, home_a, spill_base_slot);
+                        let reg_b = if let Some(xb) = hb_fma.xmm_reg() {
+                            xb
+                        } else {
+                            emit_load_home_into_xmm(out, 1, hb_fma, spill_base_slot);
+                            1
+                        };
+                        match hc_fma {
+                            ScHome::Xmm(xc) | ScHome::AliasXmm(xc) => {
+                                emit_vex_fma213_xmm_rr(out, work_x, reg_b, xc);
+                            }
+                            ScHome::Spill(s) => {
+                                emit_vex_fma213_xmm_rm_rbp(
+                                    out,
+                                    work_x,
+                                    reg_b,
+                                    sc_spill_disp(spill_base_slot, s),
+                                );
+                            }
+                            _ => {
+                                if reg_b == 1 {
+                                    emit_load_home_into_xmm(out, 0, home_a, spill_base_slot);
+                                    emit_load_home_into_xmm(out, 1, hb_fma, spill_base_slot);
+                                    if let ScHome::ConstF64(bits) = hc_fma {
+                                        emit_mov_gpr_imm64(out, REG_RAX, bits);
+                                    } else {
+                                        emit_load_home_into_gpr(
+                                            out,
+                                            REG_RAX,
+                                            hc_fma,
+                                            spill_base_slot,
+                                        );
+                                    }
+                                    emit_push_gpr(out, REG_RAX);
+                                    // vfmadd213sd xmm0, xmm1, [rsp]
+                                    out.extend_from_slice(&[0xC4, 0xE2, 0xF1, 0xA9, 0x04, 0x24]);
+                                    out.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+                                    work_x = 0;
+                                } else {
+                                    emit_load_home_into_xmm(out, 1, hc_fma, spill_base_slot);
+                                    emit_vex_fma213_xmm_rr(out, work_x, reg_b, 1);
+                                }
+                            }
+                        }
+                        emit_store_xmm_into_home(out, dst, work_x, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Abs => {
+                    if uc > 0 {
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                            });
+                        emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                        out.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]); // btr rax, 63
+                        emit_store_gpr_into_home(out, dst, REG_RAX, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Sqrt => {
+                    if uc > 0 {
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                            });
+                        let dst_x = dst.xmm_reg().unwrap_or(0);
+                        match home_a {
+                            ScHome::Xmm(xa) | ScHome::AliasXmm(xa) => {
+                                emit_sse2_sd_rr(out, 0x51, dst_x, xa);
+                            }
+                            ScHome::Spill(s) => {
+                                emit_sse2_sd_rm_rbp(
+                                    out,
+                                    0x51,
+                                    dst_x,
+                                    sc_spill_disp(spill_base_slot, s),
+                                );
+                            }
+                            _ => {
+                                emit_load_home_into_xmm(out, dst_x, home_a, spill_base_slot);
+                                emit_sse2_sd_rr(out, 0x51, dst_x, dst_x);
+                            }
+                        }
+                        emit_store_xmm_into_home(out, dst, dst_x, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Floor | Opcode::Ceil => {
+                    if uc > 0 {
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                            });
+                        let mode = if frame.opcode == Opcode::Floor {
+                            0x09
+                        } else {
+                            0x0A
+                        };
+                        let dst_x = dst.xmm_reg().unwrap_or(0);
+                        if let Some(xa) = home_a.xmm_reg() {
+                            emit_roundsd_rr(out, dst_x, xa, mode);
+                        } else {
+                            emit_load_home_into_xmm(out, dst_x, home_a, spill_base_slot);
+                            emit_roundsd_rr(out, dst_x, dst_x, mode);
+                        }
+                        emit_store_xmm_into_home(out, dst, dst_x, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::Ln | Opcode::Exp => {
+                    if uc > 0 {
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .or_else(|| alloc.try_reuse_xmm(a_idx, idx, eff_lu, spans_bar, scratch))
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::F64, eff_lu, spans_bar, scratch)
+                            });
+                        let src_disp = if let ScHome::Spill(s) = home_a {
+                            sc_spill_disp(spill_base_slot, s)
+                        } else {
+                            emit_load_home_into_xmm(out, 0, home_a, spill_base_slot);
+                            emit_store_rbp_xmm(out, x87_scratch_disp, 0);
+                            x87_scratch_disp
+                        };
+                        let dst_disp = if let ScHome::Spill(s) = dst {
+                            sc_spill_disp(spill_base_slot, s)
+                        } else {
+                            x87_scratch_disp
+                        };
+                        if frame.opcode == Opcode::Ln {
+                            emit_x87_ln_slot(out, src_disp, dst_disp);
+                        } else {
+                            emit_x87_exp_slot(out, src_disp, dst_disp);
+                        }
+                        if let Some(dx) = dst.xmm_reg() {
+                            emit_load_xmm_rbp(out, dx, x87_scratch_disp);
+                        }
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq | Opcode::CmpLtU => {
+                    if uc > 0 && !scratch.is_node_fused_out(idx) {
+                        let elem_a = scratch.node_elem(a_idx);
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(
+                                    idx,
+                                    ElemType::BoolMask,
+                                    eff_lu,
+                                    spans_bar,
+                                    scratch,
+                                )
+                            });
+                        let dst_r = dst.gpr_reg().unwrap_or(REG_RAX);
+                        if elem_a == ElemType::I64 || elem_a == ElemType::U8 {
+                            let jcc = emit_sc_int_cmp(
+                                out,
+                                frame.opcode,
+                                elem_a,
+                                home_a,
+                                home_b,
+                                spill_base_slot,
+                            );
+                            let setcc = jcc.saturating_add(0x10); // 0x8x -> 0x9x (`setcc`)
+                            out.extend_from_slice(&[
+                                sc_rex(false, 0, 0, dst_r),
+                                0x0F,
+                                setcc,
+                                0xC0 | (dst_r & 7),
+                            ]);
+                            emit_movzx_gpr32_gpr8(out, dst_r, dst_r);
+                        } else {
+                            match frame.opcode {
+                                Opcode::CmpGt => {
+                                    emit_load_home_into_xmm(out, 0, home_b, spill_base_slot);
+                                    emit_load_home_into_xmm(out, 1, home_a, spill_base_slot);
+                                    out.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
+                                }
+                                Opcode::CmpLt => {
+                                    emit_load_home_into_xmm(out, 0, home_a, spill_base_slot);
+                                    emit_load_home_into_xmm(out, 1, home_b, spill_base_slot);
+                                    out.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
+                                }
+                                _ => {
+                                    emit_load_home_into_xmm(out, 0, home_a, spill_base_slot);
+                                    emit_load_home_into_xmm(out, 1, home_b, spill_base_slot);
+                                    out.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x00]);
+                                }
+                            }
+                            emit_movq_gpr_xmm(out, dst_r, 0);
+                            emit_alu32_ri(out, 4, dst_r, 1);
+                        }
+                        emit_store_gpr_into_home(out, dst, dst_r, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::SelectZero => {
+                    if uc > 0 {
+                        let el_b = scratch.node_elem(b_idx);
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, el_b, eff_lu, spans_bar, scratch)
+                            });
+                        emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                        out.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
+                        match home_b {
+                            ScHome::Gpr(r) | ScHome::AliasGpr(r) => {
+                                emit_alu64_rr(out, 0x23, REG_RAX, r);
+                            }
+                            ScHome::Spill(s) => {
+                                emit_alu64_rm_rbp(
+                                    out,
+                                    0x23,
+                                    REG_RAX,
+                                    sc_spill_disp(spill_base_slot, s),
+                                );
+                            }
+                            _ => {
+                                emit_load_home_into_gpr(out, REG_R11, home_b, spill_base_slot);
+                                emit_alu64_rr(out, 0x23, REG_RAX, REG_R11);
+                            }
+                        }
+                        emit_store_gpr_into_home(out, dst, REG_RAX, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::RingEnqueue => {
+                    if uc > 0 {
+                        let el_a = scratch.node_elem(a_idx);
+                        let dst = alloc.alloc_home(idx, el_a, eff_lu, spans_bar, scratch);
+                        emit_move_home_to_home(out, dst, home_a, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::AssertContract => {
+                    let el_a = scratch.node_elem(a_idx);
+                    let dst = if uc > 0 {
+                        alloc.alloc_home(idx, el_a, eff_lu, spans_bar, scratch)
+                    } else {
+                        ScHome::None
+                    };
+                    if el_a == ElemType::F64 {
+                        emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                        emit_store_gpr_into_home(out, dst, REG_RAX, spill_base_slot);
+                        emit_movabs_reg(out, REG_R11, 0x7FF0_0000_0000_0000);
+                        out.extend_from_slice(&[0x4C, 0x21, 0xD8]); // and rax, r11
+                        out.extend_from_slice(&[0x4C, 0x39, 0xD8]); // cmp rax, r11
+                        out.extend_from_slice(&[0x75, 0x0C]); // jne +12
+                        emit_sys_exit(out, AOT_EXIT_CONTRACT_FAILED as u32);
+                    } else {
+                        emit_move_home_to_home(out, dst, home_a, spill_base_slot);
+                    }
+                    scratch.set_home(idx, dst)?;
+                }
+                Opcode::Block => {
+                    let hdr_info = scratch.nodes.get(idx).copied();
+                    let end_idx = hdr_info.map_or(0, |n| n.aux as usize);
+                    if hdr_info.is_some_and(|n| (n.elem_flags & FLAG_SCOPE_HAS_RESULT) != 0) {
+                        let end_uc = scratch.nodes.get(end_idx).map_or(0, |n| n.use_count());
+                        if end_uc > 0 {
+                            let end_el = scratch.node_elem(end_idx);
+                            let end_lu = scratch.eff_last_use(end_idx);
+                            let end_spans = scratch.spans_barrier(end_idx, end_lu);
+                            let res_home =
+                                alloc.alloc_home(end_idx, end_el, end_lu, end_spans, scratch);
+                            scratch.set_home(end_idx, res_home)?;
+                        }
+                    }
+                    scratch.ctrl_stack.push(AotCtrlFrame {
+                        kind: AotCtrlKind::Block {
+                            end_node_idx: end_idx,
+                        },
+                        end_patches: Vec::new(),
+                    });
+                }
+                Opcode::Loop => {
+                    let end_idx = scratch.nodes.get(idx).map_or(0, |n| n.aux as usize);
+                    let bounded = if frame.proof_idx > 0 {
+                        let proof = program
+                            .proofs
+                            .get(usize::from(frame.proof_idx - 1))
+                            .ok_or(AotError::UnsupportedGraph("missing LoopBound proof"))?;
+                        let fuel_spans = scratch.spans_barrier(idx, end_idx);
+                        let fuel_home =
+                            alloc.alloc_home(idx, ElemType::I64, end_idx, fuel_spans, scratch);
+                        match fuel_home {
+                            ScHome::Gpr(r) | ScHome::AliasGpr(r) => {
+                                emit_mov_gpr_imm64(out, r, u64::from(proof.bound_hi));
+                            }
+                            ScHome::Spill(s) => {
+                                emit_mov_gpr_imm64(out, REG_RAX, u64::from(proof.bound_hi));
+                                emit_store_rbp_gpr(out, sc_spill_disp(spill_base_slot, s), REG_RAX);
+                            }
+                            _ => {}
+                        }
+                        scratch.set_home(idx, fuel_home)?;
+                        true
+                    } else {
+                        false
+                    };
+                    let body_start_offset = out.len();
+                    scratch.ctrl_stack.push(AotCtrlFrame {
+                        kind: AotCtrlKind::Loop {
+                            body_start_offset,
+                            loop_node_idx: idx,
+                            bounded,
+                        },
+                        end_patches: Vec::new(),
+                    });
+                }
+                Opcode::If => {
+                    let hdr_info = scratch.nodes.get(idx).copied();
+                    let end_idx = hdr_info.map_or(0, |n| n.aux as usize);
+                    if hdr_info.is_some_and(|n| (n.elem_flags & FLAG_SCOPE_HAS_RESULT) != 0) {
+                        let end_uc = scratch.nodes.get(end_idx).map_or(0, |n| n.use_count());
+                        if end_uc > 0 {
+                            let end_el = scratch.node_elem(end_idx);
+                            let end_lu = scratch.eff_last_use(end_idx);
+                            let end_spans = scratch.spans_barrier(end_idx, end_lu);
+                            let res_home =
+                                alloc.alloc_home(end_idx, end_el, end_lu, end_spans, scratch);
+                            scratch.set_home(end_idx, res_home)?;
+                        }
+                    }
+                    let jcc_false = if let Some((cmp_idx, inverted)) = scratch.is_branch_fused(idx)
+                    {
+                        let cf = unit_nodes
+                            .get(cmp_idx)
+                            .ok_or(AotError::UnsupportedGraph("missing fused cmp node"))?;
+                        let ca_home = scratch.get_home(cf.in_a as usize, unit_nodes);
+                        let cb_home = scratch.get_home(cf.in_b as usize, unit_nodes);
+                        let cel = scratch.node_elem(cf.in_a as usize);
+                        let true_cc =
+                            emit_sc_int_cmp(out, cf.opcode, cel, ca_home, cb_home, spill_base_slot);
+                        if inverted {
+                            true_cc
+                        } else {
+                            true_cc ^ 1
+                        }
+                    } else {
+                        if let Some(r) = home_a.gpr_reg() {
+                            out.extend_from_slice(&[
+                                sc_rex(true, r, 0, r),
+                                0x85,
+                                0xC0 | ((r & 7) << 3) | (r & 7),
+                            ]);
+                        } else {
+                            emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                            out.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                        }
+                        0x84 // jz
+                    };
+                    out.extend_from_slice(&[0x0F, jcc_false, 0x00, 0x00, 0x00, 0x00]);
+                    let false_jump_patch = out.len() - 4;
+                    scratch.ctrl_stack.push(AotCtrlFrame {
+                        kind: AotCtrlKind::If {
+                            end_node_idx: end_idx,
+                            false_jump_patch,
+                            has_else: false,
+                        },
+                        end_patches: Vec::new(),
+                    });
+                }
+                Opcode::Else => {
+                    let (end_node_idx, false_jump_patch) = {
+                        let top = scratch
+                            .ctrl_stack
+                            .last()
+                            .ok_or(AotError::UnsupportedGraph("Else without open If"))?;
+                        let AotCtrlKind::If {
+                            end_node_idx,
+                            false_jump_patch,
+                            ..
+                        } = top.kind
+                        else {
+                            return Err(AotError::UnsupportedGraph("Else without matching If"));
+                        };
+                        (end_node_idx, false_jump_patch)
+                    };
+                    if frame.in_b != 0 {
+                        let res_home = scratch.get_home(end_node_idx, unit_nodes);
+                        emit_move_home_to_home(out, res_home, home_a, spill_base_slot);
+                    }
+                    out.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                    let end_patch = out.len() - 4;
+                    let else_body_pos = out.len();
+                    patch_rel32(out, false_jump_patch, else_body_pos)?;
+                    if let Some(top) = scratch.ctrl_stack.last_mut() {
+                        top.end_patches.push(end_patch);
+                        if let AotCtrlKind::If {
+                            ref mut has_else, ..
+                        } = top.kind
+                        {
+                            *has_else = true;
+                        }
+                    }
+                }
+                Opcode::End => {
+                    if let Some(popped) = scratch.ctrl_stack.pop() {
+                        match popped.kind {
+                            AotCtrlKind::Block { end_node_idx } => {
+                                if frame.in_b != 0 {
+                                    let res_home = scratch.get_home(end_node_idx, unit_nodes);
+                                    emit_move_home_to_home(out, res_home, home_a, spill_base_slot);
+                                }
+                                let end_pos = out.len();
+                                for p in popped.end_patches {
+                                    patch_rel32(out, p, end_pos)?;
+                                }
+                            }
+                            AotCtrlKind::Loop { .. } => {
+                                let end_pos = out.len();
+                                for p in popped.end_patches {
+                                    patch_rel32(out, p, end_pos)?;
+                                }
+                            }
+                            AotCtrlKind::If {
+                                end_node_idx,
+                                false_jump_patch,
+                                has_else,
+                            } => {
+                                if has_else {
+                                    if frame.in_b != 0 {
+                                        let res_home = scratch.get_home(end_node_idx, unit_nodes);
+                                        emit_move_home_to_home(
+                                            out,
+                                            res_home,
+                                            home_a,
+                                            spill_base_slot,
+                                        );
+                                    }
+                                    let join_pos = out.len();
+                                    for p in popped.end_patches {
+                                        patch_rel32(out, p, join_pos)?;
+                                    }
+                                } else {
+                                    let end_pos = out.len();
+                                    patch_rel32(out, false_jump_patch, end_pos)?;
+                                    for p in popped.end_patches {
+                                        patch_rel32(out, p, end_pos)?;
+                                    }
+                                }
+                            }
+                        }
+                    } else if func_mode {
+                        // End of `Func`: emit return value move and epilogue into `out`.
+                        if frame.in_b != 0 {
+                            emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                        }
+                        let epilogue_pos = out.len();
+                        for p in scratch.epilogue_patches.drain(..) {
+                            patch_rel32(out, p, epilogue_pos)?;
+                        }
+                        let total_slots = spill_base_slot.saturating_add(alloc.next_spill_slot);
+                        let frame_bytes = total_slots.saturating_mul(8);
+                        let saved_mask = alloc.used_callee_saved_mask;
+                        if frame_bytes > 0 {
+                            out.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D]); // mov rsp, rbp; pop rbp
+                        }
+                        for &reg in SC_CALLEE_SAVED_GPRS.iter().rev() {
+                            if (saved_mask & (1u16 << reg)) != 0 {
+                                emit_pop_gpr(out, reg);
+                            }
+                        }
+                        // add r14, imm32(budget_delta_u32); ret
+                        out.extend_from_slice(&[0x49, 0x81, 0xC6]);
+                        out.extend_from_slice(&budget_delta_u32.to_le_bytes());
+                        out.push(0xC3);
+                    } else {
+                        return Err(AotError::UnsupportedGraph("End without open block"));
+                    }
+                }
+                Opcode::Br => {
+                    let depth = frame.in_a as usize;
+                    let pos = scratch
+                        .ctrl_stack
+                        .len()
+                        .checked_sub(1 + depth)
+                        .ok_or(AotError::UnsupportedGraph("Br depth overflow"))?;
+                    let target = scratch
+                        .ctrl_stack
+                        .get_mut(pos)
+                        .ok_or(AotError::UnsupportedGraph("Br target missing"))?;
+                    match target.kind {
+                        AotCtrlKind::Loop {
+                            body_start_offset,
+                            loop_node_idx,
+                            bounded,
+                        } => {
+                            let fuel_home = scratch.get_home(loop_node_idx, unit_nodes);
+                            emit_loop_backedge_jump(
+                                out,
+                                body_start_offset,
+                                fuel_home,
+                                spill_base_slot,
+                                bounded,
+                            )?;
+                        }
+                        AotCtrlKind::Block { .. } | AotCtrlKind::If { .. } => {
+                            out.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                            target.end_patches.push(out.len() - 4);
+                        }
+                    }
+                }
+                Opcode::BrIf => {
+                    let depth = frame.in_b as usize;
+                    let pos = scratch
+                        .ctrl_stack
+                        .len()
+                        .checked_sub(1 + depth)
+                        .ok_or(AotError::UnsupportedGraph("BrIf depth overflow"))?;
+                    let jcc_true = if let Some((cmp_idx, inverted)) = scratch.is_branch_fused(idx) {
+                        let cf = unit_nodes
+                            .get(cmp_idx)
+                            .ok_or(AotError::UnsupportedGraph("missing fused cmp node"))?;
+                        let ca_home = scratch.get_home(cf.in_a as usize, unit_nodes);
+                        let cb_home = scratch.get_home(cf.in_b as usize, unit_nodes);
+                        let cel = scratch.node_elem(cf.in_a as usize);
+                        let cc =
+                            emit_sc_int_cmp(out, cf.opcode, cel, ca_home, cb_home, spill_base_slot);
+                        if inverted {
+                            cc ^ 1
+                        } else {
+                            cc
+                        }
+                    } else {
+                        if let Some(r) = home_a.gpr_reg() {
+                            out.extend_from_slice(&[
+                                sc_rex(true, r, 0, r),
+                                0x85,
+                                0xC0 | ((r & 7) << 3) | (r & 7),
+                            ]);
+                        } else {
+                            emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                            out.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                        }
+                        0x85 // jnz
+                    };
+
+                    let target_kind = match scratch.ctrl_stack.get(pos).map(|f| &f.kind) {
+                        Some(AotCtrlKind::Loop {
+                            body_start_offset,
+                            loop_node_idx,
+                            bounded,
+                        }) => Some((*body_start_offset, *loop_node_idx, *bounded)),
+                        Some(AotCtrlKind::Block { .. } | AotCtrlKind::If { .. }) => None,
+                        None => return Err(AotError::UnsupportedGraph("BrIf target missing")),
+                    };
+                    if let Some((body_start_offset, loop_node_idx, bounded)) = target_kind {
+                        if bounded {
+                            out.extend_from_slice(&[0x0F, jcc_true ^ 1, 0x00, 0x00, 0x00, 0x00]);
+                            let skip_patch = out.len() - 4;
+                            let fuel_home = scratch.get_home(loop_node_idx, unit_nodes);
+                            emit_loop_backedge_jump(
+                                out,
+                                body_start_offset,
+                                fuel_home,
+                                spill_base_slot,
+                                true,
+                            )?;
+                            let after_pos = out.len();
+                            patch_rel32(out, skip_patch, after_pos)?;
+                        } else {
+                            out.extend_from_slice(&[0x0F, jcc_true, 0x00, 0x00, 0x00, 0x00]);
+                            let patch_pos = out.len() - 4;
+                            patch_rel32(out, patch_pos, body_start_offset)?;
+                        }
+                    } else if let Some(target) = scratch.ctrl_stack.get_mut(pos) {
+                        out.extend_from_slice(&[0x0F, jcc_true, 0x00, 0x00, 0x00, 0x00]);
+                        target.end_patches.push(out.len() - 4);
+                    }
+                }
+                Opcode::RegionNew => {
+                    let slot = frame.in_a as usize;
+                    let decl = regions
+                        .get(slot)
+                        .and_then(|d| *d)
+                        .ok_or(AotError::UnsupportedGraph("undeclared RegionNew slot"))?;
+                    emit_sc_region_new(out, slot, decl, home_b, spill_base_slot)?;
+                }
+                Opcode::RegionGrow => {
+                    let slot = frame.in_a as usize;
+                    let decl = regions
+                        .get(slot)
+                        .and_then(|d| *d)
+                        .ok_or(AotError::UnsupportedGraph("undeclared RegionGrow slot"))?;
+                    let dst = if uc > 0 {
+                        alloc.alloc_home(idx, ElemType::I64, eff_lu, spans_bar, scratch)
+                    } else {
+                        ScHome::None
+                    };
+                    emit_sc_region_grow(out, slot, decl, home_b, dst, spill_base_slot)?;
+                    scratch.set_home(idx, dst)?;
+                }
+                Opcode::RegionLen => {
+                    if uc > 0 {
+                        let slot = frame.in_a as usize;
+                        let off_len = sc_region_off(slot, 8);
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::I64, eff_lu, spans_bar, scratch)
+                            });
+                        let dst_r = dst.gpr_reg().unwrap_or(REG_RAX);
+                        emit_load_reg_r15(out, dst_r, off_len);
+                        emit_store_gpr_into_home(out, dst, dst_r, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::RegionLoad => {
+                    let slot = frame.in_a as usize;
+                    let decl = regions
+                        .get(slot)
+                        .and_then(|d| *d)
+                        .ok_or(AotError::UnsupportedGraph("undeclared RegionLoad slot"))?;
+                    let off_base = sc_region_off(slot, 0);
+                    let off_len = sc_region_off(slot, 8);
+                    let dst = if uc > 0 {
+                        direct_local_dst(unit_nodes, scratch, &local_home, idx).unwrap_or_else(
+                            || {
+                                if alloc.free_gpr_mask == 0
+                                    && can_use_transient_rax(
+                                        unit_nodes, scratch, idx, decl.elem, uc, eff_lu, spans_bar,
+                                    )
+                                {
+                                    ScHome::AliasGpr(REG_RAX)
+                                } else {
+                                    alloc.alloc_home(idx, decl.elem, eff_lu, spans_bar, scratch)
+                                }
+                            },
+                        )
+                    } else {
+                        ScHome::None
+                    };
+
+                    // Fast path: proven-in-bounds constant index.
+                    let const_proven_disp = if frame.proof_idx != 0 {
+                        if let ScHome::ConstI64(c) = home_b {
+                            let scale = i64::try_from(decl.elem.region_elem_bytes()).unwrap_or(8);
+                            if c >= 0 {
+                                c.checked_mul(scale).and_then(|off| i32::try_from(off).ok())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(byte_disp) = const_proven_disp {
+                        if uc > 0 {
+                            emit_load_reg_r15(out, REG_R11, off_base);
+                            if decl.elem == ElemType::F64 {
+                                let dx = dst.xmm_reg().unwrap_or(0);
+                                out.extend_from_slice(&[
+                                    0xF2,
+                                    sc_rex(false, dx, 0, REG_R11),
+                                    0x0F,
+                                    0x10,
+                                    0x83 | ((dx & 7) << 3),
+                                ]);
+                                out.extend_from_slice(&byte_disp.to_le_bytes());
+                                emit_store_xmm_into_home(out, dst, dx, spill_base_slot);
+                            } else {
+                                let dr = dst.gpr_reg().unwrap_or(REG_RAX);
+                                if decl.elem == ElemType::U8 {
+                                    out.extend_from_slice(&[
+                                        sc_rex(false, dr, 0, REG_R11),
+                                        0x0F,
+                                        0xB6,
+                                        0x83 | ((dr & 7) << 3),
+                                    ]);
+                                } else {
+                                    out.extend_from_slice(&[
+                                        sc_rex(true, dr, 0, REG_R11),
+                                        0x8B,
+                                        0x83 | ((dr & 7) << 3),
+                                    ]);
+                                }
+                                out.extend_from_slice(&byte_disp.to_le_bytes());
+                                emit_store_gpr_into_home(out, dst, dr, spill_base_slot);
+                            }
+                        }
+                    } else {
+                        let r_idx = if let Some(r) = home_b.gpr_reg() {
+                            r
+                        } else {
+                            emit_load_home_into_gpr(out, REG_RAX, home_b, spill_base_slot);
+                            REG_RAX
+                        };
+                        if frame.proof_idx == 0 {
+                            emit_cmp_reg_r15(out, r_idx, off_len);
+                            out.extend_from_slice(&[0x72, 0x0C]);
+                            emit_sys_exit(out, AOT_EXIT_GATHER_OOB as u32);
+                        }
+                        if uc > 0 {
+                            emit_load_reg_r15(out, REG_R11, off_base);
+                            if decl.elem == ElemType::F64 {
+                                let dx = dst.xmm_reg().unwrap_or(0);
+                                out.extend_from_slice(&[
+                                    0xF2,
+                                    sc_rex(false, dx, r_idx, REG_R11),
+                                    0x0F,
+                                    0x10,
+                                    ((dx & 7) << 3) | 0x04,
+                                    0xC0 | ((r_idx & 7) << 3) | 0x03,
+                                ]);
+                                emit_store_xmm_into_home(out, dst, dx, spill_base_slot);
+                            } else {
+                                let dr = dst.gpr_reg().unwrap_or(REG_RAX);
+                                if decl.elem == ElemType::U8 {
+                                    out.extend_from_slice(&[
+                                        sc_rex(false, dr, r_idx, REG_R11),
+                                        0x0F,
+                                        0xB6,
+                                        ((dr & 7) << 3) | 0x04,
+                                        ((r_idx & 7) << 3) | 0x03,
+                                    ]);
+                                } else {
+                                    out.extend_from_slice(&[
+                                        sc_rex(true, dr, r_idx, REG_R11),
+                                        0x8B,
+                                        ((dr & 7) << 3) | 0x04,
+                                        0xC0 | ((r_idx & 7) << 3) | 0x03,
+                                    ]);
+                                }
+                                emit_store_gpr_into_home(out, dst, dr, spill_base_slot);
+                            }
+                        }
+                    }
+                    scratch.set_home(idx, dst)?;
+                }
+                Opcode::RegionStore => {
+                    let slot = frame.in_a as usize;
+                    let decl = regions
+                        .get(slot)
+                        .and_then(|d| *d)
+                        .ok_or(AotError::UnsupportedGraph("undeclared RegionStore slot"))?;
+                    let (idx_node, val_node) = frame.decode_u16_pair();
+                    let idx_home = scratch.get_home(idx_node as usize, unit_nodes);
+                    let val_home = scratch.get_home(val_node as usize, unit_nodes);
+                    let off_base = sc_region_off(slot, 0);
+                    let off_len = sc_region_off(slot, 8);
+
+                    let r_idx = if let Some(r) = idx_home.gpr_reg() {
+                        r
+                    } else {
+                        emit_load_home_into_gpr(out, REG_RAX, idx_home, spill_base_slot);
+                        REG_RAX
+                    };
+                    if frame.proof_idx == 0 {
+                        emit_cmp_reg_r15(out, r_idx, off_len);
+                        out.extend_from_slice(&[0x72, 0x0C]);
+                        emit_sys_exit(out, AOT_EXIT_GATHER_OOB as u32);
+                    }
+                    emit_load_reg_r15(out, REG_R11, off_base);
+
+                    match (decl.elem, val_home) {
+                        (ElemType::U8, ScHome::ConstU8(b)) => {
+                            out.extend_from_slice(&[
+                                sc_rex(false, 0, r_idx, REG_R11),
+                                0xC6,
+                                0x04,
+                                ((r_idx & 7) << 3) | 0x03,
+                                b,
+                            ]);
+                        }
+                        (ElemType::U8, ScHome::Gpr(rv) | ScHome::AliasGpr(rv)) => {
+                            out.extend_from_slice(&[
+                                sc_rex(false, rv, r_idx, REG_R11),
+                                0x88,
+                                ((rv & 7) << 3) | 0x04,
+                                ((r_idx & 7) << 3) | 0x03,
+                            ]);
+                        }
+                        (ElemType::I64, ScHome::Gpr(rv) | ScHome::AliasGpr(rv)) => {
+                            out.extend_from_slice(&[
+                                sc_rex(true, rv, r_idx, REG_R11),
+                                0x89,
+                                ((rv & 7) << 3) | 0x04,
+                                0xC0 | ((r_idx & 7) << 3) | 0x03,
+                            ]);
+                        }
+                        (ElemType::I64, ScHome::ConstI64(v)) if i32::try_from(v).is_ok() => {
+                            let i32v = i32::try_from(v).unwrap_or(0);
+                            out.extend_from_slice(&[
+                                sc_rex(true, 0, r_idx, REG_R11),
+                                0xC7,
+                                0x04,
+                                0xC0 | ((r_idx & 7) << 3) | 0x03,
+                            ]);
+                            out.extend_from_slice(&i32v.to_le_bytes());
+                        }
+                        (ElemType::F64, ScHome::Xmm(xv) | ScHome::AliasXmm(xv)) => {
+                            out.extend_from_slice(&[
+                                0xF2,
+                                sc_rex(false, xv, r_idx, REG_R11),
+                                0x0F,
+                                0x11,
+                                ((xv & 7) << 3) | 0x04,
+                                0xC0 | ((r_idx & 7) << 3) | 0x03,
+                            ]);
+                        }
+                        _ => {
+                            if decl.elem == ElemType::U8 {
+                                emit_alu64_rr(out, 0x03, REG_R11, r_idx);
+                                emit_load_home_into_gpr(out, REG_RAX, val_home, spill_base_slot);
+                                out.extend_from_slice(&[0x41, 0x88, 0x03]);
+                            } else {
+                                out.extend_from_slice(&[
+                                    sc_rex(true, REG_R11, r_idx, REG_R11),
+                                    0x8D,
+                                    0x1C,
+                                    0xC0 | ((r_idx & 7) << 3) | 0x03,
+                                ]);
+                                emit_load_home_into_gpr(out, REG_RAX, val_home, spill_base_slot);
+                                out.extend_from_slice(&[0x49, 0x89, 0x03]);
+                            }
+                        }
+                    }
+                }
+                Opcode::RegionFree => {
+                    let slot = frame.in_a as usize;
+                    emit_sc_region_free(out, slot)?;
+                }
+                Opcode::Return => {
+                    if frame.in_a != 0 {
+                        emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                    }
+                    out.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                    scratch.epilogue_patches.push(out.len() - 4);
+                }
+                Opcode::CallArg => {
+                    let a2 = frame.in_a as usize;
+                    let a3 = if frame.in_b == u32::from(CALL_ARG_SENTINEL) {
+                        None
+                    } else {
+                        Some(frame.in_b as usize)
+                    };
+                    pending_call_args = Some((a2, a3));
+                }
+                Opcode::Call => {
+                    let target_id = frame.in_a as usize;
+                    let callee_sig = func_sigs
+                        .get(target_id)
+                        .copied()
+                        .flatten()
+                        .ok_or(AotError::UnsupportedGraph("unknown callee FuncSig"))?;
+                    let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+                    let sentinel = u32::from(CALL_ARG_SENTINEL);
+                    let mut arg_homes: [Option<ScHome>; 4] = [None; 4];
+                    if arg0_raw != sentinel {
+                        arg_homes[0] = Some(scratch.get_home(arg0_raw as usize, unit_nodes));
+                    }
+                    if arg1_raw != sentinel {
+                        arg_homes[1] = Some(scratch.get_home(arg1_raw as usize, unit_nodes));
+                    }
+                    if let Some((a2, a3_opt)) = pending_call_args.take() {
+                        arg_homes[2] = Some(scratch.get_home(a2, unit_nodes));
+                        if let Some(a3) = a3_opt {
+                            arg_homes[3] = Some(scratch.get_home(a3, unit_nodes));
+                        }
+                    }
+                    // 1. Parallel-move all GPR arguments into their target arg registers first.
+                    let mut gpr_moves: [(u8, u8); 4] = [(0, 0); 4];
+                    let mut gm_len = 0usize;
+                    for (i, opt_h) in arg_homes.iter().enumerate() {
+                        if let (Some(&dst_arg), Some(h)) = (SC_ARG_GPRS.get(i), *opt_h) {
+                            if let Some(src_r) = h.gpr_reg() {
+                                if let Some(slot) = gpr_moves.get_mut(gm_len) {
+                                    *slot = (dst_arg, src_r);
+                                    gm_len += 1;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(slice) = gpr_moves.get(..gm_len) {
+                        emit_parallel_gpr_moves(out, slice);
+                    }
+                    // 2. Materialize non-GPR arguments (constants, spills, XMMs) into their target arg registers.
+                    for (i, opt_h) in arg_homes.iter().enumerate() {
+                        if let (Some(&dst_arg), Some(h)) = (SC_ARG_GPRS.get(i), *opt_h) {
+                            if h.gpr_reg().is_none() {
+                                emit_load_home_into_gpr(out, dst_arg, h, spill_base_slot);
+                            }
+                        }
+                    }
+
+                    // Expire arguments that die at this Call BEFORE allocating the return value's home.
+                    alloc.expire_at(idx, scratch);
+
+                    out.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call rel32
+                    call_patches.push((out.len() - 4, target_id));
+
+                    if let Some(ret_elem) = callee_sig.ret_elem {
+                        if uc > 0 {
+                            let keep_in_rax_local_set = ret_elem != ElemType::F64
+                                && uc == 1
+                                && !spans_bar
+                                && eff_lu > idx
+                                && eff_lu <= idx.saturating_add(4)
+                                && unit_nodes.get(eff_lu).is_some_and(|ls_f| {
+                                    ls_f.opcode == Opcode::LocalSet
+                                        && ls_f.in_b as usize == idx
+                                        && scratch.nodes.get(eff_lu).map_or(0, |n| n.use_count())
+                                            == 0
+                                        && matches!(
+                                            local_home.get(ls_f.in_a as usize).copied(),
+                                            Some(ScLocalHome::Gpr(_))
+                                        )
+                                })
+                                && {
+                                    // Each live Add/Sub in `(idx + 1)..eff_lu` allocates at most
+                                    // one fresh GPR while `ConstI64` and aliased `LocalGet` take
+                                    // none. Require enough free GPRs up front so no window node
+                                    // can spill or fall back to scratch `rax` before `eff_lu`.
+                                    let mut window_gprs_needed = 0usize;
+                                    let mut window_ok = true;
+                                    for k in (idx + 1)..eff_lu {
+                                        let Some(kf) = unit_nodes.get(k) else {
+                                            window_ok = false;
+                                            break;
+                                        };
+                                        match kf.opcode {
+                                            Opcode::ConstI64 => {}
+                                            Opcode::LocalGet => {
+                                                let nls = scratch
+                                                    .nodes
+                                                    .get(k)
+                                                    .map_or(u32::MAX, |n| n.aux)
+                                                    as usize;
+                                                if !matches!(
+                                                    local_home.get(kf.in_a as usize).copied(),
+                                                    Some(ScLocalHome::Gpr(_))
+                                                ) || scratch.eff_last_use(k) >= nls
+                                                {
+                                                    window_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                            Opcode::Add | Opcode::Sub => {
+                                                let ka = kf.in_a as usize;
+                                                let kb = kf.in_b as usize;
+                                                let k_lu = scratch.eff_last_use(k);
+                                                let k_ok = ka != idx
+                                                    && kb != idx
+                                                    && scratch.node_elem(k) == ElemType::I64
+                                                    && !scratch.spans_barrier(k, k_lu)
+                                                    && k_lu.saturating_sub(k) <= 256
+                                                    && unit_nodes.get(ka).is_some_and(|af| {
+                                                        af.opcode == Opcode::LocalGet
+                                                            && matches!(
+                                                                local_home
+                                                                    .get(af.in_a as usize)
+                                                                    .copied(),
+                                                                Some(ScLocalHome::Gpr(_))
+                                                            )
+                                                    })
+                                                    && unit_nodes.get(kb).is_some_and(|bf| {
+                                                        if bf.opcode != Opcode::ConstI64 {
+                                                            return false;
+                                                        }
+                                                        let v = bf.decode_const_i64();
+                                                        if kf.opcode == Opcode::Sub {
+                                                            v.checked_neg()
+                                                                .and_then(|n| i32::try_from(n).ok())
+                                                                .is_some()
+                                                        } else {
+                                                            i32::try_from(v).is_ok()
+                                                        }
+                                                    });
+                                                if !k_ok {
+                                                    window_ok = false;
+                                                    break;
+                                                }
+                                                if scratch.nodes.get(k).map_or(0, |n| n.use_count())
+                                                    > 0
+                                                {
+                                                    window_gprs_needed += 1;
+                                                }
+                                            }
+                                            _ => {
+                                                window_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    window_ok
+                                        && (alloc.free_gpr_mask.count_ones() as usize)
+                                            >= window_gprs_needed
+                                };
+                            let keep_in_rax = keep_in_rax_local_set
+                                || (ret_elem != ElemType::F64
+                                    && uc == 1
+                                    && (is_immediate_func_return(idx)
+                                        || unit_nodes.get(idx.saturating_add(1)).is_some_and(
+                                            |nf| {
+                                                let next_idx = idx.saturating_add(1);
+                                                matches!(
+                                                    nf.opcode,
+                                                    Opcode::Add
+                                                        | Opcode::Sub
+                                                        | Opcode::Mul
+                                                        | Opcode::BitAnd
+                                                        | Opcode::BitOr
+                                                        | Opcode::BitXor
+                                                ) && scratch.node_elem(next_idx) != ElemType::F64
+                                                    && (nf.in_a as usize == idx
+                                                        || (nf.opcode != Opcode::Sub
+                                                            && nf.in_b as usize == idx))
+                                                    && scratch
+                                                        .nodes
+                                                        .get(next_idx)
+                                                        .map_or(0, |n| n.use_count())
+                                                        == 1
+                                                    && is_immediate_func_return(next_idx)
+                                            },
+                                        )));
+                            let dst = if keep_in_rax {
+                                ScHome::AliasGpr(REG_RAX)
+                            } else {
+                                direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                                    .unwrap_or_else(|| {
+                                        alloc.alloc_home(idx, ret_elem, eff_lu, spans_bar, scratch)
+                                    })
+                            };
+                            emit_store_gpr_into_home(out, dst, REG_RAX, spill_base_slot);
+                            scratch.set_home(idx, dst)?;
+                        }
+                    }
+                    continue;
+                }
+                Opcode::ArenaInput
+                | Opcode::ArenaSlice
+                | Opcode::ArenaMutate
+                | Opcode::FilterCompact
+                | Opcode::ReduceSum
+                | Opcode::ReduceMax
+                | Opcode::ReduceMin
+                | Opcode::Gather => {
+                    return Err(AotError::UnsupportedGraph(
+                        "columnar opcode in scalar structured control-flow AOT",
+                    ));
+                }
+            }
+
+            alloc.expire_at(idx, scratch);
+        }
+    }
+
+    if let Some(sig) = cur_sig {
+        let stub_pos =
+            stack_overflow_stub.ok_or(AotError::UnsupportedGraph("missing stack overflow stub"))?;
+        let total_slots = spill_base_slot.saturating_add(alloc.next_spill_slot);
+        let frame_bytes = total_slots.saturating_mul(8);
+        let saved_mask = alloc.used_callee_saved_mask;
+        // Use compact 2-byte `js rel8` / `jnz rel8` into a trailing 5-byte `jmp stack_overflow_stub`
+        // when the entire function (including early guard and prologue) is guaranteed <= 127 bytes.
+        let use_short_budget_jumps = fn_body_buf.len() <= 48 && frame_bytes == 0 && sig.arity <= 2;
+        let mut short_oom_patches: Vec<usize> = Vec::new();
+
+        // 1. Optional early-return base-case `If` guard (non-mutating `r14` budget check).
+        if let Some((if_idx, guard_end)) = early_guard {
+            if let Some((cmp_idx, inverted)) = scratch.is_branch_fused(if_idx) {
+                if let (Some(cf), Some(ret_f)) =
+                    (unit_nodes.get(cmp_idx), unit_nodes.get(guard_end - 1))
+                {
+                    if let (Some(ca_home), Some(cb_home)) = (
+                        early_guard_arg_home(unit_nodes, cf.in_a as usize),
+                        early_guard_arg_home(unit_nodes, cf.in_b as usize),
+                    ) {
+                        let cel = scratch.node_elem(cf.in_a as usize);
+                        let true_cc = emit_sc_int_cmp(code, cf.opcode, cel, ca_home, cb_home, 0);
+                        let jcc_false = if inverted { true_cc } else { true_cc ^ 1 };
+                        code.extend_from_slice(&[0x70 | (jcc_false & 0x0F), 0x00]);
+                        let skip_patch = code.len() - 1;
+                        emit_mov_gpr_gpr(code, REG_RAX, REG_R14);
+                        emit_sc_budget_sub_check(
+                            code,
+                            REG_RAX,
+                            budget_delta_u32,
+                            stub_pos,
+                            if use_short_budget_jumps {
+                                Some(&mut short_oom_patches)
+                            } else {
+                                None
+                            },
+                        )?;
+                        if ret_f.in_a != 0 {
+                            if let Some(ret_home) =
+                                early_guard_arg_home(unit_nodes, ret_f.in_a as usize)
+                            {
+                                emit_load_home_into_gpr(code, REG_RAX, ret_home, 0);
+                            }
+                        }
+                        code.push(0xC3); // ret
+                        let rel8 = code.len().saturating_sub(skip_patch + 1);
+                        if let (Ok(r8), Some(slot)) = (u8::try_from(rel8), code.get_mut(skip_patch))
+                        {
+                            *slot = r8;
+                        } else {
+                            return Err(AotError::UnsupportedGraph(
+                                "early guard short branch overflow",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Main-path packed depth + stack-unit budget check using `r14` (zero L1D loads, macro-fused).
+        emit_sc_budget_sub_check(
+            code,
+            REG_R14,
+            budget_delta_u32,
+            stub_pos,
+            if use_short_budget_jumps {
+                Some(&mut short_oom_patches)
+            } else {
+                None
+            },
+        )?;
+
+        // 3. Emit exact minimal prologue (zero NOPs) + param moves, then append `fn_body_buf`.
+        for &reg in &SC_CALLEE_SAVED_GPRS {
+            if (saved_mask & (1u16 << reg)) != 0 {
+                emit_push_gpr(code, reg);
+            }
+        }
+        if frame_bytes > 0 {
+            code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5]); // push rbp; mov rbp, rsp
+            if let Ok(fb8) = i8::try_from(frame_bytes) {
+                code.extend_from_slice(&[0x48, 0x83, 0xEC, fb8 as u8]); // sub rsp, imm8
+            } else {
+                code.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
+                code.extend_from_slice(&frame_bytes.to_le_bytes());
+            }
+        }
+        let arity = usize::from(sig.arity);
+        for i in 0..arity {
+            let Some(&arg_reg) = SC_ARG_GPRS.get(i) else {
+                continue;
+            };
+            match local_home.get(i).copied().unwrap_or(ScLocalHome::Unused) {
+                ScLocalHome::Slot(disp) => emit_store_rbp_gpr(code, disp, arg_reg),
+                ScLocalHome::Xmm(x) => emit_movq_xmm_gpr(code, x, arg_reg),
+                ScLocalHome::Gpr(_) | ScLocalHome::Unused => {}
+            }
+        }
+        let mut param_moves: [(u8, u8); 4] = [(0, 0); 4];
+        let mut pm_len = 0usize;
+        for i in 0..arity {
+            if let (Some(&arg_reg), Some(ScLocalHome::Gpr(dst_r))) =
+                (SC_ARG_GPRS.get(i), local_home.get(i).copied())
+            {
+                if let Some(slot) = param_moves.get_mut(pm_len) {
+                    *slot = (dst_r, arg_reg);
+                    pm_len += 1;
+                }
+            }
+        }
+        if let Some(slice) = param_moves.get(..pm_len) {
+            emit_parallel_gpr_moves(code, slice);
+        }
+
+        let body_base = code.len();
+        code.extend_from_slice(&fn_body_buf);
+        if !short_oom_patches.is_empty() {
+            let local_oom_pos = code.len();
+            for p in short_oom_patches {
+                let rel = local_oom_pos.saturating_sub(p + 1);
+                if let (Ok(r8), Some(slot)) = (i8::try_from(rel), code.get_mut(p)) {
+                    *slot = r8 as u8;
+                } else {
+                    return Err(AotError::UnsupportedGraph("short budget branch overflow"));
+                }
+            }
+            code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]); // jmp stack_overflow_stub
+            let jp = code.len() - 4;
+            patch_rel32(code, jp, stub_pos)?;
+        }
+        if let Some(patches) = call_patches.get_mut(body_call_patch_start..) {
+            for (patch_pos, _) in patches {
+                *patch_pos = patch_pos.saturating_add(body_base);
+            }
+        }
+        scratch.fn_body = fn_body_buf;
+    } else {
+        scratch.fn_body = fn_body_buf;
+        let total_slots = spill_base_slot.saturating_add(alloc.next_spill_slot);
+        let raw_bytes = usize::try_from(total_slots).unwrap_or(0).saturating_mul(8);
+        let frame_bytes = u32::try_from(raw_bytes.div_ceil(32) * 32)
+            .map_err(|_e| AotError::UnsupportedGraph("stack frame overflow"))?;
+        if let Some(patch_pos) = top_frame_sub_patch {
+            if let Some(dst) = code.get_mut(patch_pos..patch_pos + 4) {
+                dst.copy_from_slice(&frame_bytes.to_le_bytes());
+            }
+        }
+        if let Some(out_slot) = output_region_slot {
+            emit_sc_output_region_epilogue(code, out_slot)?;
+        } else {
+            let out_home = scratch.get_home(program.output_node as usize, unit_nodes);
+            emit_load_home_into_gpr(code, REG_RAX, out_home, spill_base_slot);
+            emit_store_rbp_gpr(code, stdout_disp, REG_RAX);
+            code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (SYS_write)
+            code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1
+            code.extend_from_slice(&[0x48, 0x8D, 0xB5]); // lea rsi, [rbp + stdout_disp]
+            code.extend_from_slice(&stdout_disp.to_le_bytes());
+            code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+            code.extend_from_slice(&[0x0F, 0x05]); // syscall
+            emit_sys_exit(code, 0);
+        }
+    }
+
+    Ok(())
+}
+
 fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotError> {
     let node_count = program.nodes.len();
     let func_mode = program.has_functions();
-    let mut code: Vec<u8> = Vec::with_capacity(256 + node_count * 24);
+    let mut code: Vec<u8> =
+        Vec::with_capacity(ELF_CODE_OFFSET + 256 + node_count.saturating_mul(16));
+    code.resize(ELF_CODE_OFFSET, 0);
 
     let mut regions: [Option<AotRegionDecl>; MAX_REGION_SLOTS] = [None; MAX_REGION_SLOTS];
     let mut has_any_region = false;
@@ -1754,30 +5883,29 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
     }
     let mut func_offsets: Vec<Option<usize>> = vec![None; func_count];
     let mut call_patches: Vec<(usize, usize)> = Vec::new();
+    let mut scratch = ScUnitScratch::new();
 
     if func_mode {
-        // 1. Entry stub for function programs:
-        //    Map 4096B global page in `r15` (64 region descriptors + live_call_depth + live_stack_units + io scratch).
-        code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
+        // 1. Entry stub: map 4096B global page in `r15`.
+        code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]);
         emit_sc_sys_mmap_anon(&mut code);
         code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
 
-        //    Map private stack (`8 * MAX_STACK_UNITS + 4096`) with bottom 4096B `PROT_NONE` guard page.
+        // 2. Map private stack (`8 * MAX_STACK_UNITS + 4096`) with bottom `PROT_NONE` guard page.
         let stack_total_bytes = u64::from(MAX_STACK_UNITS)
             .saturating_mul(8)
             .saturating_add(4096);
-        emit_movabs_reg(&mut code, 6, stack_total_bytes); // movabs rsi, stack_total_bytes
+        emit_movabs_reg(&mut code, 6, stack_total_bytes);
         emit_sc_sys_mmap_anon(&mut code);
-        code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax (stack base)
+        code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax
         code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
         code.extend_from_slice(&[0xBE, 0x00, 0x10, 0x00, 0x00]); // mov esi, 4096
         code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (PROT_NONE)
         code.extend_from_slice(&[0xB8, 0x0A, 0x00, 0x00, 0x00]); // mov eax, 10 (SYS_mprotect)
-        code.extend_from_slice(&[0x0F, 0x05]); // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
         code.extend_from_slice(&[0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF, 0x72, 0x0C]);
         emit_sys_exit(&mut code, AOT_EXIT_REGION_OOM as u32);
 
-        //    Switch `rsp` to top of private stack (4096B-aligned, 16B-aligned for `call`).
         emit_movabs_reg(&mut code, 0, stack_total_bytes);
         code.extend_from_slice(&[0x49, 0x01, 0xC4]); // add r12, rax
         code.extend_from_slice(&[0x4C, 0x89, 0xE4]); // mov rsp, r12
@@ -1787,7 +5915,12 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
             emit_sc_region_startup(&mut code, &regions, true)?;
         }
 
-        //    Call entry function (highest func_id = func_count - 1).
+        // 3. Initialize packed remaining depth + stack-unit budget register `r14` AFTER region startup.
+        // Layout: bits 22..63 = remaining call depth, bit 21 = unit underflow guard, bits 0..20 = remaining stack units.
+        let init_budget = (u64::from(MAX_CALL_DEPTH) << 22) | u64::from(MAX_STACK_UNITS);
+        emit_movabs_reg(&mut code, REG_R14, init_budget);
+
+        // 4. Call entry function (`func_count - 1`).
         let entry_func_id = func_count
             .checked_sub(1)
             .ok_or(AotError::UnsupportedGraph("empty function table"))?;
@@ -1797,28 +5930,27 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
         if let Some(out_slot) = output_region_slot {
             emit_sc_output_region_epilogue(&mut code, out_slot)?;
         } else {
-            // Write 8-byte scalar return value in `rax` via `[r15 + SC_SCRATCH_IO_OFF]` with EINTR/partial-write loop.
             emit_store_r15_reg(&mut code, 0, SC_SCRATCH_IO_OFF);
-            code.extend_from_slice(&[0x45, 0x31, 0xE4]); // xor r12d, r12d (written = 0)
+            code.extend_from_slice(&[0x45, 0x31, 0xE4]); // xor r12d, r12d
             let write_loop_pos = code.len();
-            code.extend_from_slice(&[0x49, 0x83, 0xFC, 0x08]); // cmp r12, 8
-            code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]); // jae done
+            code.extend_from_slice(&[0x49, 0x83, 0xFC, 0x08]);
+            code.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]);
             let done_patch = code.len() - 4;
-            code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1
-            code.extend_from_slice(&[0x49, 0x8D, 0xB7]); // lea rsi, [r15 + SC_SCRATCH_IO_OFF]
+            code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x49, 0x8D, 0xB7]);
             code.extend_from_slice(&SC_SCRATCH_IO_OFF.to_le_bytes());
-            code.extend_from_slice(&[0x4C, 0x01, 0xE6]); // add rsi, r12
-            code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
-            code.extend_from_slice(&[0x4C, 0x29, 0xE2]); // sub rdx, r12
-            code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (SYS_write)
-            code.extend_from_slice(&[0x0F, 0x05]); // syscall
-            code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]); // cmp rax, -4 (EINTR)
+            code.extend_from_slice(&[0x4C, 0x01, 0xE6]);
+            code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x4C, 0x29, 0xE2]);
+            code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            code.extend_from_slice(&[0x48, 0x83, 0xF8, 0xFC]);
             code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
             let eintr_patch = code.len() - 4;
             patch_rel32(&mut code, eintr_patch, write_loop_pos)?;
-            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x7F, 0x0C]); // test rax, rax; jg +12
+            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x7F, 0x0C]);
             emit_sys_exit(&mut code, AOT_EXIT_REGION_OOM as u32);
-            code.extend_from_slice(&[0x49, 0x01, 0xC4]); // add r12, rax
+            code.extend_from_slice(&[0x49, 0x01, 0xC4]);
             code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
             let back_patch = code.len() - 4;
             patch_rel32(&mut code, back_patch, write_loop_pos)?;
@@ -1826,961 +5958,81 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
             patch_rel32(&mut code, done_patch, done_pos)?;
             emit_sys_exit(&mut code, 0);
         }
-    } else {
-        // 1. Entry prologue: align stack to 32B, establish `rbp`, allocate 64 local slots + SSA slots.
-        // and rsp, -32
-        code.extend_from_slice(&[0x48, 0x83, 0xE4, 0xE0]);
-        // mov rbp, rsp
-        code.extend_from_slice(&[0x48, 0x89, 0xE5]);
 
-        let raw_frame = 528usize.saturating_add(node_count.saturating_mul(8));
-        let frame_bytes = u32::try_from(raw_frame.div_ceil(32) * 32)
-            .map_err(|_e| AotError::UnsupportedGraph("stack frame overflow"))?;
-        // sub rsp, frame_bytes
-        code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-        code.extend_from_slice(&frame_bytes.to_le_bytes());
+        // Shared out-of-line fail-closed stack/call-depth overflow stub (`exit(75)`).
+        let stack_overflow_stub = code.len();
+        emit_sys_exit(&mut code, AOT_EXIT_STACK_OVERFLOW as u32);
 
-        if has_any_region {
-            emit_sc_region_startup(&mut code, &regions, false)?;
-        }
-    }
-
-    let mut node_elem: Vec<ElemType> = if func_mode {
-        Vec::new()
-    } else {
-        vec![ElemType::I64; node_count]
-    };
-    let mut local_elem: [ElemType; 64] = [ElemType::I64; 64];
-    let mut ctrl_stack: Vec<AotCtrlFrame> = Vec::new();
-    let mut current_func_start: Option<usize> = None;
-    let mut pending_call_args: Option<(usize, Option<usize>)> = None;
-
-    for (abs_idx, frame) in program.nodes.iter().enumerate() {
-        let idx = if frame.opcode == Opcode::Func {
-            0
-        } else if let Some(fn_start) = current_func_start {
-            node_elem.push(ElemType::I64);
-            abs_idx.saturating_sub(fn_start)
-        } else {
-            abs_idx
-        };
-        let disp = sc_node_disp(idx);
-        let a_idx = frame.in_a as usize;
-        let b_idx = frame.in_b as usize;
-        let disp_a = sc_node_disp(a_idx);
-        let disp_b = sc_node_disp(b_idx);
-
-        match frame.opcode {
-            Opcode::ConstF64 => {
-                let bits = frame.decode_const_f64().to_bits();
-                // movabs rax, bits
-                code.extend_from_slice(&[0x48, 0xB8]);
-                code.extend_from_slice(&bits.to_le_bytes());
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::ConstI64 => {
-                #[expect(
-                    clippy::cast_sign_loss,
-                    reason = "two's-complement i64 immediate encoded as exact 64-bit movabs pattern"
-                )]
-                let bits = frame.decode_const_i64() as u64;
-                // movabs rax, bits
-                code.extend_from_slice(&[0x48, 0xB8]);
-                code.extend_from_slice(&bits.to_le_bytes());
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::I64;
-                }
-            }
-            Opcode::LocalGet => {
-                let slot = frame.in_a;
-                emit_mov_rax_rbp(&mut code, sc_local_disp(slot));
-                emit_mov_rbp_rax(&mut code, disp);
-                let el_val = local_elem
-                    .get(slot as usize)
-                    .copied()
-                    .unwrap_or(frame.type_lane.elem);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = el_val;
-                }
-            }
-            Opcode::LocalSet => {
-                let slot = frame.in_a;
-                emit_mov_rax_rbp(&mut code, disp_b);
-                emit_mov_rbp_rax(&mut code, sc_local_disp(slot));
-                emit_mov_rbp_rax(&mut code, disp);
-                let el_val = node_elem
-                    .get(b_idx)
-                    .copied()
-                    .unwrap_or(frame.type_lane.elem);
-                if let Some(le) = local_elem.get_mut(slot as usize) {
-                    *le = el_val;
-                }
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = el_val;
-                }
-            }
-            Opcode::Add | Opcode::Sub | Opcode::Mul => {
-                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
-                if elem_a == ElemType::I64 {
-                    emit_mov_rax_rbp(&mut code, disp_a);
-                    match frame.opcode {
-                        Opcode::Add => {
-                            // add rax, [rbp + disp_b]
-                            code.extend_from_slice(&[0x48, 0x03, 0x85]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                        }
-                        Opcode::Sub => {
-                            // sub rax, [rbp + disp_b]
-                            code.extend_from_slice(&[0x48, 0x2B, 0x85]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                        }
-                        _ => {
-                            // imul rax, [rbp + disp_b]
-                            code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0x85]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                        }
-                    }
-                    emit_mov_rbp_rax(&mut code, disp);
-                    if let Some(el) = node_elem.get_mut(idx) {
-                        *el = ElemType::I64;
-                    }
-                } else if elem_a == ElemType::U8 {
-                    // mov eax, [rbp + disp_a]
-                    code.extend_from_slice(&[0x8B, 0x85]);
-                    code.extend_from_slice(&disp_a.to_le_bytes());
-                    match frame.opcode {
-                        Opcode::Add => {
-                            // add eax, [rbp + disp_b]
-                            code.extend_from_slice(&[0x03, 0x85]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                        }
-                        Opcode::Sub => {
-                            // sub eax, [rbp + disp_b]
-                            code.extend_from_slice(&[0x2B, 0x85]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                        }
-                        _ => {
-                            // imul eax, [rbp + disp_b]
-                            code.extend_from_slice(&[0x0F, 0xAF, 0x85]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                        }
-                    }
-                    // and eax, 0xFF (zero-extends into rax)
-                    code.extend_from_slice(&[0x25, 0xFF, 0x00, 0x00, 0x00]);
-                    emit_mov_rbp_rax(&mut code, disp);
-                    if let Some(el) = node_elem.get_mut(idx) {
-                        *el = ElemType::U8;
-                    }
-                } else {
-                    emit_load_xmm0_rbp(&mut code, disp_a);
-                    let op_byte = match frame.opcode {
-                        Opcode::Add => 0x58,
-                        Opcode::Sub => 0x5C,
-                        _ => 0x59,
-                    };
-                    code.extend_from_slice(&[0xF2, 0x0F, op_byte, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_xmm0_rbp(&mut code, disp);
-                    if let Some(el) = node_elem.get_mut(idx) {
-                        *el = ElemType::F64;
-                    }
-                }
-            }
-            Opcode::Div => {
-                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
-                if matches!(elem_a, ElemType::I64 | ElemType::U8) {
-                    emit_sc_int_div_rem(
-                        &mut code,
-                        elem_a == ElemType::U8,
-                        false,
-                        disp_a,
-                        disp_b,
-                        disp,
-                    )?;
-                    if let Some(el) = node_elem.get_mut(idx) {
-                        *el = elem_a;
-                    }
-                } else {
-                    emit_load_xmm0_rbp(&mut code, disp_a);
-                    code.extend_from_slice(&[0xF2, 0x0F, 0x5E, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    emit_store_xmm0_rbp(&mut code, disp);
-                    if let Some(el) = node_elem.get_mut(idx) {
-                        *el = ElemType::F64;
-                    }
-                }
-            }
-            Opcode::Rem => {
-                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
-                emit_sc_int_div_rem(
-                    &mut code,
-                    elem_a == ElemType::U8,
-                    true,
-                    disp_a,
-                    disp_b,
-                    disp,
-                )?;
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = elem_a;
-                }
-            }
-            Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
-                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
-                emit_mov_rax_rbp(&mut code, disp_a);
-                let op_byte = match frame.opcode {
-                    Opcode::BitAnd => 0x23,
-                    Opcode::BitOr => 0x0B,
-                    _ => 0x33,
-                };
-                code.extend_from_slice(&[0x48, op_byte, 0x85]);
-                code.extend_from_slice(&disp_b.to_le_bytes());
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = elem_a;
-                }
-            }
-            Opcode::Shl | Opcode::ShrU | Opcode::ShrS => {
-                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
-                if elem_a == ElemType::U8 {
-                    // mov eax, [rbp + disp_a]; mov ecx, [rbp + disp_b]; and ecx, 7
-                    code.extend_from_slice(&[0x8B, 0x85]);
-                    code.extend_from_slice(&disp_a.to_le_bytes());
-                    code.extend_from_slice(&[0x8B, 0x8D]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    code.extend_from_slice(&[0x83, 0xE1, 0x07]);
-                    if frame.opcode == Opcode::Shl {
-                        // shl eax, cl; and eax, 0xFF
-                        code.extend_from_slice(&[0xD3, 0xE0, 0x25, 0xFF, 0x00, 0x00, 0x00]);
-                    } else {
-                        // shr eax, cl
-                        code.extend_from_slice(&[0xD3, 0xE8]);
-                    }
-                    emit_mov_rbp_rax(&mut code, disp);
-                } else {
-                    emit_mov_rax_rbp(&mut code, disp_a);
-                    // mov rcx, [rbp + disp_b] (x86_64 64-bit shift masks cl & 63 in hardware)
-                    code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    let shift_modrm = match frame.opcode {
-                        Opcode::Shl => 0xE0,  // shl rax, cl
-                        Opcode::ShrU => 0xE8, // shr rax, cl
-                        _ => 0xF8,            // sar rax, cl
-                    };
-                    code.extend_from_slice(&[0x48, 0xD3, shift_modrm]);
-                    emit_mov_rbp_rax(&mut code, disp);
-                }
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = elem_a;
-                }
-            }
-            Opcode::MaskNot => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                // xor eax, 1 (zero-extends 0/1 into rax)
-                code.extend_from_slice(&[0x83, 0xF0, 0x01]);
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::BoolMask;
-                }
-            }
-            Opcode::Cast => {
-                let src_elem = node_elem.get(a_idx).copied().unwrap_or(ElemType::I64);
-                let dst_elem = frame.type_lane.elem;
-                emit_sc_cast(&mut code, src_elem, dst_elem, disp_a, disp)?;
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = dst_elem;
-                }
-            }
-            Opcode::Min | Opcode::Max => {
-                emit_load_xmm0_rbp(&mut code, disp_a);
-                let op_byte = if frame.opcode == Opcode::Min {
-                    0x5D
-                } else {
-                    0x5F
-                };
-                code.extend_from_slice(&[0xF2, 0x0F, op_byte, 0x85]);
-                code.extend_from_slice(&disp_b.to_le_bytes());
-                emit_store_xmm0_rbp(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::Fma => {
-                let (in_b, in_c) = frame.decode_fma_bc();
-                let disp_b_fma = sc_node_disp(in_b as usize);
-                let disp_c_fma = sc_node_disp(in_c as usize);
-                emit_load_xmm0_rbp(&mut code, disp_a);
-                // movsd xmm1, [rbp + disp_b_fma]
-                code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
-                code.extend_from_slice(&disp_b_fma.to_le_bytes());
-                emit_vex_fma213_xmm_rm_rbp(&mut code, 0, 1, disp_c_fma);
-                emit_store_xmm0_rbp(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::Abs => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                // btr rax, 63
-                code.extend_from_slice(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]);
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::Sqrt => {
-                // sqrtsd xmm0, [rbp + disp_a]
-                code.extend_from_slice(&[0xF2, 0x0F, 0x51, 0x85]);
-                code.extend_from_slice(&disp_a.to_le_bytes());
-                emit_store_xmm0_rbp(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::Floor => {
-                emit_load_xmm0_rbp(&mut code, disp_a);
-                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x09]);
-                emit_store_xmm0_rbp(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::Ceil => {
-                emit_load_xmm0_rbp(&mut code, disp_a);
-                code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0A]);
-                emit_store_xmm0_rbp(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::Ln => {
-                emit_x87_ln_slot(&mut code, disp_a, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::Exp => {
-                emit_x87_exp_slot(&mut code, disp_a, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::F64;
-                }
-            }
-            Opcode::CmpGt | Opcode::CmpLt | Opcode::CmpEq => {
-                let elem_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
-                if elem_a == ElemType::I64 || elem_a == ElemType::U8 {
-                    emit_mov_rax_rbp(&mut code, disp_a);
-                    // cmp rax, [rbp + disp_b]
-                    code.extend_from_slice(&[0x48, 0x3B, 0x85]);
-                    code.extend_from_slice(&disp_b.to_le_bytes());
-                    let setcc = if elem_a == ElemType::U8 {
-                        match frame.opcode {
-                            Opcode::CmpGt => 0x97, // seta al (unsigned >)
-                            Opcode::CmpLt => 0x92, // setb al (unsigned <)
-                            _ => 0x94,             // sete al
-                        }
-                    } else {
-                        match frame.opcode {
-                            Opcode::CmpGt => 0x9F, // setg al (signed >)
-                            Opcode::CmpLt => 0x9C, // setl al (signed <)
-                            _ => 0x94,             // sete al
-                        }
-                    };
-                    code.extend_from_slice(&[0x0F, setcc, 0xC0]);
-                    // movzx eax, al
-                    code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
-                    emit_mov_rbp_rax(&mut code, disp);
-                } else {
-                    match frame.opcode {
-                        Opcode::CmpGt => {
-                            // b < a (ordered): xmm0 = b, xmm1 = a, cmpltsd xmm0, xmm1
-                            emit_load_xmm0_rbp(&mut code, disp_b);
-                            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
-                            code.extend_from_slice(&disp_a.to_le_bytes());
-                            code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
-                        }
-                        Opcode::CmpLt => {
-                            // a < b (ordered): xmm0 = a, xmm1 = b, cmpltsd xmm0, xmm1
-                            emit_load_xmm0_rbp(&mut code, disp_a);
-                            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                            code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x01]);
-                        }
-                        _ => {
-                            // a == b (ordered): xmm0 = a, xmm1 = b, cmpeqsd xmm0, xmm1
-                            emit_load_xmm0_rbp(&mut code, disp_a);
-                            code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x8D]);
-                            code.extend_from_slice(&disp_b.to_le_bytes());
-                            code.extend_from_slice(&[0xF2, 0x0F, 0xC2, 0xC1, 0x00]);
-                        }
-                    }
-                    // movq rax, xmm0
-                    code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]);
-                    // and eax, 1
-                    code.extend_from_slice(&[0x83, 0xE0, 0x01]);
-                    emit_mov_rbp_rax(&mut code, disp);
-                }
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::BoolMask;
-                }
-            }
-            Opcode::CmpLtU => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                // cmp rax, [rbp + disp_b]; setb al; movzx eax, al
-                code.extend_from_slice(&[0x48, 0x3B, 0x85]);
-                code.extend_from_slice(&disp_b.to_le_bytes());
-                code.extend_from_slice(&[0x0F, 0x92, 0xC0, 0x0F, 0xB6, 0xC0]);
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::BoolMask;
-                }
-            }
-            Opcode::MaskAnd | Opcode::MaskOr => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                let op_byte = if frame.opcode == Opcode::MaskAnd {
-                    0x23
-                } else {
-                    0x0B
-                };
-                code.extend_from_slice(&[0x48, op_byte, 0x85]);
-                code.extend_from_slice(&disp_b.to_le_bytes());
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::BoolMask;
-                }
-            }
-            Opcode::SelectZero => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                // neg rax (0 -> 0, 1 -> 0xFFFF_FFFF_FFFF_FFFF)
-                code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
-                // and rax, [rbp + disp_b]
-                code.extend_from_slice(&[0x48, 0x23, 0x85]);
-                code.extend_from_slice(&disp_b.to_le_bytes());
-                emit_mov_rbp_rax(&mut code, disp);
-                let el_b = node_elem.get(b_idx).copied().unwrap_or(ElemType::F64);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = el_b;
-                }
-            }
-            Opcode::RingEnqueue => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                emit_mov_rbp_rax(&mut code, disp);
-                let el_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = el_a;
-                }
-            }
-            Opcode::AssertContract => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                emit_mov_rbp_rax(&mut code, disp);
-                let el_a = node_elem.get(a_idx).copied().unwrap_or(ElemType::F64);
-                if el_a == ElemType::F64 {
-                    // movabs rdx, 0x7FF0_0000_0000_0000
-                    code.extend_from_slice(&[0x48, 0xBA]);
-                    code.extend_from_slice(&0x7FF0_0000_0000_0000_u64.to_le_bytes());
-                    // and rax, rdx
-                    code.extend_from_slice(&[0x48, 0x21, 0xD0]);
-                    // cmp rax, rdx
-                    code.extend_from_slice(&[0x48, 0x39, 0xD0]);
-                    // jne +12 (skip 12-byte SYS_exit(70))
-                    code.extend_from_slice(&[0x75, 0x0C]);
-                    emit_sys_exit(&mut code, AOT_EXIT_CONTRACT_FAILED as u32);
-                }
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = el_a;
-                }
-            }
-            Opcode::Block => {
-                ctrl_stack.push(AotCtrlFrame {
-                    kind: AotCtrlKind::Block,
-                    end_patches: Vec::new(),
-                });
-            }
-            Opcode::Loop => {
-                let bounded = if frame.proof_idx > 0 {
-                    let proof = program
-                        .proofs
-                        .get(usize::from(frame.proof_idx - 1))
-                        .ok_or(AotError::UnsupportedGraph("missing LoopBound proof"))?;
-                    // mov eax, bound_hi (zero-extends into rax)
-                    code.push(0xB8);
-                    code.extend_from_slice(&proof.bound_hi.to_le_bytes());
-                    emit_mov_rbp_rax(&mut code, disp);
-                    true
-                } else {
-                    false
-                };
-                let body_start_offset = code.len();
-                ctrl_stack.push(AotCtrlFrame {
-                    kind: AotCtrlKind::Loop {
-                        body_start_offset,
-                        loop_node_idx: idx,
-                        bounded,
-                    },
-                    end_patches: Vec::new(),
-                });
-            }
-            Opcode::If => {
-                emit_mov_rax_rbp(&mut code, disp_a);
-                // test rax, rax
-                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
-                // jz rel32 (patched to Else body or End)
-                code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-                let false_jump_patch = code.len() - 4;
-                ctrl_stack.push(AotCtrlFrame {
-                    kind: AotCtrlKind::If {
-                        if_node_idx: idx,
-                        false_jump_patch,
-                        has_else: false,
-                    },
-                    end_patches: Vec::new(),
-                });
-            }
-            Opcode::Else => {
-                let top = ctrl_stack
-                    .last_mut()
-                    .ok_or(AotError::UnsupportedGraph("Else without open If"))?;
-                let AotCtrlKind::If {
-                    if_node_idx,
-                    false_jump_patch,
-                    ref mut has_else,
-                } = top.kind
-                else {
-                    return Err(AotError::UnsupportedGraph("Else without matching If"));
-                };
-                if frame.in_b != 0 {
-                    emit_mov_rax_rbp(&mut code, disp_a);
-                    emit_mov_rbp_rax(&mut code, sc_node_disp(if_node_idx));
-                }
-                // jmp rel32 (from end of then-branch to End)
-                code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
-                top.end_patches.push(code.len() - 4);
-
-                let else_body_pos = code.len();
-                patch_rel32(&mut code, false_jump_patch, else_body_pos)?;
-                *has_else = true;
-            }
-            Opcode::End => {
-                let popped = ctrl_stack
-                    .pop()
-                    .ok_or(AotError::UnsupportedGraph("End without open block"))?;
-                match popped.kind {
-                    AotCtrlKind::Block | AotCtrlKind::Loop { .. } => {
-                        if frame.in_b != 0 {
-                            emit_mov_rax_rbp(&mut code, disp_a);
-                            emit_mov_rbp_rax(&mut code, disp);
-                            let el_res = node_elem
-                                .get(a_idx)
-                                .copied()
-                                .unwrap_or(frame.type_lane.elem);
-                            if let Some(el) = node_elem.get_mut(idx) {
-                                *el = el_res;
-                            }
-                        }
-                        let end_pos = code.len();
-                        for p in popped.end_patches {
-                            patch_rel32(&mut code, p, end_pos)?;
-                        }
-                    }
-                    AotCtrlKind::If {
-                        if_node_idx,
-                        false_jump_patch,
-                        has_else,
-                    } => {
-                        if has_else {
-                            if frame.in_b != 0 {
-                                emit_mov_rax_rbp(&mut code, disp_a);
-                                emit_mov_rbp_rax(&mut code, sc_node_disp(if_node_idx));
-                            }
-                            let join_pos = code.len();
-                            for p in popped.end_patches {
-                                patch_rel32(&mut code, p, join_pos)?;
-                            }
-                            if frame.in_b != 0 {
-                                emit_mov_rax_rbp(&mut code, sc_node_disp(if_node_idx));
-                                emit_mov_rbp_rax(&mut code, disp);
-                                let el_res = node_elem
-                                    .get(a_idx)
-                                    .copied()
-                                    .unwrap_or(frame.type_lane.elem);
-                                if let Some(el) = node_elem.get_mut(idx) {
-                                    *el = el_res;
-                                }
-                            }
-                        } else {
-                            let end_pos = code.len();
-                            patch_rel32(&mut code, false_jump_patch, end_pos)?;
-                            for p in popped.end_patches {
-                                patch_rel32(&mut code, p, end_pos)?;
-                            }
-                        }
-                    }
-                    AotCtrlKind::Func {
-                        func_start,
-                        units_add_patch,
-                        frame_sub_patch,
-                        epilogue_patches,
-                    } => {
-                        if frame.in_b != 0 {
-                            emit_mov_rax_rbp(&mut code, disp_a);
-                        }
-                        let epilogue_pos = code.len();
-                        for p in epilogue_patches {
-                            patch_rel32(&mut code, p, epilogue_pos)?;
-                        }
-                        let fn_node_count = abs_idx.saturating_sub(func_start).saturating_add(1);
-                        let fn_frame_units = func_frame_units(fn_node_count);
-                        let fn_raw_frame = 520usize.saturating_add(fn_node_count.saturating_mul(8));
-                        let fn_frame_bytes = u32::try_from(fn_raw_frame.div_ceil(16) * 16)
-                            .map_err(|_e| AotError::UnsupportedGraph("function frame overflow"))?;
-                        let units_dst = code.get_mut(units_add_patch..units_add_patch + 4).ok_or(
-                            AotError::UnsupportedGraph("function units patch out of bounds"),
-                        )?;
-                        units_dst.copy_from_slice(&fn_frame_units.to_le_bytes());
-                        let frame_dst = code.get_mut(frame_sub_patch..frame_sub_patch + 4).ok_or(
-                            AotError::UnsupportedGraph("function frame patch out of bounds"),
-                        )?;
-                        frame_dst.copy_from_slice(&fn_frame_bytes.to_le_bytes());
-                        // Epilogue (preserves `rax` return value):
-                        // dec [r15 + SC_CALL_DEPTH_OFF]
-                        emit_load_reg_r15(&mut code, 11, SC_CALL_DEPTH_OFF);
-                        code.extend_from_slice(&[0x49, 0xFF, 0xCB]); // dec r11
-                        emit_store_r15_reg(&mut code, 11, SC_CALL_DEPTH_OFF);
-                        // sub [r15 + SC_STACK_UNITS_OFF], fn_frame_units
-                        emit_load_reg_r15(&mut code, 11, SC_STACK_UNITS_OFF);
-                        code.extend_from_slice(&[0x49, 0x81, 0xEB]); // sub r11, imm32
-                        code.extend_from_slice(&fn_frame_units.to_le_bytes());
-                        emit_store_r15_reg(&mut code, 11, SC_STACK_UNITS_OFF);
-                        // mov rsp, rbp; pop rbp; ret
-                        code.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D, 0xC3]);
-                        current_func_start = None;
-                    }
-                }
-            }
-            Opcode::Br => {
-                let depth = frame.in_a as usize;
-                let pos = ctrl_stack
-                    .len()
-                    .checked_sub(1 + depth)
-                    .ok_or(AotError::UnsupportedGraph("Br depth overflow"))?;
-                let target = ctrl_stack
-                    .get_mut(pos)
-                    .ok_or(AotError::UnsupportedGraph("Br target missing"))?;
-                match target.kind {
-                    AotCtrlKind::Loop {
-                        body_start_offset,
-                        loop_node_idx,
-                        bounded,
-                    } => {
-                        emit_loop_backedge_jump(
-                            &mut code,
-                            body_start_offset,
-                            loop_node_idx,
-                            bounded,
-                        )?;
-                    }
-                    AotCtrlKind::Block | AotCtrlKind::If { .. } => {
-                        code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
-                        target.end_patches.push(code.len() - 4);
-                    }
-                    AotCtrlKind::Func { .. } => {
-                        return Err(AotError::UnsupportedGraph("Br cannot target Func"));
-                    }
-                }
-            }
-            Opcode::BrIf => {
-                let depth = frame.in_b as usize;
-                let pos = ctrl_stack
-                    .len()
-                    .checked_sub(1 + depth)
-                    .ok_or(AotError::UnsupportedGraph("BrIf depth overflow"))?;
-                emit_mov_rax_rbp(&mut code, disp_a);
-                // test rax, rax
-                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
-                let target = ctrl_stack
-                    .get_mut(pos)
-                    .ok_or(AotError::UnsupportedGraph("BrIf target missing"))?;
-                match target.kind {
-                    AotCtrlKind::Loop {
-                        body_start_offset,
-                        loop_node_idx,
-                        bounded,
-                    } => {
-                        if bounded {
-                            // jz skip_backedge (0F 84 <rel32>)
-                            code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-                            let skip_patch = code.len() - 4;
-                            emit_loop_backedge_jump(
-                                &mut code,
-                                body_start_offset,
-                                loop_node_idx,
-                                true,
-                            )?;
-                            let after_pos = code.len();
-                            patch_rel32(&mut code, skip_patch, after_pos)?;
-                        } else {
-                            // jnz rel32 -> body_start_offset
-                            code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-                            let patch_pos = code.len() - 4;
-                            patch_rel32(&mut code, patch_pos, body_start_offset)?;
-                        }
-                    }
-                    AotCtrlKind::Block | AotCtrlKind::If { .. } => {
-                        // jnz rel32 -> End
-                        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-                        target.end_patches.push(code.len() - 4);
-                    }
-                    AotCtrlKind::Func { .. } => {
-                        return Err(AotError::UnsupportedGraph("BrIf cannot target Func"));
-                    }
-                }
-            }
-            Opcode::RegionNew => {
-                let slot = frame.in_a as usize;
-                let decl = regions
-                    .get(slot)
-                    .and_then(|d| *d)
-                    .ok_or(AotError::UnsupportedGraph("undeclared RegionNew slot"))?;
-                emit_sc_region_new(&mut code, slot, decl, disp_b)?;
-            }
-            Opcode::RegionGrow => {
-                let slot = frame.in_a as usize;
-                let decl = regions
-                    .get(slot)
-                    .and_then(|d| *d)
-                    .ok_or(AotError::UnsupportedGraph("undeclared RegionGrow slot"))?;
-                emit_sc_region_grow(&mut code, slot, decl, disp_b, disp)?;
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::I64;
-                }
-            }
-            Opcode::RegionLen => {
-                let slot = frame.in_a as usize;
-                let off_len = sc_region_off(slot, 8);
-                emit_load_reg_r15(&mut code, 0, off_len);
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = ElemType::I64;
-                }
-            }
-            Opcode::RegionLoad => {
-                let slot = frame.in_a as usize;
-                let decl = regions
-                    .get(slot)
-                    .and_then(|d| *d)
-                    .ok_or(AotError::UnsupportedGraph("undeclared RegionLoad slot"))?;
-                let off_base = sc_region_off(slot, 0);
-                let off_len = sc_region_off(slot, 8);
-                // mov rcx, [rbp + disp_b]
-                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
-                code.extend_from_slice(&disp_b.to_le_bytes());
-                if frame.proof_idx == 0 {
-                    // Unsigned bounds check: cmp rcx, [r15 + off_len]; jb +12; exit(71)
-                    emit_cmp_reg_r15(&mut code, 1, off_len);
-                    code.extend_from_slice(&[0x72, 0x0C]);
-                    emit_sys_exit(&mut code, AOT_EXIT_GATHER_OOB as u32);
-                }
-                emit_load_reg_r15(&mut code, 2, off_base); // rdx = base_ptr
-                if decl.elem == ElemType::U8 {
-                    // movzx eax, byte ptr [rdx + rcx]
-                    code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x0A]);
-                } else {
-                    // mov rax, qword ptr [rdx + rcx*8]
-                    code.extend_from_slice(&[0x48, 0x8B, 0x04, 0xCA]);
-                }
-                emit_mov_rbp_rax(&mut code, disp);
-                if let Some(el) = node_elem.get_mut(idx) {
-                    *el = decl.elem;
-                }
-            }
-            Opcode::RegionStore => {
-                let slot = frame.in_a as usize;
-                let decl = regions
-                    .get(slot)
-                    .and_then(|d| *d)
-                    .ok_or(AotError::UnsupportedGraph("undeclared RegionStore slot"))?;
-                let (idx_node, val_node) = frame.decode_u16_pair();
-                let disp_idx = sc_node_disp(idx_node as usize);
-                let disp_val = sc_node_disp(val_node as usize);
-                let off_base = sc_region_off(slot, 0);
-                let off_len = sc_region_off(slot, 8);
-                // mov rcx, [rbp + disp_idx]
-                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
-                code.extend_from_slice(&disp_idx.to_le_bytes());
-                if frame.proof_idx == 0 {
-                    // Unsigned bounds check: cmp rcx, [r15 + off_len]; jb +12; exit(71)
-                    emit_cmp_reg_r15(&mut code, 1, off_len);
-                    code.extend_from_slice(&[0x72, 0x0C]);
-                    emit_sys_exit(&mut code, AOT_EXIT_GATHER_OOB as u32);
-                }
-                emit_load_reg_r15(&mut code, 2, off_base); // rdx = base_ptr
-                emit_mov_rax_rbp(&mut code, disp_val);
-                if decl.elem == ElemType::U8 {
-                    // mov byte ptr [rdx + rcx], al
-                    code.extend_from_slice(&[0x88, 0x04, 0x0A]);
-                } else {
-                    // mov qword ptr [rdx + rcx*8], rax
-                    code.extend_from_slice(&[0x48, 0x89, 0x04, 0xCA]);
-                }
-            }
-            Opcode::RegionFree => {
-                let slot = frame.in_a as usize;
-                emit_sc_region_free(&mut code, slot)?;
-            }
-            Opcode::Func => {
-                let func_id = frame.in_a as usize;
-                let sig = func_sigs
-                    .get(func_id)
-                    .copied()
-                    .flatten()
-                    .ok_or(AotError::UnsupportedGraph("missing FuncSig in AOT"))?;
-                if let Some(slot) = func_offsets.get_mut(func_id) {
-                    *slot = Some(code.len());
-                }
-                current_func_start = Some(abs_idx);
-                node_elem.clear();
-                node_elem.push(ElemType::I64);
-                local_elem = [ElemType::I64; 64];
-
-                // Prologue guard (uses ONLY `rax` and `r11`, preserving arg regs `rdi, rsi, rdx, rcx`):
-                // 1. live_call_depth + 1 <= MAX_CALL_DEPTH
-                emit_load_reg_r15(&mut code, 0, SC_CALL_DEPTH_OFF);
-                code.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
-                code.extend_from_slice(&[0x48, 0x3D]); // cmp rax, MAX_CALL_DEPTH
-                code.extend_from_slice(&MAX_CALL_DEPTH.to_le_bytes());
-                code.extend_from_slice(&[0x76, 0x0C]); // jbe +12
-                emit_sys_exit(&mut code, AOT_EXIT_STACK_OVERFLOW as u32);
-
-                // 2. live_stack_units + fn_frame_units <= MAX_STACK_UNITS
-                emit_load_reg_r15(&mut code, 11, SC_STACK_UNITS_OFF);
-                code.extend_from_slice(&[0x49, 0x81, 0xC3, 0x00, 0x00, 0x00, 0x00]); // add r11, imm32
-                let units_add_patch = code.len() - 4;
-                code.extend_from_slice(&[0x49, 0x81, 0xFB]); // cmp r11, MAX_STACK_UNITS
-                code.extend_from_slice(&MAX_STACK_UNITS.to_le_bytes());
-                code.extend_from_slice(&[0x76, 0x0C]); // jbe +12
-                emit_sys_exit(&mut code, AOT_EXIT_STACK_OVERFLOW as u32);
-
-                // 3. Commit updated depth & stack unit counters
-                emit_store_r15_reg(&mut code, 0, SC_CALL_DEPTH_OFF);
-                emit_store_r15_reg(&mut code, 11, SC_STACK_UNITS_OFF);
-
-                // 4. Push frame pointer & allocate activation frame
-                code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5]); // push rbp; mov rbp, rsp
-                code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x00, 0x00, 0x00]); // sub rsp, imm32
-                let frame_sub_patch = code.len() - 4;
-
-                // 5. Spill arguments `0..arity` from `rdi, rsi, rdx, rcx` into local slots `0..arity`
-                let arity = usize::from(sig.arity);
-                let param_modrm: [u8; 4] = [0xBD, 0xB5, 0x95, 0x8D];
-                for i in 0..arity {
-                    if let (Some(&modrm), Some(&param_el)) = (param_modrm.get(i), sig.params.get(i))
-                    {
-                        let ldisp = sc_local_disp(u32::try_from(i).unwrap_or(0));
-                        code.extend_from_slice(&[0x48, 0x89, modrm]);
-                        code.extend_from_slice(&ldisp.to_le_bytes());
-                        if let Some(le) = local_elem.get_mut(i) {
-                            *le = param_el;
-                        }
-                    }
-                }
-
-                ctrl_stack.push(AotCtrlFrame {
-                    kind: AotCtrlKind::Func {
-                        func_start: abs_idx,
-                        units_add_patch,
-                        frame_sub_patch,
-                        epilogue_patches: Vec::new(),
-                    },
-                    end_patches: Vec::new(),
-                });
-            }
-            Opcode::Return => {
-                if frame.in_a != 0 {
-                    emit_mov_rax_rbp(&mut code, disp_a);
-                }
-                code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
-                let patch_pos = code.len() - 4;
-                let func_ctrl = ctrl_stack
-                    .first_mut()
-                    .ok_or(AotError::UnsupportedGraph("Return outside Func"))?;
-                let AotCtrlKind::Func {
-                    ref mut epilogue_patches,
-                    ..
-                } = func_ctrl.kind
-                else {
-                    return Err(AotError::UnsupportedGraph("Return outside Func"));
-                };
-                epilogue_patches.push(patch_pos);
-            }
-            Opcode::CallArg => {
-                let a2 = frame.in_a as usize;
-                let a3 = if frame.in_b == u32::from(CALL_ARG_SENTINEL) {
-                    None
-                } else {
-                    Some(frame.in_b as usize)
-                };
-                pending_call_args = Some((a2, a3));
-            }
-            Opcode::Call => {
-                let target_id = frame.in_a as usize;
-                let callee_sig = func_sigs
-                    .get(target_id)
-                    .copied()
-                    .flatten()
-                    .ok_or(AotError::UnsupportedGraph("unknown callee FuncSig"))?;
-                let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
-                let sentinel = u32::from(CALL_ARG_SENTINEL);
-                if arg0_raw != sentinel {
-                    let d = sc_node_disp(arg0_raw as usize);
-                    // mov rdi, [rbp + d]
-                    code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
-                    code.extend_from_slice(&d.to_le_bytes());
-                }
-                if arg1_raw != sentinel {
-                    let d = sc_node_disp(arg1_raw as usize);
-                    // mov rsi, [rbp + d]
-                    code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
-                    code.extend_from_slice(&d.to_le_bytes());
-                }
-                if let Some((a2, a3_opt)) = pending_call_args.take() {
-                    let d2 = sc_node_disp(a2);
-                    // mov rdx, [rbp + d2]
-                    code.extend_from_slice(&[0x48, 0x8B, 0x95]);
-                    code.extend_from_slice(&d2.to_le_bytes());
-                    if let Some(a3) = a3_opt {
-                        let d3 = sc_node_disp(a3);
-                        // mov rcx, [rbp + d3]
-                        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
-                        code.extend_from_slice(&d3.to_le_bytes());
-                    }
-                }
-                code.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call rel32
-                call_patches.push((code.len() - 4, target_id));
-                if let Some(ret_elem) = callee_sig.ret_elem {
-                    emit_mov_rbp_rax(&mut code, disp);
-                    if let Some(el) = node_elem.get_mut(idx) {
-                        *el = ret_elem;
-                    }
-                }
-            }
-            Opcode::ArenaInput
-            | Opcode::ArenaSlice
-            | Opcode::ArenaMutate
-            | Opcode::FilterCompact
-            | Opcode::ReduceSum
-            | Opcode::ReduceMax
-            | Opcode::ReduceMin
-            | Opcode::Gather => {
+        // 5. Emit each `Func..End` unit independently with its own O(N) pre-scan and linear-scan allocation.
+        let mut cursor = 0usize;
+        while cursor < node_count {
+            let Some(hdr) = program.nodes.get(cursor) else {
+                break;
+            };
+            if hdr.opcode != Opcode::Func {
                 return Err(AotError::UnsupportedGraph(
-                    "columnar opcode in scalar structured control-flow AOT",
+                    "expected Func header at top level of function program",
                 ));
             }
+            let func_id = hdr.in_a as usize;
+            let sig = func_sigs
+                .get(func_id)
+                .copied()
+                .flatten()
+                .ok_or(AotError::UnsupportedGraph("missing FuncSig in AOT"))?;
+            // Find matching End of this Func scope in one scan.
+            let mut depth = 0usize;
+            let mut fn_end = cursor;
+            for (rel, nf) in program
+                .nodes
+                .get(cursor..)
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+            {
+                match nf.opcode {
+                    Opcode::Func | Opcode::Block | Opcode::Loop | Opcode::If => {
+                        depth += 1;
+                    }
+                    Opcode::End => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            fn_end = cursor + rel;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                return Err(AotError::UnsupportedGraph("unclosed Func scope in AOT"));
+            }
+            // Align each function entry to a 16-byte boundary (never executed padding between functions).
+            while (code.len() & 15) != 0 {
+                code.push(0x90);
+            }
+            if let Some(slot) = func_offsets.get_mut(func_id) {
+                *slot = Some(code.len());
+            }
+            let unit_slice = program
+                .nodes
+                .get(cursor..=fn_end)
+                .ok_or(AotError::UnsupportedGraph("Func slice out of bounds"))?;
+            sc_emit_unit(
+                &mut code,
+                program,
+                unit_slice,
+                &regions,
+                &func_sigs,
+                Some(sig),
+                output_region_slot,
+                Some(stack_overflow_stub),
+                &mut call_patches,
+                &mut scratch,
+            )?;
+            cursor = fn_end + 1;
         }
-    }
 
-    if func_mode {
         for (patch_pos, target_id) in call_patches {
             let target_offset = func_offsets
                 .get(target_id)
@@ -2792,32 +6044,68 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
         return Ok(code);
     }
 
-    if let Some(out_slot) = output_region_slot {
-        emit_sc_output_region_epilogue(&mut code, out_slot)?;
-    } else {
-        // Epilogue: write 8-byte output_node bit-pattern to stdout (`fd = 1`) and `SYS_exit(0)`.
-        emit_mov_rax_rbp(&mut code, sc_node_disp(program.output_node as usize));
-        emit_mov_rbp_rax(&mut code, SC_STDOUT_DISP);
-
-        // mov eax, 1 (SYS_write)
-        code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
-        // mov edi, 1 (STDOUT_FILENO)
-        code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
-        // lea rsi, [rbp + SC_STDOUT_DISP]
-        code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
-        code.extend_from_slice(&SC_STDOUT_DISP.to_le_bytes());
-        // mov edx, 8
-        code.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
-        // syscall
-        code.extend_from_slice(&[0x0F, 0x05]);
-
-        emit_sys_exit(&mut code, 0);
-    }
+    sc_emit_unit(
+        &mut code,
+        program,
+        &program.nodes,
+        &regions,
+        &func_sigs,
+        None,
+        output_region_slot,
+        None,
+        &mut call_patches,
+        &mut scratch,
+    )?;
     Ok(code)
 }
 
 // =========================================================================
-// Rul AOT x86_64 Register Contract (`RegisterContract`)
+// Rul AOT x86_64 Structured Scalar Register Contract (`v0-5-tc-core-4`)
+// =========================================================================
+// - Fixed Non-Allocatable Registers:
+//   * `rsp`: native stack pointer (private `8 * MAX_STACK_UNITS + 4096` mmap stack with bottom
+//     `PROT_NONE` guard page in function programs).
+//   * `rbp`: activation frame base pointer for unpinned locals, x87 scratch, and spill slots
+//     (omitted in zero-spill functions whose active locals are all pinned to registers).
+//   * `r15`: 4096-byte program-global descriptor page (`[0..2048)` = 64 x 32B region descriptors,
+//     `[2064..2072)` = scalar stdout / EOF probe scratch, `[2080..2136)` = callee-save spill area
+//     used only around `RegionNew`/`RegionGrow`/`RegionFree` syscalls).
+//   * `r14`: in function programs, packed remaining stack budget
+//     `((MAX_CALL_DEPTH - live_call_depth) << 22) | (MAX_STACK_UNITS - live_stack_units)`.
+//     Each `Func` prologue subtracts the 32-bit immediate `(1 << 22) | func_frame_units(node_count)`
+//     and fails closed with exit `75` if bit 63 (call-depth underflow) or bit 21 (stack-unit
+//     underflow) is set; each `Func` epilogue adds the same 32-bit delta back.
+//   * Functions starting with a pure early-return base-case `If` guard evaluate that guard before
+//     pushing callee-saved registers or allocating a frame, checking the packed `r14` budget via a
+//     non-mutating copy in `rax` into a shared out-of-line `exit(75)` stub; the remaining body is
+//     emitted into a reusable scratch buffer so the prologue has zero NOPs.
+// - Scratch Registers (clobberable within any single opcode emission):
+//   * GPR: `rax` (primary ALU scratch, function return value, `div`/`idiv` dividend/quotient, and
+//     transient home for immediately-consumed single-use commutative integer spills),
+//     `r11` (secondary scratch, region base pointer, syscall clobber).
+//   * SIMD: `xmm0`, `xmm1` (FP scratch and FMA/cast/comparison temporaries).
+// - Allocatable GPR Pool (10 registers for `I64`, `U8`, `BoolMask`, and loop fuel):
+//   * Caller-saved (4): `rdi` (arg0), `rsi` (arg1), `rdx` (arg2), `rcx` (arg3).
+//     Preferred first for non-call-spanning intervals so leaf functions avoid prologue pushes.
+//     `rdx` (`Div`/`Rem`) and `rcx` (dynamic shift) are preserved on the stack only if live.
+//   * Callee-saved (6): `rbx`, `r12`, `r13`, `r8`, `r9`, `r10`.
+//     Intervals spanning any `Call` / `RegionNew` / `RegionGrow` / `RegionFree` barrier take a
+//     callee-saved GPR or a frame spill slot. Each `Func` saves only the subset it assigns.
+// - Allocatable XMM Pool (14 registers for `F64`):
+//   * `xmm2 ..= xmm15` (all caller-saved across `Call` barriers; `F64` values spanning a barrier
+//     take an 8-byte frame spill slot).
+// - Frame Layout & Stack Budget Guarantee:
+//   * Below `rbp`: `[unpinned used locals] [optional 8B x87 scratch] [optional 8B stdout slot]
+//     [reused 8B spill slots]`.
+//   * Native frame size per activation (`ret_addr + saved_callee_gprs + saved_rbp + frame_bytes`)
+//     is strictly `<= 8 * func_frame_units(node_count) = 8 * (72 + node_count)` bytes.
+//   * Every SSA scalar and local has exactly one home for its lifetime (no interval splitting or
+//     join reconciliation). `ConstI64`/`ConstF64`/`Cast(ConstI64, U8)` materialize on demand;
+//     adjacent integer `Cmp*` (and `MaskNot(Cmp*)`) fuse into `cmp` + `jcc`; `BitAnd 0xFFFF_FFFF`
+//     lowers to a 32-bit zero-extending move; dying operands reuse their home in two-operand ops.
+//
+// =========================================================================
+// Rul AOT x86_64 Columnar AVX2 Register Contract (`RegisterContract`)
 // =========================================================================
 // - Fixed Frame / Loop Registers:
 //   * `rbp`: 32-byte aligned stack frame base pointer

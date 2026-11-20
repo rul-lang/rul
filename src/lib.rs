@@ -26,6 +26,8 @@ pub mod verifier;
 
 #[cfg(test)]
 mod tc_core3_tests;
+#[cfg(test)]
+mod tc_core4_tests;
 
 #[cfg(test)]
 mod tests {
