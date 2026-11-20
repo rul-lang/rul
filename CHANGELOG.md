@@ -2,7 +2,9 @@
 
 All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Tier execution engine, and `ELF64` AOT compiler are documented in this file.
 
-## [Unreleased] — Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`), `v0-5-tc-core-1` (Structured Control Flow & `CAP_DIVERGE`), `v0-5-tc-core-2` (`I64`/`U8` Arithmetic, Declared Regions & Byte I/O), `v0-5-tc-core-3` (Function Table, Recursion, Stack Budget & Brainf\*ck Proof) & `v0-5-tc-core-4` (Scalar Register Allocation & Performance Gate)
+## [0.5.0] — 2026-11-20
+
+Milestone 1 (**Turing-Complete Core**: `v0-5-tc-core-1` through `v0-5-tc-core-4`) plus Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), and Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`).
 
 ### Added (`v0-5-tc-core-4` — Single-Pass Structured Scalar Register Allocator & `v0.5` Performance Gate)
 - **Single-pass linear-scan scalar register allocator (`src/aot.rs`, `docs/rul_spec_v0.md` §4)**:

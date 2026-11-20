@@ -1,6 +1,6 @@
-# Rul Language & `.rl` Binary Execution Specification (v0.4 + v0.5 TC Core Slice 1)
+# Rul Language & `.rl` Binary Execution Specification (`v0.5.0` — 60-Opcode Turing-Complete Core)
 
-- **Status**: APPROVED (`v0.4.0` Production Baseline — Columnar Dataflow, Math & Vector Compute Domain), extended with the implemented `v0.5` TC Core slice 1 (structured control flow, typed scalar locals, and the `CAP_DIVERGE` termination policy). Later `v0.5` slices listed in [`ROADMAP.md`](../ROADMAP.md) are not part of this specification until they are implemented.
+- **Status**: APPROVED (`v0.5.0` Production Release — Columnar Dataflow, AVX2 Vector Math & Complete `v0.5` Turing-Complete Core across `v0-5-tc-core-1..4`: structured control flow, `CAP_DIVERGE`, `I64`/`U8` arithmetic, declared growable regions & byte I/O, modular function table with host-independent stack budget, and single-pass linear-scan scalar register allocation). Later milestones (`v0.6`–`v1.0`) listed in [`ROADMAP.md`](../ROADMAP.md) are not part of this specification until they are implemented.
 - **File Extensions**: `.rl` (128-bit binary graph), `.rls` (lossless flat symbolic IR)
 - **Core Equation**:
   $$\text{Artifact (}\mathtt{.rl}\text{)} = \text{Algorithm} + \text{Schedule} + \text{Proof}$$
