@@ -470,7 +470,9 @@ fn json_rpc_error(req_id: &str, code: i32, message: &str) -> String {
     format!(r#"{{"jsonrpc":"2.0","id":{req_id},"error":{{"code":{code},"message":"{escaped}"}}}}"#)
 }
 
-fn escape_json_string(input: &str) -> String {
+/// Escapes a string for safe inclusion inside a JSON string literal.
+#[must_use]
+pub fn escape_json_string(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 16);
     for ch in input.chars() {
         match ch {

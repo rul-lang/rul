@@ -21,6 +21,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use rul::aot::{
@@ -32,9 +33,10 @@ use rul::engine::{
     autotune_schedule, execute_tier0_interpreter, execute_tier0_interpreter_with_input,
     execute_tier2_fused, format_trace_table, trace_program, RuntimeValue,
 };
+use rul::mcp::escape_json_string;
 use rul::suite10::{load_rl_file, save_rl_file, MAX_RL_FILE_BYTES};
 use rul::transpiler::{assemble_rls, disassemble_rl, program_to_rls};
-use rul::verifier::{verify_program, VerifiedSummary};
+use rul::verifier::{verify_program, StaticCostSummary, VerifiedSummary};
 
 const RUL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -65,8 +67,8 @@ USAGE:
     rul <COMMAND> [ARGS]
 
 COMMANDS:
-    new <dir>           Create a new pure Rul project (rul.toml, src/main.rls, data/arena_0.bin)
-    check [file]        Run the single-pass O(N) static verifier (defaults to src/main.rls)
+    new <dir>             Create a new pure Rul project (rul.toml, src/main.rls, data/arena_0.bin)
+    check [--json] [file] Run the single-pass O(N) static verifier (defaults to src/main.rls)
     build [file]        Pack .rls -> build/*.rl and compile standalone x86_64 AVX2 ELF64 binary
     run [file]          Verify, execute (Tier 2 SIMD + ELF64 AOT), and print HardwareTelemetry
     autotune [file]     Autotune hardware ScheduleHint (AutoL1Tile, SimdStream, MultiCore)
@@ -211,21 +213,127 @@ fn cmd_new(project_arg: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_check(arg: Option<&str>) -> Result<(), String> {
-    let entry = resolve_entry_path(arg)?;
-    let t0 = Instant::now();
-    let prog = load_program(&entry)?;
-    let summary = verify_program(&prog).map_err(|e| e.to_string())?;
-    let elapsed_ns = t0.elapsed().as_nanos();
-    println!(
-        "[RUL CHECK OK] {} | Nodes={} | FusionGroups={} | OutputShape={:?} | ZeroBoundsChecks={} | Time={elapsed_ns} ns",
-        entry.display(),
+fn format_static_cost_inline(static_cost: Option<StaticCostSummary>) -> String {
+    match static_cost {
+        Some(c) => format!(
+            "Cost(steps={}, depth={}, stack_units={}, stack_bytes={}, region_bytes={})",
+            c.worst_case_steps,
+            c.max_call_depth,
+            c.max_stack_units,
+            c.max_stack_bytes,
+            c.max_region_bytes
+        ),
+        None => "Cost=unbounded(CAP_DIVERGE)".to_owned(),
+    }
+}
+
+fn format_check_json_ok(entry: &Path, summary: &VerifiedSummary, verify_ns: u128) -> String {
+    let file_esc = escape_json_string(&entry.display().to_string());
+    let shape_esc = escape_json_string(&format!("{:?}", summary.output_shape));
+    let elem_esc = escape_json_string(&format!("{:?}", summary.output_elem));
+    let cost_json = match summary.static_cost {
+        Some(c) => format!(
+            "{{\"worst_case_steps\":{},\"max_call_depth\":{},\"max_stack_units\":{},\"max_stack_bytes\":{},\"max_region_bytes\":{}}}",
+            c.worst_case_steps,
+            c.max_call_depth,
+            c.max_stack_units,
+            c.max_stack_bytes,
+            c.max_region_bytes
+        ),
+        None => "null".to_owned(),
+    };
+    format!(
+        "{{\"status\":\"ok\",\"file\":\"{file_esc}\",\"node_count\":{},\"fusion_groups\":{},\"output_shape\":\"{shape_esc}\",\"output_elem\":\"{elem_esc}\",\"zero_runtime_bounds_checks\":{},\"verify_ns\":{verify_ns},\"static_cost\":{cost_json}}}",
         summary.node_count,
         summary.fusion_groups,
-        summary.output_shape,
         summary.zero_runtime_bounds_checks
-    );
-    Ok(())
+    )
+}
+
+fn format_check_json_err(entry_label: &str, message: &str) -> String {
+    let file_esc = escape_json_string(entry_label);
+    let err_esc = escape_json_string(message);
+    format!("{{\"status\":\"error\",\"file\":\"{file_esc}\",\"error\":\"{err_esc}\"}}")
+}
+
+fn parse_check_args(args: &[String]) -> Result<(bool, Option<&str>), String> {
+    let mut json_mode = false;
+    let mut file_arg: Option<&str> = None;
+    for raw in args {
+        let a = raw.as_str();
+        if a == "--json" {
+            json_mode = true;
+        } else if a.starts_with('-') {
+            return Err(format!("unknown flag `{a}` for `rul check`"));
+        } else if file_arg.is_none() {
+            file_arg = Some(a);
+        } else {
+            return Err(format!("unexpected extra argument `{a}` for `rul check`"));
+        }
+    }
+    Ok((json_mode, file_arg))
+}
+
+fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
+    let json_hint = args.iter().any(|a| a == "--json");
+    let (json_mode, file_arg) = match parse_check_args(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            if json_hint {
+                println!("{}", format_check_json_err("", &e));
+                return Ok(ExitCode::FAILURE);
+            }
+            return Err(e);
+        }
+    };
+    let entry = match resolve_entry_path(file_arg) {
+        Ok(p) => p,
+        Err(e) => {
+            if json_mode {
+                println!("{}", format_check_json_err(file_arg.unwrap_or(""), &e));
+                return Ok(ExitCode::FAILURE);
+            }
+            return Err(e);
+        }
+    };
+    let entry_label = entry.display().to_string();
+    let t0 = Instant::now();
+    let prog = match load_program(&entry) {
+        Ok(p) => p,
+        Err(e) => {
+            if json_mode {
+                println!("{}", format_check_json_err(&entry_label, &e));
+                return Ok(ExitCode::FAILURE);
+            }
+            return Err(e);
+        }
+    };
+    let summary = match verify_program(&prog) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = e.to_string();
+            if json_mode {
+                println!("{}", format_check_json_err(&entry_label, &msg));
+                return Ok(ExitCode::FAILURE);
+            }
+            return Err(msg);
+        }
+    };
+    let elapsed_ns = t0.elapsed().as_nanos();
+    if json_mode {
+        println!("{}", format_check_json_ok(&entry, &summary, elapsed_ns));
+    } else {
+        let cost_inline = format_static_cost_inline(summary.static_cost);
+        println!(
+            "[RUL CHECK OK] {} | Nodes={} | FusionGroups={} | OutputShape={:?} | ZeroBoundsChecks={} | {cost_inline} | Time={elapsed_ns} ns",
+            entry.display(),
+            summary.node_count,
+            summary.fusion_groups,
+            summary.output_shape,
+            summary.zero_runtime_bounds_checks
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram, VerifiedSummary), String> {
@@ -572,55 +680,62 @@ fn cmd_trace(arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn main() -> Result<(), String> {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let Some(cmd) = args.get(1).map(String::as_str) else {
         print_help();
-        return Ok(());
+        return ExitCode::SUCCESS;
     };
 
-    match cmd {
+    let result: Result<ExitCode, String> = match cmd {
         "new" | "init" => {
             let dir = args
                 .get(2)
                 .map(String::as_str)
-                .ok_or_else(|| "usage: rul new <project_dir>".to_owned())?;
-            cmd_new(dir)
+                .ok_or_else(|| "usage: rul new <project_dir>".to_owned());
+            dir.and_then(cmd_new).map(|()| ExitCode::SUCCESS)
         }
-        "check" | "verify" => cmd_check(args.get(2).map(String::as_str)),
+        "check" | "verify" => cmd_check(args.get(2..).unwrap_or(&[])),
         "build" | "compile" => {
-            let _ = cmd_build(args.get(2).map(String::as_str))?;
-            Ok(())
+            cmd_build(args.get(2).map(String::as_str)).map(|_| ExitCode::SUCCESS)
         }
-        "run" => cmd_run(args.get(2).map(String::as_str)),
-        "autotune" => cmd_autotune(args.get(2).map(String::as_str)),
-        "trace" => cmd_trace(args.get(2).map(String::as_str)),
-        "inspect" => {
-            let path = resolve_entry_path(args.get(2).map(String::as_str))?;
-            let prog = load_program(&path)?;
-            print!("{}", disassemble_rl(&prog));
-            Ok(())
-        }
-        "decompile" => {
-            let path_str = args
-                .get(2)
-                .map(String::as_str)
-                .ok_or_else(|| "usage: rul decompile <file.rl>".to_owned())?;
-            let prog = load_rl_file(path_str).map_err(|e| e.to_string())?;
-            print!("{}", program_to_rls(&prog));
-            Ok(())
-        }
+        "run" => cmd_run(args.get(2).map(String::as_str)).map(|()| ExitCode::SUCCESS),
+        "autotune" => cmd_autotune(args.get(2).map(String::as_str)).map(|()| ExitCode::SUCCESS),
+        "trace" => cmd_trace(args.get(2).map(String::as_str)).map(|()| ExitCode::SUCCESS),
+        "inspect" => resolve_entry_path(args.get(2).map(String::as_str))
+            .and_then(|path| load_program(&path))
+            .map(|prog| {
+                print!("{}", disassemble_rl(&prog));
+                ExitCode::SUCCESS
+            }),
+        "decompile" => args
+            .get(2)
+            .map(String::as_str)
+            .ok_or_else(|| "usage: rul decompile <file.rl>".to_owned())
+            .and_then(|path_str| load_rl_file(path_str).map_err(|e| e.to_string()))
+            .map(|prog| {
+                print!("{}", program_to_rls(&prog));
+                ExitCode::SUCCESS
+            }),
         "version" | "--version" | "-V" => {
             println!("rul {RUL_VERSION} (128-bit schedule- and proof-carrying binary toolchain)");
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         "help" | "--help" | "-h" => {
             print_help();
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         other => Err(format!(
             "unknown subcommand `{other}` (run `rul help` for available commands)"
         )),
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            ExitCode::FAILURE
+        }
     }
 }
 

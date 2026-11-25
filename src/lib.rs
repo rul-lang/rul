@@ -28,6 +28,8 @@ pub mod verifier;
 mod tc_core3_tests;
 #[cfg(test)]
 mod tc_core4_tests;
+#[cfg(test)]
+mod v06_ownership_tests;
 
 #[cfg(test)]
 mod tests {
