@@ -26,6 +26,8 @@ fn verify_rls(src: &str) -> Result<crate::verifier::VerifiedSummary, VerifyError
             proofs: Vec::new(),
             nodes: Vec::new(),
             output_node: 0,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         }
     });
     assert!(
@@ -756,6 +758,8 @@ output $out
             proofs: Vec::new(),
             nodes,
             output_node: 1,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         }
     };
 
@@ -867,6 +871,8 @@ output $out
         proofs: Vec::new(),
         nodes: nested_nodes,
         output_node: 1,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     let (_, nested_work) =
         verify_program_with_join_work(&nested_prog).map_err(|e| e.to_string())?;
@@ -957,6 +963,8 @@ output $out
         proofs: Vec::new(),
         nodes: inter_nodes,
         output_node: 1,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     let (_, inter_work) = verify_program_with_join_work(&inter_prog).map_err(|e| e.to_string())?;
     assert_eq!(inter_work, (2 * d_nest) as u64);
@@ -1052,6 +1060,8 @@ output $out
         proofs: Vec::new(),
         nodes: nodes_b,
         output_node: 0,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     let n_plus_a_b = (prog_b.nodes.len() + prog_b.arenas.len()) as u64;
     let t_b = std::time::Instant::now();
@@ -1162,6 +1172,8 @@ output $out
         proofs: Vec::new(),
         nodes: nodes_c,
         output_node: 0,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     let n_plus_a_c = (prog_c.nodes.len() + prog_c.arenas.len()) as u64;
     let t_c = std::time::Instant::now();
@@ -1336,6 +1348,8 @@ output $out
             proofs: Vec::new(),
             nodes: nodes_f,
             output_node: 0,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         }
     };
     let prog_f_ok = build_shape_f(4_000, 4_000, None);

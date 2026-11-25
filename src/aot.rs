@@ -40,6 +40,8 @@ pub const AOT_EXIT_CAST_ERR: i32 = 73;
 pub const AOT_EXIT_REGION_OOM: i32 = 74;
 /// Exit status code emitted by the standalone ELF binary when call depth (`MAX_CALL_DEPTH`) or stack budget (`MAX_STACK_UNITS`) is exceeded.
 pub const AOT_EXIT_STACK_OVERFLOW: i32 = 75;
+/// Exit status code emitted by the standalone ELF binary when `CallIndirect` index is out of range (`< 0` or `>= entry_count`).
+pub const AOT_EXIT_INDIRECT_CALL_OOB: i32 = 76;
 
 /// Report returned after compiling a `.rl` program into a standalone native executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +81,8 @@ pub enum AotError {
     RegionAllocationFailed,
     /// Call depth (`MAX_CALL_DEPTH`) or stack budget (`MAX_STACK_UNITS`) exceeded by the native binary (`exit 75`).
     StackOverflow,
+    /// `CallIndirect` table index out-of-bounds detected by the native binary (`exit 76`).
+    IndirectCallOutOfBounds,
     /// Native binary exited with a non-zero status code or invalid output.
     ExecutionFailed(String),
 }
@@ -123,6 +127,12 @@ impl fmt::Display for AotError {
                 write!(
                     f,
                     "AOT native binary exceeded call depth or stack budget guard (exit 75)"
+                )
+            }
+            Self::IndirectCallOutOfBounds => {
+                write!(
+                    f,
+                    "AOT native binary detected out-of-bounds CallIndirect table index (exit 76)"
                 )
             }
             Self::ExecutionFailed(msg) => write!(f, "AOT native execution failed: {msg}"),
@@ -574,7 +584,11 @@ pub fn compile_to_elf64_bytes(
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
-            | Opcode::CallArg => {
+            | Opcode::CallArg
+            | Opcode::ConstDataLen
+            | Opcode::ConstDataLoad
+            | Opcode::BrTable
+            | Opcode::CallIndirect => {
                 return Err(AotError::UnsupportedGraph(
                     "structured control-flow or region opcode reached columnar AOT pipeline",
                 ));
@@ -711,7 +725,11 @@ pub fn compile_to_elf64_bytes(
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
-            | Opcode::CallArg => {}
+            | Opcode::CallArg
+            | Opcode::ConstDataLen
+            | Opcode::ConstDataLoad
+            | Opcode::BrTable
+            | Opcode::CallIndirect => {}
         }
     }
 
@@ -947,6 +965,7 @@ pub fn run_compiled_structured_executable(
             Some(AOT_EXIT_CAST_ERR) => return Err(AotError::CastOutOfRange),
             Some(AOT_EXIT_REGION_OOM) => return Err(AotError::RegionAllocationFailed),
             Some(AOT_EXIT_STACK_OVERFLOW) => return Err(AotError::StackOverflow),
+            Some(AOT_EXIT_INDIRECT_CALL_OOB) => return Err(AotError::IndirectCallOutOfBounds),
             other => {
                 return Err(AotError::ExecutionFailed(format!(
                     "standalone binary exited with status {other:?}"
@@ -1159,6 +1178,37 @@ enum AotCtrlKind {
 struct AotCtrlFrame {
     kind: AotCtrlKind,
     end_patches: Vec<usize>,
+    table_patches: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AotConstSeg {
+    offset: u32,
+    len: u32,
+}
+
+#[derive(Debug, Clone)]
+struct AotBrTable {
+    default_depth: usize,
+    case_depths: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct AotCallTable {
+    sig: FuncSigInfo,
+    func_ids: Vec<usize>,
+}
+
+struct AotDispatchTables {
+    const_segs: Vec<AotConstSeg>,
+    br_tables: Vec<AotBrTable>,
+    call_tables: Vec<AotCallTable>,
+}
+
+struct AotPatchLists {
+    call_patches: Vec<(usize, usize)>,
+    call_table_patches: Vec<(usize, usize)>,
+    rodata_patches: Vec<(usize, u32)>,
 }
 
 struct ScUnitScratch {
@@ -1349,6 +1399,13 @@ impl ScUnitScratch {
     }
 }
 
+struct ScalarElfLayout {
+    elf: Vec<u8>,
+    code_offset: usize,
+    text_end_offset: usize,
+    rodata_segment: Option<(u64, u64)>,
+}
+
 fn compile_structured_to_elf64_bytes(
     program: &RulProgram,
     summary: &VerifiedSummary,
@@ -1374,12 +1431,22 @@ fn compile_structured_to_elf64_bytes(
         ));
     }
 
-    let mut elf = emit_x86_64_scalar_control_flow(program)?;
+    let ScalarElfLayout {
+        mut elf,
+        code_offset,
+        text_end_offset,
+        rodata_segment,
+    } = emit_x86_64_scalar_control_flow(program)?;
     let total_elf_size = elf.len();
-    let machine_code_bytes = total_elf_size.saturating_sub(ELF_CODE_OFFSET);
-    let mut hdr = Vec::with_capacity(ELF_CODE_OFFSET);
-    write_elf64_headers(&mut hdr, total_elf_size as u64);
-    if let Some(dst) = elf.get_mut(..ELF_CODE_OFFSET) {
+    let machine_code_bytes = text_end_offset.saturating_sub(code_offset);
+    let mut hdr = Vec::with_capacity(code_offset);
+    write_elf64_headers_ex(
+        &mut hdr,
+        code_offset,
+        text_end_offset as u64,
+        rodata_segment,
+    );
+    if let Some(dst) = elf.get_mut(..code_offset) {
         dst.copy_from_slice(&hdr);
     }
 
@@ -3012,6 +3079,7 @@ fn sc_analyze_unit(
     unit_nodes: &[crate::bytecode::NodeFrame],
     regions: &[Option<AotRegionDecl>; MAX_REGION_SLOTS],
     func_sigs: &[Option<FuncSigInfo>],
+    tables: &AotDispatchTables,
     cur_sig: Option<FuncSigInfo>,
     output_node_opt: Option<usize>,
     scratch: &mut ScUnitScratch,
@@ -3369,6 +3437,52 @@ fn sc_analyze_unit(
                 }
             }
             Opcode::Br => {}
+            Opcode::BrTable => {
+                record_use(scratch, a_idx, idx);
+            }
+            Opcode::ConstDataLen => {
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(ElemType::I64);
+                }
+            }
+            Opcode::ConstDataLoad => {
+                record_use(scratch, b_idx, idx);
+                if let Some(info) = scratch.nodes.get_mut(idx) {
+                    info.set_elem(frame.type_lane.elem);
+                }
+            }
+            Opcode::CallIndirect => {
+                let (table_id, index_node) = frame.decode_in_a_u16_pair();
+                let table = tables
+                    .call_tables
+                    .get(table_id as usize)
+                    .ok_or(AotError::UnsupportedGraph("unknown CallIndirect table"))?;
+                record_use(scratch, index_node as usize, idx);
+                let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+                let sentinel = u32::from(CALL_ARG_SENTINEL);
+                if arg0_raw != sentinel {
+                    record_use(scratch, arg0_raw as usize, idx);
+                }
+                if arg1_raw != sentinel {
+                    record_use(scratch, arg1_raw as usize, idx);
+                }
+                if let Some((a2, a3_opt)) = pending_call_args.take() {
+                    record_use(scratch, a2, idx);
+                    if let Some(a3) = a3_opt {
+                        record_use(scratch, a3, idx);
+                    }
+                }
+                if let Some(ret_elem) = table.sig.ret_elem {
+                    if let Some(info) = scratch.nodes.get_mut(idx) {
+                        info.set_elem(ret_elem);
+                    }
+                }
+                if !scratch.has_any_barrier {
+                    scratch.has_any_barrier = true;
+                    scratch.call_prefix.resize(len.saturating_add(1), 0);
+                }
+                barriers = barriers.saturating_add(1);
+            }
             Opcode::Return => {
                 if frame.in_a != 0 {
                     record_use(scratch, a_idx, idx);
@@ -3955,10 +4069,11 @@ fn sc_emit_unit(
     unit_nodes: &[crate::bytecode::NodeFrame],
     regions: &[Option<AotRegionDecl>; MAX_REGION_SLOTS],
     func_sigs: &[Option<FuncSigInfo>],
+    tables: &AotDispatchTables,
     cur_sig: Option<FuncSigInfo>,
     output_region_slot: Option<usize>,
     stack_overflow_stub: Option<usize>,
-    call_patches: &mut Vec<(usize, usize)>,
+    patches: &mut AotPatchLists,
     scratch: &mut ScUnitScratch,
 ) -> Result<(), AotError> {
     let func_mode = cur_sig.is_some();
@@ -3978,6 +4093,7 @@ fn sc_emit_unit(
         unit_nodes,
         regions,
         func_sigs,
+        tables,
         cur_sig,
         output_node_opt,
         scratch,
@@ -4121,7 +4237,9 @@ fn sc_emit_unit(
 
     let mut fn_body_buf = std::mem::take(&mut scratch.fn_body);
     fn_body_buf.clear();
-    let body_call_patch_start = call_patches.len();
+    let body_call_patch_start = patches.call_patches.len();
+    let body_call_table_patch_start = patches.call_table_patches.len();
+    let body_rodata_patch_start = patches.rodata_patches.len();
     let mut pending_call_args: Option<(usize, Option<usize>)> = None;
 
     {
@@ -4919,6 +5037,7 @@ fn sc_emit_unit(
                             end_node_idx: end_idx,
                         },
                         end_patches: Vec::new(),
+                        table_patches: Vec::new(),
                     });
                 }
                 Opcode::Loop => {
@@ -4954,6 +5073,7 @@ fn sc_emit_unit(
                             bounded,
                         },
                         end_patches: Vec::new(),
+                        table_patches: Vec::new(),
                     });
                 }
                 Opcode::If => {
@@ -5007,6 +5127,7 @@ fn sc_emit_unit(
                             has_else: false,
                         },
                         end_patches: Vec::new(),
+                        table_patches: Vec::new(),
                     });
                 }
                 Opcode::Else => {
@@ -5055,11 +5176,17 @@ fn sc_emit_unit(
                                 for p in popped.end_patches {
                                     patch_rel32(out, p, end_pos)?;
                                 }
+                                for (slot_pos, table_base) in popped.table_patches {
+                                    patch_table_rel32(out, slot_pos, table_base, end_pos)?;
+                                }
                             }
                             AotCtrlKind::Loop { .. } => {
                                 let end_pos = out.len();
                                 for p in popped.end_patches {
                                     patch_rel32(out, p, end_pos)?;
+                                }
+                                for (slot_pos, table_base) in popped.table_patches {
+                                    patch_table_rel32(out, slot_pos, table_base, end_pos)?;
                                 }
                             }
                             AotCtrlKind::If {
@@ -5081,11 +5208,17 @@ fn sc_emit_unit(
                                     for p in popped.end_patches {
                                         patch_rel32(out, p, join_pos)?;
                                     }
+                                    for (slot_pos, table_base) in popped.table_patches {
+                                        patch_table_rel32(out, slot_pos, table_base, join_pos)?;
+                                    }
                                 } else {
                                     let end_pos = out.len();
                                     patch_rel32(out, false_jump_patch, end_pos)?;
                                     for p in popped.end_patches {
                                         patch_rel32(out, p, end_pos)?;
+                                    }
+                                    for (slot_pos, table_base) in popped.table_patches {
+                                        patch_table_rel32(out, slot_pos, table_base, end_pos)?;
                                     }
                                 }
                             }
@@ -5217,6 +5350,222 @@ fn sc_emit_unit(
                         out.extend_from_slice(&[0x0F, jcc_true, 0x00, 0x00, 0x00, 0x00]);
                         target.end_patches.push(out.len() - 4);
                     }
+                }
+                Opcode::BrTable => {
+                    let br_table_id = frame.in_b as usize;
+                    let spec = tables
+                        .br_tables
+                        .get(br_table_id)
+                        .ok_or(AotError::UnsupportedGraph("unknown BrTable id"))?;
+                    let sel_elem = scratch.node_elem(a_idx);
+                    if sel_elem == ElemType::U8 {
+                        if let Some(r) = home_a.gpr_reg() {
+                            emit_movzx_gpr32_gpr8(out, REG_RAX, r);
+                        } else {
+                            emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                            emit_movzx_gpr32_gpr8(out, REG_RAX, REG_RAX);
+                        }
+                    } else {
+                        emit_load_home_into_gpr(out, REG_RAX, home_a, spill_base_slot);
+                    }
+
+                    let case_count = spec.case_depths.len();
+                    let case_count_i32 = i32::try_from(case_count)
+                        .map_err(|_e| AotError::UnsupportedGraph("BrTable case count overflow"))?;
+                    if let Ok(c8) = i8::try_from(case_count_i32) {
+                        out.extend_from_slice(&[0x48, 0x83, 0xF8, c8 as u8]); // cmp rax, imm8
+                    } else {
+                        out.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
+                        out.extend_from_slice(&case_count_i32.to_le_bytes());
+                    }
+
+                    // Range guard: if (rax as u64) >= case_count -> jump to default target.
+                    let def_pos = scratch
+                        .ctrl_stack
+                        .len()
+                        .checked_sub(1 + spec.default_depth)
+                        .ok_or(AotError::UnsupportedGraph("BrTable default depth overflow"))?;
+                    out.extend_from_slice(&[0x0F, 0x83, 0x00, 0x00, 0x00, 0x00]); // jae default
+                    let def_patch = out.len() - 4;
+                    let def_target = scratch
+                        .ctrl_stack
+                        .get_mut(def_pos)
+                        .ok_or(AotError::UnsupportedGraph("BrTable default target missing"))?;
+                    match def_target.kind {
+                        AotCtrlKind::Loop {
+                            body_start_offset, ..
+                        } => {
+                            patch_rel32(out, def_patch, body_start_offset)?;
+                        }
+                        AotCtrlKind::Block { .. } | AotCtrlKind::If { .. } => {
+                            def_target.end_patches.push(def_patch);
+                        }
+                    }
+
+                    // O(1) inline PC-relative i32 displacement jump table right after `jmp r11`:
+                    //   lea r11, [rip + 10]             ; 7 bytes -> table_base
+                    //   movsxd rax, dword [r11 + rax*4] ; 4 bytes
+                    //   add r11, rax                    ; 3 bytes
+                    //   jmp r11                         ; 3 bytes
+                    out.extend_from_slice(&[0x4C, 0x8D, 0x1D, 0x0A, 0x00, 0x00, 0x00]);
+                    out.extend_from_slice(&[0x49, 0x63, 0x04, 0x83]);
+                    out.extend_from_slice(&[0x49, 0x01, 0xC3]);
+                    out.extend_from_slice(&[0x41, 0xFF, 0xE3]);
+                    let table_base = out.len();
+
+                    for &depth in &spec.case_depths {
+                        let slot_pos = out.len();
+                        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                        let pos = scratch
+                            .ctrl_stack
+                            .len()
+                            .checked_sub(1 + depth)
+                            .ok_or(AotError::UnsupportedGraph("BrTable case depth overflow"))?;
+                        let target = scratch
+                            .ctrl_stack
+                            .get_mut(pos)
+                            .ok_or(AotError::UnsupportedGraph("BrTable case target missing"))?;
+                        match target.kind {
+                            AotCtrlKind::Loop {
+                                body_start_offset, ..
+                            } => {
+                                patch_table_rel32(out, slot_pos, table_base, body_start_offset)?;
+                            }
+                            AotCtrlKind::Block { .. } | AotCtrlKind::If { .. } => {
+                                target.table_patches.push((slot_pos, table_base));
+                            }
+                        }
+                    }
+                }
+                Opcode::ConstDataLen => {
+                    if uc > 0 {
+                        let seg =
+                            tables.const_segs.get(frame.in_a as usize).copied().ok_or(
+                                AotError::UnsupportedGraph("unknown ConstDataLen segment"),
+                            )?;
+                        let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            .unwrap_or_else(|| {
+                                alloc.alloc_home(idx, ElemType::I64, eff_lu, spans_bar, scratch)
+                            });
+                        let dst_r = dst.gpr_reg().unwrap_or(REG_RAX);
+                        emit_mov_gpr_imm64(out, dst_r, u64::from(seg.len));
+                        emit_store_gpr_into_home(out, dst, dst_r, spill_base_slot);
+                        scratch.set_home(idx, dst)?;
+                    }
+                }
+                Opcode::ConstDataLoad => {
+                    let seg = tables
+                        .const_segs
+                        .get(frame.in_a as usize)
+                        .copied()
+                        .ok_or(AotError::UnsupportedGraph("unknown ConstDataLoad segment"))?;
+                    let elem = frame.type_lane.elem;
+                    let elem_bytes: u64 = if elem == ElemType::I64 { 8 } else { 1 };
+                    let dst = if uc > 0 {
+                        direct_local_dst(unit_nodes, scratch, &local_home, idx).unwrap_or_else(
+                            || {
+                                if alloc.free_gpr_mask == 0
+                                    && can_use_transient_rax(
+                                        unit_nodes, scratch, idx, elem, uc, eff_lu, spans_bar,
+                                    )
+                                {
+                                    ScHome::AliasGpr(REG_RAX)
+                                } else {
+                                    alloc.alloc_home(idx, elem, eff_lu, spans_bar, scratch)
+                                }
+                            },
+                        )
+                    } else {
+                        ScHome::None
+                    };
+
+                    if u64::from(seg.len) < elem_bytes {
+                        emit_sys_exit(out, AOT_EXIT_GATHER_OOB as u32);
+                    } else {
+                        let const_proven_off = if frame.proof_idx != 0 {
+                            if let ScHome::ConstI64(c) = home_b {
+                                u32::try_from(c)
+                                    .ok()
+                                    .and_then(|off| seg.offset.checked_add(off))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(abs_const_off) = const_proven_off {
+                            if uc > 0 {
+                                // lea r11, [rip + disp32] -> seg_base + c
+                                out.extend_from_slice(&[0x4C, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]);
+                                patches.rodata_patches.push((out.len() - 4, abs_const_off));
+                                let dr = dst.gpr_reg().unwrap_or(REG_RAX);
+                                if elem == ElemType::U8 {
+                                    out.extend_from_slice(&[
+                                        sc_rex(false, dr, 0, REG_R11),
+                                        0x0F,
+                                        0xB6,
+                                        ((dr & 7) << 3) | 0x03,
+                                    ]);
+                                } else {
+                                    out.extend_from_slice(&[
+                                        sc_rex(true, dr, 0, REG_R11),
+                                        0x8B,
+                                        ((dr & 7) << 3) | 0x03,
+                                    ]);
+                                }
+                                emit_store_gpr_into_home(out, dst, dr, spill_base_slot);
+                            }
+                        } else {
+                            let r_idx = if let Some(r) = home_b.gpr_reg() {
+                                r
+                            } else {
+                                emit_load_home_into_gpr(out, REG_RAX, home_b, spill_base_slot);
+                                REG_RAX
+                            };
+                            if frame.proof_idx == 0 {
+                                let max_valid = i32::try_from(u64::from(seg.len) - elem_bytes)
+                                    .map_err(|_e| {
+                                        AotError::UnsupportedGraph("const_data segment too large")
+                                    })?;
+                                // cmp r_idx, max_valid (unsigned <= covers 0 <= idx && idx + elem_bytes <= seg.len)
+                                out.extend_from_slice(&[
+                                    sc_rex(true, 0, 0, r_idx),
+                                    0x81,
+                                    0xF8 | (r_idx & 7),
+                                ]);
+                                out.extend_from_slice(&max_valid.to_le_bytes());
+                                out.extend_from_slice(&[0x76, 0x0C]); // jbe +12
+                                emit_sys_exit(out, AOT_EXIT_GATHER_OOB as u32);
+                            }
+                            if uc > 0 {
+                                // lea r11, [rip + disp32] -> &const_data[seg.offset]
+                                out.extend_from_slice(&[0x4C, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]);
+                                patches.rodata_patches.push((out.len() - 4, seg.offset));
+                                let dr = dst.gpr_reg().unwrap_or(REG_RAX);
+                                if elem == ElemType::U8 {
+                                    // movzx dr32, byte [r11 + r_idx]
+                                    out.extend_from_slice(&[
+                                        sc_rex(false, dr, r_idx, REG_R11),
+                                        0x0F,
+                                        0xB6,
+                                        ((dr & 7) << 3) | 0x04,
+                                        ((r_idx & 7) << 3) | 0x03,
+                                    ]);
+                                } else {
+                                    // mov dr64, qword [r11 + r_idx] (byte-addressed, scale = 1)
+                                    out.extend_from_slice(&[
+                                        sc_rex(true, dr, r_idx, REG_R11),
+                                        0x8B,
+                                        ((dr & 7) << 3) | 0x04,
+                                        ((r_idx & 7) << 3) | 0x03,
+                                    ]);
+                                }
+                                emit_store_gpr_into_home(out, dst, dr, spill_base_slot);
+                            }
+                        }
+                    }
+                    scratch.set_home(idx, dst)?;
                 }
                 Opcode::RegionNew => {
                     let slot = frame.in_a as usize;
@@ -5543,7 +5892,7 @@ fn sc_emit_unit(
                     alloc.expire_at(idx, scratch);
 
                     out.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call rel32
-                    call_patches.push((out.len() - 4, target_id));
+                    patches.call_patches.push((out.len() - 4, target_id));
 
                     if let Some(ret_elem) = callee_sig.ret_elem {
                         if uc > 0 {
@@ -5677,6 +6026,93 @@ fn sc_emit_unit(
                                         alloc.alloc_home(idx, ret_elem, eff_lu, spans_bar, scratch)
                                     })
                             };
+                            emit_store_gpr_into_home(out, dst, REG_RAX, spill_base_slot);
+                            scratch.set_home(idx, dst)?;
+                        }
+                    }
+                    continue;
+                }
+                Opcode::CallIndirect => {
+                    let (table_id, index_node) = frame.decode_in_a_u16_pair();
+                    let table = tables
+                        .call_tables
+                        .get(table_id as usize)
+                        .ok_or(AotError::UnsupportedGraph("unknown CallIndirect table"))?;
+                    let idx_home = scratch.get_home(index_node as usize, unit_nodes);
+                    let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+                    let sentinel = u32::from(CALL_ARG_SENTINEL);
+                    let mut arg_homes: [Option<ScHome>; 4] = [None; 4];
+                    if arg0_raw != sentinel {
+                        arg_homes[0] = Some(scratch.get_home(arg0_raw as usize, unit_nodes));
+                    }
+                    if arg1_raw != sentinel {
+                        arg_homes[1] = Some(scratch.get_home(arg1_raw as usize, unit_nodes));
+                    }
+                    if let Some((a2, a3_opt)) = pending_call_args.take() {
+                        arg_homes[2] = Some(scratch.get_home(a2, unit_nodes));
+                        if let Some(a3) = a3_opt {
+                            arg_homes[3] = Some(scratch.get_home(a3, unit_nodes));
+                        }
+                    }
+
+                    // 1. Evaluate table index in `rax`, bounds-check BEFORE touching arg regs `rdi/rsi/rdx/rcx`,
+                    //    and compute target function address into `r11`.
+                    emit_load_home_into_gpr(out, REG_RAX, idx_home, spill_base_slot);
+                    let entry_count_i32 = i32::try_from(table.func_ids.len()).map_err(|_e| {
+                        AotError::UnsupportedGraph("CallTable entry count overflow")
+                    })?;
+                    if let Ok(c8) = i8::try_from(entry_count_i32) {
+                        out.extend_from_slice(&[0x48, 0x83, 0xF8, c8 as u8]); // cmp rax, imm8
+                    } else {
+                        out.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
+                        out.extend_from_slice(&entry_count_i32.to_le_bytes());
+                    }
+                    out.extend_from_slice(&[0x72, 0x0C]); // jb +12
+                    emit_sys_exit(out, AOT_EXIT_INDIRECT_CALL_OOB as u32);
+
+                    // lea r11, [rip + rel32] -> call_table_i base
+                    out.extend_from_slice(&[0x4C, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]);
+                    patches
+                        .call_table_patches
+                        .push((out.len() - 4, table_id as usize));
+                    // movsxd rax, dword [r11 + rax*4]; add r11, rax
+                    out.extend_from_slice(&[0x49, 0x63, 0x04, 0x83]);
+                    out.extend_from_slice(&[0x49, 0x01, 0xC3]);
+
+                    // 2. Materialize args 0..4 into `rdi`, `rsi`, `rdx`, `rcx` (never clobbers `r11`).
+                    let mut gpr_moves: [(u8, u8); 4] = [(0, 0); 4];
+                    let mut gm_len = 0usize;
+                    for (i, opt_h) in arg_homes.iter().enumerate() {
+                        if let (Some(&dst_arg), Some(h)) = (SC_ARG_GPRS.get(i), *opt_h) {
+                            if let Some(src_r) = h.gpr_reg() {
+                                if let Some(slot) = gpr_moves.get_mut(gm_len) {
+                                    *slot = (dst_arg, src_r);
+                                    gm_len += 1;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(slice) = gpr_moves.get(..gm_len) {
+                        emit_parallel_gpr_moves(out, slice);
+                    }
+                    for (i, opt_h) in arg_homes.iter().enumerate() {
+                        if let (Some(&dst_arg), Some(h)) = (SC_ARG_GPRS.get(i), *opt_h) {
+                            if h.gpr_reg().is_none() {
+                                emit_load_home_into_gpr(out, dst_arg, h, spill_base_slot);
+                            }
+                        }
+                    }
+
+                    // 3. Expire dying operands and invoke `call r11`.
+                    alloc.expire_at(idx, scratch);
+                    out.extend_from_slice(&[0x41, 0xFF, 0xD3]); // call r11
+
+                    if let Some(ret_elem) = table.sig.ret_elem {
+                        if uc > 0 {
+                            let dst = direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                                .unwrap_or_else(|| {
+                                    alloc.alloc_home(idx, ret_elem, eff_lu, spans_bar, scratch)
+                                });
                             emit_store_gpr_into_home(out, dst, REG_RAX, spill_base_slot);
                             scratch.set_home(idx, dst)?;
                         }
@@ -5832,8 +6268,21 @@ fn sc_emit_unit(
             let jp = code.len() - 4;
             patch_rel32(code, jp, stub_pos)?;
         }
-        if let Some(patches) = call_patches.get_mut(body_call_patch_start..) {
-            for (patch_pos, _) in patches {
+        if let Some(slice) = patches.call_patches.get_mut(body_call_patch_start..) {
+            for (patch_pos, _) in slice {
+                *patch_pos = patch_pos.saturating_add(body_base);
+            }
+        }
+        if let Some(slice) = patches
+            .call_table_patches
+            .get_mut(body_call_table_patch_start..)
+        {
+            for (patch_pos, _) in slice {
+                *patch_pos = patch_pos.saturating_add(body_base);
+            }
+        }
+        if let Some(slice) = patches.rodata_patches.get_mut(body_rodata_patch_start..) {
+            for (patch_pos, _) in slice {
                 *patch_pos = patch_pos.saturating_add(body_base);
             }
         }
@@ -5868,17 +6317,30 @@ fn sc_emit_unit(
     Ok(())
 }
 
-fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotError> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass scalar/function ELF64 codegen with PC-relative jump/call tables and PF_R const_data segment"
+)]
+fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<ScalarElfLayout, AotError> {
     let node_count = program.nodes.len();
     let func_mode = program.has_functions();
-    let mut code: Vec<u8> =
-        Vec::with_capacity(ELF_CODE_OFFSET + 256 + node_count.saturating_mul(16));
-    code.resize(ELF_CODE_OFFSET, 0);
+    let has_const_data = !program.const_data.is_empty();
+    let code_offset = if has_const_data {
+        ELF_EHDR_SIZE + 2 * ELF_PHDR_SIZE
+    } else {
+        ELF_CODE_OFFSET
+    };
+    let mut code: Vec<u8> = Vec::with_capacity(code_offset + 256 + node_count.saturating_mul(16));
+    code.resize(code_offset, 0);
 
     let mut regions: [Option<AotRegionDecl>; MAX_REGION_SLOTS] = [None; MAX_REGION_SLOTS];
     let mut has_any_region = false;
     let mut output_region_slot: Option<usize> = None;
     let mut func_sigs_raw: Vec<FuncSigInfo> = Vec::new();
+    let mut raw_const_segs: Vec<(usize, AotConstSeg)> = Vec::new();
+    let mut raw_br_tables: Vec<(usize, AotBrTable)> = Vec::new();
+    let mut raw_call_tables: Vec<(usize, Vec<usize>)> = Vec::new();
+
     for proof in &program.proofs {
         match proof.rule_kind {
             ProofRuleKind::RegionDecl => {
@@ -5906,6 +6368,49 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                     .ok_or(AotError::UnsupportedGraph("invalid FuncSig proof"))?;
                 func_sigs_raw.push(sig);
             }
+            ProofRuleKind::ConstDataSeg => {
+                raw_const_segs.push((
+                    usize::from(proof.target_arena),
+                    AotConstSeg {
+                        offset: proof.bound_lo,
+                        len: proof.bound_hi,
+                    },
+                ));
+            }
+            ProofRuleKind::BrTableSpec => {
+                let lo = proof.bound_lo as usize;
+                let count = proof.bound_hi as usize;
+                let slice = program
+                    .const_data
+                    .get(lo..lo.saturating_add(count.saturating_mul(4)))
+                    .ok_or(AotError::UnsupportedGraph("BrTableSpec payload OOB"))?;
+                let mut case_depths = Vec::with_capacity(count);
+                for chunk in slice.as_chunks::<4>().0 {
+                    let d = u32::from_le_bytes(*chunk);
+                    case_depths.push(d as usize);
+                }
+                raw_br_tables.push((
+                    proof.witness_node as usize,
+                    AotBrTable {
+                        default_depth: usize::from(proof.target_arena),
+                        case_depths,
+                    },
+                ));
+            }
+            ProofRuleKind::CallTable => {
+                let lo = proof.bound_lo as usize;
+                let count = proof.bound_hi as usize;
+                let slice = program
+                    .const_data
+                    .get(lo..lo.saturating_add(count.saturating_mul(4)))
+                    .ok_or(AotError::UnsupportedGraph("CallTable payload OOB"))?;
+                let mut func_ids = Vec::with_capacity(count);
+                for chunk in slice.as_chunks::<4>().0 {
+                    let fid = u32::from_le_bytes(*chunk);
+                    func_ids.push(fid as usize);
+                }
+                raw_call_tables.push((usize::from(proof.target_arena), func_ids));
+            }
             _ => {}
         }
     }
@@ -5917,8 +6422,62 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
             *slot = Some(sig);
         }
     }
+
+    let mut const_segs = vec![AotConstSeg { offset: 0, len: 0 }; raw_const_segs.len()];
+    for (id, seg) in raw_const_segs {
+        if let Some(slot) = const_segs.get_mut(id) {
+            *slot = seg;
+        }
+    }
+    let mut br_tables = vec![
+        AotBrTable {
+            default_depth: 0,
+            case_depths: Vec::new(),
+        };
+        raw_br_tables.len()
+    ];
+    for (id, bt) in raw_br_tables {
+        if let Some(slot) = br_tables.get_mut(id) {
+            *slot = bt;
+        }
+    }
+    let dummy_sig = FuncSigInfo {
+        func_id: 0,
+        arity: 0,
+        params: [ElemType::I64; 4],
+        ret_elem: None,
+    };
+    let mut call_tables = vec![
+        AotCallTable {
+            sig: dummy_sig,
+            func_ids: Vec::new(),
+        };
+        raw_call_tables.len()
+    ];
+    for (id, func_ids) in raw_call_tables {
+        let rep_sig = func_ids
+            .first()
+            .and_then(|&fid| func_sigs.get(fid).copied().flatten())
+            .ok_or(AotError::UnsupportedGraph("CallTable missing FuncSig"))?;
+        if let Some(slot) = call_tables.get_mut(id) {
+            *slot = AotCallTable {
+                sig: rep_sig,
+                func_ids,
+            };
+        }
+    }
+    let tables = AotDispatchTables {
+        const_segs,
+        br_tables,
+        call_tables,
+    };
+
     let mut func_offsets: Vec<Option<usize>> = vec![None; func_count];
-    let mut call_patches: Vec<(usize, usize)> = Vec::new();
+    let mut patches = AotPatchLists {
+        call_patches: Vec::new(),
+        call_table_patches: Vec::new(),
+        rodata_patches: Vec::new(),
+    };
     let mut scratch = ScUnitScratch::new();
 
     if func_mode {
@@ -5961,7 +6520,7 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
             .checked_sub(1)
             .ok_or(AotError::UnsupportedGraph("empty function table"))?;
         code.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]);
-        call_patches.push((code.len() - 4, entry_func_id));
+        patches.call_patches.push((code.len() - 4, entry_func_id));
 
         if let Some(out_slot) = output_region_slot {
             emit_sc_output_region_epilogue(&mut code, out_slot)?;
@@ -6060,16 +6619,39 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                 unit_slice,
                 &regions,
                 &func_sigs,
+                &tables,
                 Some(sig),
                 output_region_slot,
                 Some(stack_overflow_stub),
-                &mut call_patches,
+                &mut patches,
                 &mut scratch,
             )?;
             cursor = fn_end + 1;
         }
 
-        for (patch_pos, target_id) in call_patches {
+        // 6. Emit PC-relative `CallTable` i32 displacement tables in `.text` after all functions.
+        let mut call_table_offsets: Vec<usize> = Vec::with_capacity(tables.call_tables.len());
+        for ct in &tables.call_tables {
+            while (code.len() & 3) != 0 {
+                code.push(0x00);
+            }
+            let table_base = code.len();
+            call_table_offsets.push(table_base);
+            for &fid in &ct.func_ids {
+                let target_off = func_offsets
+                    .get(fid)
+                    .copied()
+                    .flatten()
+                    .ok_or(AotError::UnsupportedGraph("unresolved CallTable target"))?;
+                let rel = i32::try_from(
+                    i64::try_from(target_off).unwrap_or(0) - i64::try_from(table_base).unwrap_or(0),
+                )
+                .map_err(|_e| AotError::UnsupportedGraph("CallTable displacement exceeds rel32"))?;
+                code.extend_from_slice(&rel.to_le_bytes());
+            }
+        }
+
+        for (patch_pos, target_id) in patches.call_patches {
             let target_offset = func_offsets
                 .get(target_id)
                 .copied()
@@ -6077,22 +6659,52 @@ fn emit_x86_64_scalar_control_flow(program: &RulProgram) -> Result<Vec<u8>, AotE
                 .ok_or(AotError::UnsupportedGraph("unresolved Call target"))?;
             patch_rel32(&mut code, patch_pos, target_offset)?;
         }
-        return Ok(code);
+        for (patch_pos, table_id) in patches.call_table_patches {
+            let table_offset = call_table_offsets
+                .get(table_id)
+                .copied()
+                .ok_or(AotError::UnsupportedGraph("unresolved CallTable patch"))?;
+            patch_rel32(&mut code, patch_pos, table_offset)?;
+        }
+    } else {
+        sc_emit_unit(
+            &mut code,
+            program,
+            &program.nodes,
+            &regions,
+            &func_sigs,
+            &tables,
+            None,
+            output_region_slot,
+            None,
+            &mut patches,
+            &mut scratch,
+        )?;
     }
 
-    sc_emit_unit(
-        &mut code,
-        program,
-        &program.nodes,
-        &regions,
-        &func_sigs,
-        None,
-        output_region_slot,
-        None,
-        &mut call_patches,
-        &mut scratch,
-    )?;
-    Ok(code)
+    let text_end_offset = code.len();
+    let rodata_segment = if has_const_data {
+        let rodata_file_offset =
+            usize::try_from(align_up_4096(text_end_offset as u64)).map_err(|_e| {
+                AotError::UnsupportedGraph("const_data segment offset exceeds address space")
+            })?;
+        code.resize(rodata_file_offset, 0);
+        for (patch_pos, seg_offset) in patches.rodata_patches {
+            let target_pos = rodata_file_offset.saturating_add(seg_offset as usize);
+            patch_rel32(&mut code, patch_pos, target_pos)?;
+        }
+        code.extend_from_slice(&program.const_data);
+        Some((rodata_file_offset as u64, program.const_data.len() as u64))
+    } else {
+        None
+    };
+
+    Ok(ScalarElfLayout {
+        elf: code,
+        code_offset,
+        text_end_offset,
+        rodata_segment,
+    })
 }
 
 // =========================================================================
@@ -6499,7 +7111,11 @@ fn emit_x86_64_machine_code(
                 | Opcode::Func
                 | Opcode::Return
                 | Opcode::Call
-                | Opcode::CallArg => {}
+                | Opcode::CallArg
+                | Opcode::ConstDataLen
+                | Opcode::ConstDataLoad
+                | Opcode::BrTable
+                | Opcode::CallIndirect => {}
             }
         }
         for spec in reductions {
@@ -6854,7 +7470,11 @@ fn emit_x86_64_machine_code(
                 | Opcode::Func
                 | Opcode::Return
                 | Opcode::Call
-                | Opcode::CallArg => {}
+                | Opcode::CallArg
+                | Opcode::ConstDataLen
+                | Opcode::ConstDataLoad
+                | Opcode::BrTable
+                | Opcode::CallIndirect => {}
             }
         }
 
@@ -7240,7 +7860,11 @@ fn emit_x86_64_machine_code(
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
-            | Opcode::CallArg => {}
+            | Opcode::CallArg
+            | Opcode::ConstDataLen
+            | Opcode::ConstDataLoad
+            | Opcode::BrTable
+            | Opcode::CallIndirect => {}
         }
     }
 
@@ -8052,8 +8676,38 @@ fn patch_rel32(code: &mut [u8], patch_pos: usize, target_pos: usize) -> Result<(
     Ok(())
 }
 
+fn patch_table_rel32(
+    code: &mut [u8],
+    slot_pos: usize,
+    table_base: usize,
+    target_pos: usize,
+) -> Result<(), AotError> {
+    let base = i64::try_from(table_base).unwrap_or(0);
+    let target = i64::try_from(target_pos).unwrap_or(0);
+    let rel = i32::try_from(target - base)
+        .map_err(|_e| AotError::UnsupportedGraph("jump table displacement exceeds rel32"))?;
+    let bytes = rel.to_le_bytes();
+    let dst = code
+        .get_mut(slot_pos..slot_pos + 4)
+        .ok_or(AotError::UnsupportedGraph(
+            "invalid table rel32 patch offset",
+        ))?;
+    dst.copy_from_slice(&bytes);
+    Ok(())
+}
+
 fn write_elf64_headers(buf: &mut Vec<u8>, total_file_size: u64) {
-    let entry_vaddr = ELF_BASE_VADDR + (ELF_CODE_OFFSET as u64);
+    write_elf64_headers_ex(buf, ELF_CODE_OFFSET, total_file_size, None);
+}
+
+fn write_elf64_headers_ex(
+    buf: &mut Vec<u8>,
+    code_offset: usize,
+    text_filesz: u64,
+    rodata_segment: Option<(u64, u64)>,
+) {
+    let entry_vaddr = ELF_BASE_VADDR + (code_offset as u64);
+    let phnum: u16 = if rodata_segment.is_some() { 2 } else { 1 };
 
     // 1. Elf64_Ehdr (64 bytes)
     buf.extend_from_slice(&[
@@ -8073,20 +8727,33 @@ fn write_elf64_headers(buf: &mut Vec<u8>, total_file_size: u64) {
     buf.extend_from_slice(&0u32.to_le_bytes()); // e_flags = 0
     buf.extend_from_slice(&(ELF_EHDR_SIZE as u16).to_le_bytes()); // e_ehsize = 64
     buf.extend_from_slice(&(ELF_PHDR_SIZE as u16).to_le_bytes()); // e_phentsize = 56
-    buf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
+    buf.extend_from_slice(&phnum.to_le_bytes()); // e_phnum = 1 or 2
     buf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize = 0
     buf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum = 0
     buf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx = 0
 
-    // 2. Elf64_Phdr (56 bytes) — Single PT_LOAD segment (PF_R | PF_X = 5)
+    // 2. Elf64_Phdr #0 (56 bytes) — Executable `.text` + displacement tables (PF_R | PF_X = 5)
     buf.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD (1)
     buf.extend_from_slice(&5u32.to_le_bytes()); // p_flags = PF_R | PF_X (5)
     buf.extend_from_slice(&0u64.to_le_bytes()); // p_offset = 0
     buf.extend_from_slice(&ELF_BASE_VADDR.to_le_bytes()); // p_vaddr
     buf.extend_from_slice(&ELF_BASE_VADDR.to_le_bytes()); // p_paddr
-    buf.extend_from_slice(&total_file_size.to_le_bytes()); // p_filesz
-    buf.extend_from_slice(&total_file_size.to_le_bytes()); // p_memsz
+    buf.extend_from_slice(&text_filesz.to_le_bytes()); // p_filesz
+    buf.extend_from_slice(&text_filesz.to_le_bytes()); // p_memsz
     buf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align = 4096
+
+    // 3. Optional Elf64_Phdr #1 (56 bytes) — Read-only, non-executable `const_data` (PF_R = 4, W^X)
+    if let Some((rodata_offset, rodata_len)) = rodata_segment {
+        let rodata_vaddr = ELF_BASE_VADDR.saturating_add(rodata_offset);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD (1)
+        buf.extend_from_slice(&4u32.to_le_bytes()); // p_flags = PF_R (4, non-executable)
+        buf.extend_from_slice(&rodata_offset.to_le_bytes()); // p_offset (page-aligned)
+        buf.extend_from_slice(&rodata_vaddr.to_le_bytes()); // p_vaddr
+        buf.extend_from_slice(&rodata_vaddr.to_le_bytes()); // p_paddr
+        buf.extend_from_slice(&rodata_len.to_le_bytes()); // p_filesz
+        buf.extend_from_slice(&rodata_len.to_le_bytes()); // p_memsz
+        buf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align = 4096
+    }
 }
 
 fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
@@ -8121,7 +8788,11 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
-            | Opcode::CallArg => {}
+            | Opcode::CallArg
+            | Opcode::ConstDataLen
+            | Opcode::ConstDataLoad
+            | Opcode::BrTable
+            | Opcode::CallIndirect => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt

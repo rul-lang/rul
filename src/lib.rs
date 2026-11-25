@@ -29,6 +29,8 @@ mod tc_core3_tests;
 #[cfg(test)]
 mod tc_core4_tests;
 #[cfg(test)]
+mod v06_data_dispatch_tests;
+#[cfg(test)]
 mod v06_ownership_tests;
 
 #[cfg(test)]
@@ -95,6 +97,8 @@ mod tests {
             proofs: Vec::new(),
             nodes: Vec::new(),
             output_node: 0,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         })
     }
 
@@ -173,6 +177,8 @@ mod tests {
                 },
             ],
             output_node: 2,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         };
 
         let res = verify_program(&prog);
@@ -245,6 +251,8 @@ mod tests {
                 },
             ],
             output_node: 2,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         };
         let res = verify_program(&prog_mismatch);
         assert!(matches!(
@@ -291,6 +299,8 @@ mod tests {
                 },
             ],
             output_node: 1,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         };
         let res_proof = verify_program(&prog_bad_proof);
         assert!(matches!(
@@ -319,6 +329,8 @@ mod tests {
                 },
             ],
             output_node: 1,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         };
         let res = verify_program(&prog);
         assert_eq!(
@@ -560,6 +572,8 @@ mod tests {
                     },
                 ],
                 output_node: 1,
+                const_data: Vec::new(),
+                link_meta: Vec::new(),
             };
 
             let res = verify_program(&prog_forged);
@@ -1124,6 +1138,8 @@ mod tests {
                     },
                 ],
                 output_node: 1,
+                const_data: Vec::new(),
+                link_meta: Vec::new(),
             };
             assert_eq!(
                 verify_program(&prog_overflow).err().map(|d| d.kind),
@@ -3555,6 +3571,8 @@ output $c
             proofs,
             nodes,
             output_node: 0,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         };
         let t_linear = std::time::Instant::now();
         let large_sum = verify_program(&large_prog).map_err(|e| format!("{e:?}"))?;
@@ -4468,6 +4486,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4489,6 +4509,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4510,6 +4532,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4531,6 +4555,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4552,6 +4578,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4573,6 +4601,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4594,6 +4624,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4615,6 +4647,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
             (
@@ -4636,6 +4670,8 @@ output $out
                         },
                     ],
                     output_node: 1,
+                    const_data: Vec::new(),
+                    link_meta: Vec::new(),
                 },
             ),
         ];

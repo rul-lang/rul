@@ -961,6 +961,8 @@ output $f1
                 },
             ],
             output_node: 0,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         };
         assert!(matches!(
             verify_program(&p_bad_sig),
@@ -2226,6 +2228,8 @@ fn test_tc_core3_function_table_limits_and_layout() -> Result<(), String> {
         proofs,
         nodes,
         output_node: entry_start,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     verify_program(&big_prog).map_err(|e| format!("big_prog verify: {e:?}"))?;
     let expected_sum: i64 = call_targets.iter().map(|&t| i64::from(t) + 1).sum();
@@ -2259,6 +2263,8 @@ fn test_tc_core3_function_table_limits_and_layout() -> Result<(), String> {
             },
         ],
         output_node: 0,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
 
     // Case 1: Func with proof_idx != 0 -> rejected with InvalidFuncSig
@@ -2387,6 +2393,8 @@ fn test_tc_core3_function_table_limits_and_layout() -> Result<(), String> {
             },
         ],
         output_node: 0,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     assert!(
         matches!(
@@ -2448,6 +2456,8 @@ fn test_tc_core3_function_table_limits_and_layout() -> Result<(), String> {
             },
         ],
         output_node: 0,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     assert!(
         matches!(
@@ -2554,6 +2564,8 @@ fn test_tc_core3_function_table_limits_and_layout() -> Result<(), String> {
             proofs: vec![ProofEntry::func_sig(0, &[], Some(ElemType::I64))],
             nodes: fn_nodes,
             output_node: 0,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         }
     };
     let ok_max = build_single_func_len(MAX_FUNC_NODES);
@@ -2612,6 +2624,8 @@ fn test_tc_core3_function_table_limits_and_layout() -> Result<(), String> {
             },
         ],
         output_node: 0,
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     };
     assert!(
         matches!(

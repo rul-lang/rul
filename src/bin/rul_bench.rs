@@ -308,6 +308,8 @@ fn build_large_synthetic_graph(node_count: usize) -> RulProgram {
         proofs: Vec::new(),
         nodes,
         output_node: u32::try_from(node_count.saturating_sub(1)).unwrap_or(0),
+        const_data: Vec::new(),
+        link_meta: Vec::new(),
     }
 }
 
