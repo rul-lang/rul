@@ -14,8 +14,8 @@ use std::fmt;
 use crate::bytecode::{
     func_frame_units, ElemType, FuncSigInfo, NodeFrame, Opcode, ProofEntry, ProofRuleKind,
     RegionRole, RegionState, RulProgram, SimdWidth, TokenMode, TypeLane, CALL_ARG_SENTINEL,
-    CAP_DIVERGE, CAP_NET_RING, MAX_FUNC_NODES, MAX_REGION_BYTES, MAX_REGION_SLOTS,
-    MAX_SECTION_ITEMS,
+    CAP_DIVERGE, CAP_NET_RING, MAX_CONST_DATA_BYTES, MAX_FUNC_NODES, MAX_LINK_META_BYTES,
+    MAX_REGION_BYTES, MAX_REGION_SLOTS, MAX_SECTION_ITEMS, MAX_TABLE_ENTRIES,
 };
 
 /// Shape and static length inferred in $O(1)$ per node during the single-pass scan.
@@ -258,6 +258,22 @@ pub enum VerifyErrorKind {
         /// Reason the effect declaration was rejected.
         reason: &'static str,
     },
+    /// Invalid [`ProofRuleKind::ConstDataSeg`], [`ProofRuleKind::BrTableSpec`], or [`ProofRuleKind::CallTable`] metadata or `const_data` payload layout.
+    InvalidConstDataTable {
+        /// Reason the constant-data segment or dispatch table was rejected.
+        reason: &'static str,
+    },
+    /// `ConstDataLen` or `ConstDataLoad` referenced an undeclared constant-data segment identifier.
+    UnknownConstDataSeg(u32),
+    /// `BrTable` referenced an undeclared `br_table_id`.
+    UnknownBrTable(u32),
+    /// A `BrTableSpec` table identifier was referenced by more than one `BrTable` instruction.
+    DuplicateBrTableUse {
+        /// Reused `br_table_id`.
+        br_table_id: u32,
+    },
+    /// `CallIndirect` referenced an undeclared `CallTable` identifier.
+    UnknownCallTable(u32),
 }
 
 impl fmt::Display for VerifyDiagnostic {
@@ -351,6 +367,33 @@ struct FuncRegionContract {
     pre_leased: u64,
     post_owned: u64,
     post_leased: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConstDataSegInfo {
+    seg_id: u16,
+    offset: u32,
+    len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrTableInfo {
+    br_table_id: u32,
+    default_depth: u16,
+    offset: u32,
+    case_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallTableSummary {
+    table_id: u16,
+    rep_func_id: u16,
+    sig: FuncSigInfo,
+    contract: FuncRegionContract,
+    max_func_id: u32,
+    offset: u32,
+    entry_count: u32,
+    cost_summary: Option<(u64, u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,6 +779,10 @@ struct VerifierState {
     region_owned: u64,
     region_leased: u64,
     has_unproven_region_access: bool,
+    const_data_segs: Vec<ConstDataSegInfo>,
+    br_tables: Vec<BrTableInfo>,
+    br_table_used: Vec<bool>,
+    call_tables: Vec<CallTableSummary>,
     func_sigs: Vec<FuncSigInfo>,
     func_contracts: Vec<FuncRegionContract>,
     current_func: Option<ActiveFunc>,
@@ -1144,6 +1191,323 @@ fn scan_func_region_contracts(
     Ok(contracts)
 }
 
+fn func_sig_matches(a: FuncSigInfo, b: FuncSigInfo) -> bool {
+    a.arity == b.arity
+        && a.ret_elem == b.ret_elem
+        && (0..usize::from(a.arity)).all(|i| a.params.get(i) == b.params.get(i))
+}
+
+struct ScannedConstTables {
+    const_data_segs: Vec<ConstDataSegInfo>,
+    br_tables: Vec<BrTableInfo>,
+    call_tables: Vec<CallTableSummary>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass O(proofs + const_data) validation of non-overlapping constant segments, BrTableSpecs, and CallTables"
+)]
+fn scan_const_data_tables(
+    program: &RulProgram,
+    func_sigs: &[FuncSigInfo],
+    func_contracts: &[FuncRegionContract],
+) -> Result<ScannedConstTables, VerifyDiagnostic> {
+    if program.const_data.len() > (MAX_CONST_DATA_BYTES as usize) {
+        return Err(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidConstDataTable {
+                reason: "const_data section exceeds MAX_CONST_DATA_BYTES (8 MiB)",
+            },
+        });
+    }
+    if program.link_meta.len() > (MAX_LINK_META_BYTES as usize) {
+        return Err(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidConstDataTable {
+                reason: "link_meta section exceeds MAX_LINK_META_BYTES (2 MiB)",
+            },
+        });
+    }
+
+    let const_len = program.const_data.len() as u64;
+    let mut prev_end: u64 = 0;
+    let mut raw_segs: Vec<ConstDataSegInfo> = Vec::new();
+    let mut raw_br_tables: Vec<BrTableInfo> = Vec::new();
+    let mut raw_call_tables: Vec<CallTableSummary> = Vec::new();
+
+    for proof in &program.proofs {
+        match proof.rule_kind {
+            ProofRuleKind::ConstDataSeg => {
+                if proof.witness_node != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "ConstDataSeg requires witness_node == 0",
+                        },
+                    });
+                }
+                let lo = u64::from(proof.bound_lo);
+                let hi = lo.saturating_add(u64::from(proof.bound_hi));
+                if lo < prev_end || hi > const_len {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "ConstDataSeg range is out of bounds, unordered, or overlaps a previous table",
+                        },
+                    });
+                }
+                prev_end = hi;
+                raw_segs.push(ConstDataSegInfo {
+                    seg_id: proof.target_arena,
+                    offset: proof.bound_lo,
+                    len: proof.bound_hi,
+                });
+            }
+            ProofRuleKind::BrTableSpec => {
+                let case_count = proof.bound_hi;
+                if case_count == 0 || case_count > MAX_TABLE_ENTRIES {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "BrTableSpec case_count must be in 1..=4096",
+                        },
+                    });
+                }
+                let lo = u64::from(proof.bound_lo);
+                let byte_len = u64::from(case_count).saturating_mul(4);
+                let hi = lo.saturating_add(byte_len);
+                if lo < prev_end || hi > const_len {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "BrTableSpec payload is out of bounds, unordered, or overlaps a previous table",
+                        },
+                    });
+                }
+                prev_end = hi;
+                raw_br_tables.push(BrTableInfo {
+                    br_table_id: proof.witness_node,
+                    default_depth: proof.target_arena,
+                    offset: proof.bound_lo,
+                    case_count,
+                });
+            }
+            ProofRuleKind::CallTable => {
+                if proof.witness_node != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "CallTable requires witness_node == 0",
+                        },
+                    });
+                }
+                let entry_count = proof.bound_hi;
+                if entry_count == 0 || entry_count > MAX_TABLE_ENTRIES {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "CallTable entry_count must be in 1..=4096",
+                        },
+                    });
+                }
+                if func_sigs.is_empty() {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "CallTable requires FuncSig declarations",
+                        },
+                    });
+                }
+                let lo = u64::from(proof.bound_lo);
+                let byte_len = u64::from(entry_count).saturating_mul(4);
+                let hi = lo.saturating_add(byte_len);
+                if lo < prev_end || hi > const_len {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "CallTable payload is out of bounds, unordered, or overlaps a previous table",
+                        },
+                    });
+                }
+                prev_end = hi;
+
+                let slice = program.const_data.get((lo as usize)..(hi as usize)).ok_or(
+                    VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "CallTable payload slice out of bounds",
+                        },
+                    },
+                )?;
+                let mut expected_sig: Option<FuncSigInfo> = None;
+                let mut expected_contract: Option<FuncRegionContract> = None;
+                let mut rep_func_id: u16 = 0;
+                let mut max_func_id: u32 = 0;
+                for chunk in slice.as_chunks::<4>().0 {
+                    let fid = u32::from_le_bytes(*chunk);
+                    let sig = func_sigs
+                        .get(fid as usize)
+                        .copied()
+                        .ok_or(VerifyDiagnostic {
+                            node_idx: 0,
+                            kind: VerifyErrorKind::UnknownFunction(fid),
+                        })?;
+                    let contract =
+                        func_contracts
+                            .get(fid as usize)
+                            .copied()
+                            .ok_or(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::UnknownFunction(fid),
+                            })?;
+                    if let Some(ref_sig) = expected_sig {
+                        if !func_sig_matches(ref_sig, sig) {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidConstDataTable {
+                                    reason: "CallTable entries disagree on FuncSig",
+                                },
+                            });
+                        }
+                    } else {
+                        expected_sig = Some(sig);
+                        rep_func_id = sig.func_id;
+                    }
+                    if let Some(ref_contract) = expected_contract {
+                        if ref_contract != contract {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidConstDataTable {
+                                    reason: "CallTable entries disagree on FuncRegionContract",
+                                },
+                            });
+                        }
+                    } else {
+                        expected_contract = Some(contract);
+                    }
+                    max_func_id = max_func_id.max(fid);
+                }
+                let (Some(sig), Some(contract)) = (expected_sig, expected_contract) else {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidConstDataTable {
+                            reason: "CallTable cannot be empty",
+                        },
+                    });
+                };
+                raw_call_tables.push(CallTableSummary {
+                    table_id: proof.target_arena,
+                    rep_func_id,
+                    sig,
+                    contract,
+                    max_func_id,
+                    offset: proof.bound_lo,
+                    entry_count,
+                    cost_summary: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Build dense 0..N tables and reject duplicates or gaps.
+    let mut dense_segs: Vec<Option<ConstDataSegInfo>> = vec![None; raw_segs.len()];
+    for seg in raw_segs {
+        let Some(slot) = dense_segs.get_mut(usize::from(seg.seg_id)) else {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidConstDataTable {
+                    reason: "ConstDataSeg seg_id is out of dense 0..N range",
+                },
+            });
+        };
+        if slot.is_some() {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidConstDataTable {
+                    reason: "duplicate ConstDataSeg seg_id",
+                },
+            });
+        }
+        *slot = Some(seg);
+    }
+    let mut segs = Vec::with_capacity(dense_segs.len());
+    for entry in dense_segs {
+        segs.push(entry.ok_or(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidConstDataTable {
+                reason: "missing ConstDataSeg seg_id in dense 0..N range",
+            },
+        })?);
+    }
+
+    let mut dense_br: Vec<Option<BrTableInfo>> = vec![None; raw_br_tables.len()];
+    for spec in raw_br_tables {
+        let Some(slot) = dense_br.get_mut(spec.br_table_id as usize) else {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidConstDataTable {
+                    reason: "BrTableSpec br_table_id is out of dense 0..N range",
+                },
+            });
+        };
+        if slot.is_some() {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidConstDataTable {
+                    reason: "duplicate BrTableSpec br_table_id",
+                },
+            });
+        }
+        *slot = Some(spec);
+    }
+    let mut br_tables = Vec::with_capacity(dense_br.len());
+    for entry in dense_br {
+        br_tables.push(entry.ok_or(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidConstDataTable {
+                reason: "missing BrTableSpec br_table_id in dense 0..N range",
+            },
+        })?);
+    }
+
+    let mut dense_call: Vec<Option<CallTableSummary>> = vec![None; raw_call_tables.len()];
+    for ct in raw_call_tables {
+        let Some(slot) = dense_call.get_mut(usize::from(ct.table_id)) else {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidConstDataTable {
+                    reason: "CallTable table_id is out of dense 0..N range",
+                },
+            });
+        };
+        if slot.is_some() {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidConstDataTable {
+                    reason: "duplicate CallTable table_id",
+                },
+            });
+        }
+        *slot = Some(ct);
+    }
+    let mut call_tables = Vec::with_capacity(dense_call.len());
+    for entry in dense_call {
+        call_tables.push(entry.ok_or(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidConstDataTable {
+                reason: "missing CallTable table_id in dense 0..N range",
+            },
+        })?);
+    }
+
+    Ok(ScannedConstTables {
+        const_data_segs: segs,
+        br_tables,
+        call_tables,
+    })
+}
+
 /// Verifies an [`RulProgram`] in a single forward pass ($O(N)$ time and $O(N)$ state).
 ///
 /// # Errors
@@ -1169,11 +1533,17 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
         });
     }
 
-    // One linear pre-scan of the proof table to index declared regions, function signatures, and region contracts.
+    // One linear pre-scan of the proof table to index declared regions, function signatures, region contracts, and constant-data tables.
     let regions = scan_region_decls(program)?;
     let declared_mask = declared_region_mask(&regions);
     let func_sigs = scan_func_sigs(program)?;
     let func_contracts = scan_func_region_contracts(program, &regions, declared_mask, &func_sigs)?;
+    let ScannedConstTables {
+        const_data_segs,
+        br_tables,
+        call_tables,
+    } = scan_const_data_tables(program, &func_sigs, &func_contracts)?;
+    let br_table_used = vec![false; br_tables.len()];
     let has_func_mode = !func_sigs.is_empty();
     let sandbox_mode = (program.capability_mask & CAP_DIVERGE) == 0;
     let max_region_bytes = compute_max_region_bytes(program, &regions);
@@ -1191,6 +1561,10 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
         region_owned: if has_func_mode { 0 } else { declared_mask },
         region_leased: 0,
         has_unproven_region_access: false,
+        const_data_segs,
+        br_tables,
+        br_table_used,
+        call_tables,
         func_sigs,
         func_contracts,
         current_func: None,
@@ -1210,11 +1584,11 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
         let node_idx = u32::try_from(idx).unwrap_or(u32::MAX);
 
         if let Some(pending) = state.pending_call_arg {
-            if frame.opcode != Opcode::Call {
+            if !matches!(frame.opcode, Opcode::Call | Opcode::CallIndirect) {
                 return Err(VerifyDiagnostic {
                     node_idx: pending.node_idx,
                     kind: VerifyErrorKind::InvalidControlFlow(
-                        "CallArg must immediately precede Call",
+                        "CallArg must immediately precede Call or CallIndirect",
                     ),
                 });
             }
@@ -1289,6 +1663,7 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
                     | Opcode::End
                     | Opcode::Func
                     | Opcode::Call
+                    | Opcode::CallIndirect
             )
         {
             let step_cost = match frame.opcode {
@@ -2042,6 +2417,47 @@ fn verify_region_index_proof(
         return Err(err(proof.bound_hi));
     };
     if upper >= u64::from(proof.bound_hi) {
+        return Err(err(proof.bound_hi));
+    }
+    Ok(())
+}
+
+fn verify_const_data_index_proof(
+    program: &RulProgram,
+    node_idx: u32,
+    proof_idx: u8,
+    seg: ConstDataSegInfo,
+    elem_bytes: u64,
+    idx_meta: NodeMeta,
+) -> Result<(), VerifyDiagnostic> {
+    let err = |bound_hi: u32| VerifyDiagnostic {
+        node_idx,
+        kind: VerifyErrorKind::InvalidRefinementProof {
+            proof_idx,
+            bound_hi,
+            arena_len: seg.len,
+        },
+    };
+    let proof = program
+        .proofs
+        .get(usize::from(proof_idx.saturating_sub(1)))
+        .ok_or_else(|| err(0))?;
+    if proof.rule_kind != ProofRuleKind::ConstDataInBounds
+        || proof.target_arena != seg.seg_id
+        || proof.bound_lo != 0
+        || proof.witness_node != 0
+        || proof.bound_hi == 0
+        || proof.bound_hi > seg.len
+    {
+        return Err(err(proof.bound_hi));
+    }
+    let Some(upper) = idx_meta.nonneg_upper_bound else {
+        return Err(err(proof.bound_hi));
+    };
+    let Some(end_byte) = upper.checked_add(elem_bytes) else {
+        return Err(err(proof.bound_hi));
+    };
+    if upper >= u64::from(proof.bound_hi) || end_byte > u64::from(proof.bound_hi) {
         return Err(err(proof.bound_hi));
     }
     Ok(())
@@ -4793,6 +5209,513 @@ fn verify_node_semantics(
             }
 
             if let Some(ret_elem) = callee_sig.ret_elem {
+                if frame.type_lane.elem != ret_elem {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ElementTypeMismatch {
+                            expected: ret_elem,
+                            actual: frame.type_lane.elem,
+                        },
+                    });
+                }
+                if frame.type_lane.width != SimdWidth::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: ValueShape::Column(0),
+                        },
+                    });
+                }
+                Ok(NodeMeta::value(ValueShape::Scalar, ret_elem, None))
+            } else {
+                Ok(NodeMeta::VOID)
+            }
+        }
+        Opcode::ConstDataLen => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "ConstDataLen requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let seg = state
+                .const_data_segs
+                .get(frame.in_a as usize)
+                .copied()
+                .ok_or(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::UnknownConstDataSeg(frame.in_a),
+                })?;
+            if frame.type_lane.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            Ok(NodeMeta {
+                shape: ValueShape::Scalar,
+                elem: ElemType::I64,
+                origin_arena: None,
+                is_void: false,
+                const_i64: Some(i64::from(seg.len)),
+                nonneg_upper_bound: Some(u64::from(seg.len)),
+            })
+        }
+        Opcode::ConstDataLoad => {
+            require_pure_token(node_idx, frame)?;
+            let seg = state
+                .const_data_segs
+                .get(frame.in_a as usize)
+                .copied()
+                .ok_or(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::UnknownConstDataSeg(frame.in_a),
+                })?;
+            let idx_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
+            if idx_meta.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: idx_meta.elem,
+                    },
+                });
+            }
+            if idx_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: idx_meta.shape,
+                    },
+                });
+            }
+            if !matches!(frame.type_lane.elem, ElemType::U8 | ElemType::I64) {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::U8,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            let elem_bytes: u64 = if frame.type_lane.elem == ElemType::I64 {
+                8
+            } else {
+                1
+            };
+            if frame.proof_idx == 0 {
+                state.has_unproven_region_access = true;
+            } else {
+                verify_const_data_index_proof(
+                    program,
+                    node_idx,
+                    frame.proof_idx,
+                    seg,
+                    elem_bytes,
+                    idx_meta,
+                )?;
+            }
+            Ok(NodeMeta::value(
+                ValueShape::Scalar,
+                frame.type_lane.elem,
+                None,
+            ))
+        }
+        Opcode::BrTable => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("BrTable requires proof_idx == 0"),
+                });
+            }
+            let sel_meta = get_prior_meta(node_idx, frame.in_a, metas, state)?;
+            if !matches!(sel_meta.elem, ElemType::I64 | ElemType::U8) {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: sel_meta.elem,
+                    },
+                });
+            }
+            if sel_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: sel_meta.shape,
+                    },
+                });
+            }
+            let br_table_id = frame.in_b;
+            let spec =
+                state
+                    .br_tables
+                    .get(br_table_id as usize)
+                    .copied()
+                    .ok_or(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UnknownBrTable(br_table_id),
+                    })?;
+            let used_slot =
+                state
+                    .br_table_used
+                    .get_mut(br_table_id as usize)
+                    .ok_or(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UnknownBrTable(br_table_id),
+                    })?;
+            if *used_slot {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::DuplicateBrTableUse { br_table_id },
+                });
+            }
+            *used_slot = true;
+
+            let lo = spec.offset as usize;
+            let byte_len = (spec.case_count as usize).saturating_mul(4);
+            let payload = program
+                .const_data
+                .get(lo..lo.saturating_add(byte_len))
+                .ok_or(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidConstDataTable {
+                        reason: "BrTableSpec payload out of bounds",
+                    },
+                })?;
+
+            let VerifierState {
+                ref mut control_stack,
+                ref mut arena_state,
+                local_init,
+                region_owned,
+                region_leased,
+                ref mut reachable,
+                ..
+            } = *state;
+
+            let mut check_depth = |depth_u32: u32| -> Result<(), VerifyDiagnostic> {
+                let depth = depth_u32 as usize;
+                let stack_len = control_stack.len();
+                if depth >= stack_len {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "BrTable relative depth exceeds open control stack",
+                        ),
+                    });
+                }
+                let target_idx = stack_len - 1 - depth;
+                let target = control_stack.get_mut(target_idx).ok_or(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "BrTable relative depth exceeds open control stack",
+                    ),
+                })?;
+                if matches!(target.kind, ControlKind::Func { .. }) {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "BrTable cannot target a Func scope; use Return",
+                        ),
+                    });
+                }
+                if target.sig.and_then(|s| s.result_type).is_some() {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "BrTable cannot target value-returning block; use typed locals for early exits",
+                        ),
+                    });
+                }
+                if matches!(target.kind, ControlKind::Loop)
+                    && (target.loop_bound > 0 || (program.capability_mask & CAP_DIVERGE) == 0)
+                {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "BrTable cannot target a bounded Loop or any Loop without CAP_DIVERGE",
+                        ),
+                    });
+                }
+                if *reachable {
+                    match target.kind {
+                        ControlKind::Loop => {
+                            check_loop_arena_invariant(program, node_idx, target, arena_state)?;
+                            check_loop_region_invariant(
+                                node_idx,
+                                target,
+                                region_owned,
+                                region_leased,
+                            )?;
+                        }
+                        ControlKind::Block | ControlKind::If { .. } => {
+                            target.has_branch_or_join = true;
+                            join_control_exit(
+                                program,
+                                target,
+                                node_idx,
+                                ExitSnapshot {
+                                    local_init,
+                                    region_owned,
+                                    region_leased,
+                                },
+                                arena_state,
+                            )?;
+                        }
+                        ControlKind::Func { .. } => {}
+                    }
+                }
+                Ok(())
+            };
+
+            for chunk in payload.as_chunks::<4>().0 {
+                let d = u32::from_le_bytes(*chunk);
+                check_depth(d)?;
+            }
+            check_depth(u32::from(spec.default_depth))?;
+
+            *reachable = false;
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::CallIndirect => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "CallIndirect requires proof_idx == 0",
+                    ),
+                });
+            }
+            let active = state.current_func.ok_or(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::InvalidControlFlow(
+                    "CallIndirect is only valid inside a Func",
+                ),
+            })?;
+            let (table_id, index_node) = frame.decode_in_a_u16_pair();
+            let table =
+                state
+                    .call_tables
+                    .get(table_id as usize)
+                    .copied()
+                    .ok_or(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UnknownCallTable(table_id),
+                    })?;
+            let idx_meta = get_prior_meta(node_idx, index_node, metas, state)?;
+            if idx_meta.elem != ElemType::I64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::I64,
+                        actual: idx_meta.elem,
+                    },
+                });
+            }
+            if idx_meta.shape != ValueShape::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: idx_meta.shape,
+                    },
+                });
+            }
+            if (program.capability_mask & CAP_DIVERGE) == 0
+                && table.max_func_id >= u32::from(active.sig.func_id)
+            {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::MissingCapability {
+                        required: CAP_DIVERGE,
+                        actual: program.capability_mask,
+                    },
+                });
+            }
+
+            let pending = state.pending_call_arg.take();
+            let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+            let sentinel = u32::from(CALL_ARG_SENTINEL);
+            let mut arg_elems: [Option<ElemType>; 4] = [None; 4];
+
+            if arg0_raw != sentinel {
+                let meta0 = get_prior_meta(node_idx, arg0_raw, metas, state)?;
+                if meta0.shape != ValueShape::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: meta0.shape,
+                        },
+                    });
+                }
+                arg_elems[0] = Some(meta0.elem);
+            }
+            if arg1_raw != sentinel {
+                if arg_elems[0].is_none() {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "CallIndirect arg1 provided without arg0",
+                        ),
+                    });
+                }
+                let meta1 = get_prior_meta(node_idx, arg1_raw, metas, state)?;
+                if meta1.shape != ValueShape::Scalar {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::ShapeMismatch {
+                            left: ValueShape::Scalar,
+                            right: meta1.shape,
+                        },
+                    });
+                }
+                arg_elems[1] = Some(meta1.elem);
+            }
+            if let Some(p) = pending {
+                if arg_elems[0].is_none() || arg_elems[1].is_none() {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::InvalidControlFlow(
+                            "CallArg provided when CallIndirect has fewer than 2 arguments",
+                        ),
+                    });
+                }
+                arg_elems[2] = Some(p.arg2_elem);
+                arg_elems[3] = p.arg3_elem;
+            }
+
+            let provided_arity = arg_elems.iter().take_while(|e| e.is_some()).count();
+            if provided_arity != usize::from(table.sig.arity) {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "CallIndirect argument count does not match CallTable FuncSig arity",
+                    ),
+                });
+            }
+            for i in 0..usize::from(table.sig.arity) {
+                if let (Some(&expected), Some(Some(actual))) =
+                    (table.sig.params.get(i), arg_elems.get(i))
+                {
+                    if *actual != expected {
+                        return Err(VerifyDiagnostic {
+                            node_idx,
+                            kind: VerifyErrorKind::ElementTypeMismatch {
+                                expected,
+                                actual: *actual,
+                            },
+                        });
+                    }
+                }
+            }
+
+            let caller_contract = state
+                .func_contracts
+                .get(usize::from(active.sig.func_id))
+                .copied()
+                .unwrap_or(FuncRegionContract {
+                    dom_mask: 0,
+                    pre_owned: 0,
+                    pre_leased: 0,
+                    post_owned: 0,
+                    post_leased: 0,
+                });
+            let callee_contract = table.contract;
+            let extra_mask = callee_contract.dom_mask & !caller_contract.dom_mask;
+            if extra_mask != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::CalleeFootprintExceedsCaller {
+                        callee_func_id: table.rep_func_id,
+                        extra_mask,
+                    },
+                });
+            }
+            if state.reachable {
+                let dom = callee_contract.dom_mask;
+                let observed_owned = state.region_owned & dom;
+                let observed_leased = state.region_leased & dom;
+                if observed_owned != callee_contract.pre_owned
+                    || observed_leased != callee_contract.pre_leased
+                {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::RegionTypestateMismatch {
+                            expected_owned: callee_contract.pre_owned,
+                            expected_leased: callee_contract.pre_leased,
+                            actual_owned: observed_owned,
+                            actual_leased: observed_leased,
+                        },
+                    });
+                }
+                state.region_owned = (state.region_owned & !dom) | callee_contract.post_owned;
+                state.region_leased = (state.region_leased & !dom) | callee_contract.post_leased;
+
+                if (program.capability_mask & CAP_DIVERGE) == 0 {
+                    let (max_steps, max_depth, max_stack) = if let Some(cached) = table.cost_summary
+                    {
+                        cached
+                    } else {
+                        let lo = table.offset as usize;
+                        let byte_len = (table.entry_count as usize).saturating_mul(4);
+                        let mut ms: u64 = 0;
+                        let mut md: u32 = 0;
+                        let mut msu: u32 = 0;
+                        if let Some(slice) = program.const_data.get(lo..lo.saturating_add(byte_len))
+                        {
+                            for chunk in slice.as_chunks::<4>().0 {
+                                let fid = u32::from_le_bytes(*chunk);
+                                if let Some(cf) = state.completed_funcs.get(fid as usize).copied() {
+                                    ms = ms.max(cf.worst_case_steps);
+                                    md = md.max(cf.max_call_depth);
+                                    msu = msu.max(cf.max_stack_units);
+                                }
+                            }
+                        }
+                        if let Some(slot) = state.call_tables.get_mut(table_id as usize) {
+                            slot.cost_summary = Some((ms, md, msu));
+                        }
+                        (ms, md, msu)
+                    };
+                    state.cur_steps = state.cur_steps.saturating_add(1).saturating_add(max_steps);
+                    state.cur_max_callee_depth = state.cur_max_callee_depth.max(max_depth);
+                    state.cur_max_callee_stack_units =
+                        state.cur_max_callee_stack_units.max(max_stack);
+                }
+            }
+
+            if let Some(ret_elem) = table.sig.ret_elem {
                 if frame.type_lane.elem != ret_elem {
                     return Err(VerifyDiagnostic {
                         node_idx,

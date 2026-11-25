@@ -38,6 +38,15 @@ pub const CALL_ARG_SENTINEL: u16 = 0xFFFF;
 /// Sentinel `bound_lo` value in [`ProofRuleKind::FuncRegionEffect`] declaring an empty function region footprint (`dom(f) = 0`).
 pub const REGION_FOOTPRINT_NONE: u32 = 0xFFFF;
 
+/// Maximum permitted byte length of Section 5a (`const_data`: `8 MiB`).
+pub const MAX_CONST_DATA_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Maximum permitted byte length of Section 5b (`link_meta`: `2 MiB`).
+pub const MAX_LINK_META_BYTES: u32 = 2 * 1024 * 1024;
+
+/// Maximum permitted number of table entries in a [`ProofRuleKind::BrTableSpec`] or [`ProofRuleKind::CallTable`].
+pub const MAX_TABLE_ENTRIES: u32 = 4096;
+
 /// Computes the ISA-defined stack budget in 8-byte frame units for a function spanning `node_count` nodes.
 #[must_use]
 pub const fn func_frame_units(node_count: usize) -> u32 {
@@ -78,6 +87,10 @@ pub enum Opcode {
     LocalGet = 0x06,
     /// Write a scalar value into a typed local slot (`in_a = slot` in `0..64`, `in_b = value_node`).
     LocalSet = 0x07,
+    /// Query byte length of a declared constant-data segment (`in_a = seg_id`, `in_b = 0`; yields `I64`).
+    ConstDataLen = 0x08,
+    /// Load a scalar `u8` or little-endian `i64` from a declared constant-data segment (`in_a = seg_id`, `in_b = idx_node`, optional `proof_idx -> ConstDataInBounds`).
+    ConstDataLoad = 0x09,
     /// Branchless elementwise addition (`out[i] = a[i] + b[i]`).
     Add = 0x10,
     /// Branchless elementwise subtraction (`out[i] = a[i] - b[i]`).
@@ -170,8 +183,12 @@ pub enum Opcode {
     Return = 0x58,
     /// Direct function call (`in_a = target_func_id`, `in_b = (arg0: u16) | ((arg1: u16) << 16)` with `0xFFFF` sentinel).
     Call = 0x59,
-    /// Additional call arguments immediately preceding `Call` for arity 3 or 4 (`in_a = arg2`, `in_b = arg3` or `0xFFFF`).
+    /// Additional call arguments immediately preceding `Call` or `CallIndirect` for arity 3 or 4 (`in_a = arg2`, `in_b = arg3` or `0xFFFF`).
     CallArg = 0x5A,
+    /// Dense multi-way structured switch branch (`in_a = selector_node` of `I64` or `U8`, `in_b = br_table_id` dense `0..N`, `proof_idx = 0`).
+    BrTable = 0x5B,
+    /// Typed indirect function call (`in_a = (table_id: u16) | ((index_node: u16) << 16)`, `in_b = (arg0: u16) | ((arg1: u16) << 16)`, optional preceding `CallArg`, `proof_idx = 0`).
+    CallIndirect = 0x5C,
     /// Reset a declared region to `len` zeroed elements (`in_a = slot`, `in_b = len_node`; void).
     RegionNew = 0x60,
     /// Append `add_len` zeroed elements to a declared region (`in_a = slot`, `in_b = add_len_node`; yields new length as `I64`).
@@ -208,6 +225,8 @@ impl Opcode {
             0x05 => Ok(Self::ConstI64),
             0x06 => Ok(Self::LocalGet),
             0x07 => Ok(Self::LocalSet),
+            0x08 => Ok(Self::ConstDataLen),
+            0x09 => Ok(Self::ConstDataLoad),
             0x10 => Ok(Self::Add),
             0x11 => Ok(Self::Sub),
             0x12 => Ok(Self::Mul),
@@ -255,6 +274,8 @@ impl Opcode {
             0x58 => Ok(Self::Return),
             0x59 => Ok(Self::Call),
             0x5A => Ok(Self::CallArg),
+            0x5B => Ok(Self::BrTable),
+            0x5C => Ok(Self::CallIndirect),
             0x60 => Ok(Self::RegionNew),
             0x61 => Ok(Self::RegionGrow),
             0x62 => Ok(Self::RegionLen),
@@ -277,6 +298,8 @@ impl Opcode {
             Self::ConstI64
                 | Self::LocalGet
                 | Self::LocalSet
+                | Self::ConstDataLen
+                | Self::ConstDataLoad
                 | Self::MaskNot
                 | Self::Cast
                 | Self::BitAnd
@@ -298,6 +321,8 @@ impl Opcode {
                 | Self::Return
                 | Self::Call
                 | Self::CallArg
+                | Self::BrTable
+                | Self::CallIndirect
                 | Self::RegionNew
                 | Self::RegionGrow
                 | Self::RegionLen
@@ -721,6 +746,14 @@ pub enum ProofRuleKind {
     RegionIndexInBounds = 7,
     /// Declares a function's region footprint and typestate transition (`target_arena = func_id`, `bound_lo = slot or 0xFFFF`, `bound_hi = pre`, `witness_node = post`).
     FuncRegionEffect = 8,
+    /// Declares a segment-addressed read-only constant data slice (`target_arena = seg_id`, `bound_lo = byte_offset`, `bound_hi = byte_len`, `witness_node = 0`).
+    ConstDataSeg = 9,
+    /// Certifies that a `ConstDataLoad` byte index satisfies `idx + elem_bytes <= bound_hi <= seg_len` (`target_arena = seg_id`, `bound_lo = 0`, `bound_hi <= seg_len`, `witness_node = 0`).
+    ConstDataInBounds = 10,
+    /// Declares a dense `BrTable` target-depth table stored in `const_data` (`target_arena = default_depth`, `bound_lo = const_data_offset`, `bound_hi = case_count`, `witness_node = br_table_id`).
+    BrTableSpec = 11,
+    /// Declares a typed `CallIndirect` function table stored in `const_data` (`target_arena = table_id`, `bound_lo = const_data_offset`, `bound_hi = entry_count`, `witness_node = 0`).
+    CallTable = 12,
 }
 
 impl ProofRuleKind {
@@ -734,6 +767,10 @@ impl ProofRuleKind {
             6 => Ok(Self::RegionDecl),
             7 => Ok(Self::RegionIndexInBounds),
             8 => Ok(Self::FuncRegionEffect),
+            9 => Ok(Self::ConstDataSeg),
+            10 => Ok(Self::ConstDataInBounds),
+            11 => Ok(Self::BrTableSpec),
+            12 => Ok(Self::CallTable),
             other => Err(RulFormatError::InvalidProofRule(other)),
         }
     }
@@ -973,6 +1010,59 @@ impl ProofEntry {
         })
     }
 
+    /// Constructs a [`ProofRuleKind::ConstDataSeg`] entry declaring segment `seg_id` at `[offset..offset+len)`.
+    #[must_use]
+    pub const fn const_data_seg(seg_id: u16, offset: u32, len: u32) -> Self {
+        Self {
+            rule_kind: ProofRuleKind::ConstDataSeg,
+            target_arena: seg_id,
+            bound_lo: offset,
+            bound_hi: len,
+            witness_node: 0,
+        }
+    }
+
+    /// Constructs a [`ProofRuleKind::ConstDataInBounds`] proof entry for segment `seg_id` with upper bound `bound_hi`.
+    #[must_use]
+    pub const fn const_data_in_bounds(seg_id: u16, bound_hi: u32) -> Self {
+        Self {
+            rule_kind: ProofRuleKind::ConstDataInBounds,
+            target_arena: seg_id,
+            bound_lo: 0,
+            bound_hi,
+            witness_node: 0,
+        }
+    }
+
+    /// Constructs a [`ProofRuleKind::BrTableSpec`] entry for `br_table_id` with `default_depth` and `case_count` `u32` depths at `offset` in `const_data`.
+    #[must_use]
+    pub const fn br_table_spec(
+        br_table_id: u32,
+        default_depth: u16,
+        offset: u32,
+        case_count: u32,
+    ) -> Self {
+        Self {
+            rule_kind: ProofRuleKind::BrTableSpec,
+            target_arena: default_depth,
+            bound_lo: offset,
+            bound_hi: case_count,
+            witness_node: br_table_id,
+        }
+    }
+
+    /// Constructs a [`ProofRuleKind::CallTable`] entry for `table_id` with `entry_count` `u32` function IDs at `offset` in `const_data`.
+    #[must_use]
+    pub const fn call_table(table_id: u16, offset: u32, entry_count: u32) -> Self {
+        Self {
+            rule_kind: ProofRuleKind::CallTable,
+            target_arena: table_id,
+            bound_lo: offset,
+            bound_hi: entry_count,
+            witness_node: 0,
+        }
+    }
+
     /// Encodes the proof entry into 16 bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; RL_FRAME_SIZE] {
@@ -1101,6 +1191,12 @@ impl NodeFrame {
         (self.in_b & 0xFFFF, self.in_b >> 16)
     }
 
+    /// Unpacks two 16-bit fields `(lo, hi)` from `self.in_a` (used by `CallIndirect` `(table_id, index_node)`).
+    #[must_use]
+    pub const fn decode_in_a_u16_pair(self) -> (u32, u32) {
+        (self.in_a & 0xFFFF, self.in_a >> 16)
+    }
+
     /// Packs the second (`in_b`) and third (`in_c`) 16-bit node indices into the `in_b` field of an [`Opcode::Fma`] frame.
     #[must_use]
     pub const fn encode_fma_bc(in_b: u16, in_c: u16) -> u32 {
@@ -1188,15 +1284,20 @@ pub struct RulProgram {
     pub nodes: Vec<NodeFrame>,
     /// Primary output node index.
     pub output_node: u32,
+    /// Section 5a: segment-addressed read-only constant data pool (`<= MAX_CONST_DATA_BYTES`).
+    pub const_data: Vec<u8>,
+    /// Section 5b: reserved linker metadata section (`<= MAX_LINK_META_BYTES`).
+    pub link_meta: Vec<u8>,
 }
 
 impl RulProgram {
-    /// Returns `true` if any node or proof uses structured control flow, functions, typed scalar ops, locals, or declared regions.
+    /// Returns `true` if any node, proof, or constant-data section uses structured control flow, functions, typed scalar ops, locals, declared regions, or constant data.
     #[must_use]
     pub fn uses_structured_control_or_locals(&self) -> bool {
-        self.nodes
-            .iter()
-            .any(|node| node.opcode.is_structured_or_local() || node.type_lane.elem == ElemType::U8)
+        !self.const_data.is_empty()
+            || self.nodes.iter().any(|node| {
+                node.opcode.is_structured_or_local() || node.type_lane.elem == ElemType::U8
+            })
             || self.proofs.iter().any(|proof| {
                 matches!(
                     proof.rule_kind,
@@ -1204,6 +1305,10 @@ impl RulProgram {
                         | ProofRuleKind::RegionDecl
                         | ProofRuleKind::RegionIndexInBounds
                         | ProofRuleKind::FuncRegionEffect
+                        | ProofRuleKind::ConstDataSeg
+                        | ProofRuleKind::ConstDataInBounds
+                        | ProofRuleKind::BrTableSpec
+                        | ProofRuleKind::CallTable
                 )
             })
     }
@@ -1254,27 +1359,40 @@ impl RulProgram {
     }
 
     /// Computes the deterministic 64-bit FNV-1a content hash of the program body.
+    ///
+    /// Byte-identical to `v0.5.0` when both `const_data` and `link_meta` are empty;
+    /// otherwise domain-separates Section 5a (`0xD5 || len_u64_le || bytes`) and
+    /// Section 5b (`0xD6 || len_u64_le || bytes`).
     #[must_use]
     pub fn compute_graph_hash(&self) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let prime: u64 = 0x0100_0000_01b3;
-        for arena in &self.arenas {
-            for b in arena.to_bytes() {
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
                 hash ^= u64::from(b);
                 hash = hash.wrapping_mul(prime);
             }
+        };
+        for arena in &self.arenas {
+            mix(&arena.to_bytes());
         }
         for proof in &self.proofs {
-            for b in proof.to_bytes() {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(prime);
-            }
+            mix(&proof.to_bytes());
         }
         for node in &self.nodes {
-            for b in node.to_bytes() {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(prime);
-            }
+            mix(&node.to_bytes());
+        }
+        if !self.const_data.is_empty() {
+            mix(&[0xD5]);
+            let len = u64::try_from(self.const_data.len()).unwrap_or(u64::MAX);
+            mix(&len.to_le_bytes());
+            mix(&self.const_data);
+        }
+        if !self.link_meta.is_empty() {
+            mix(&[0xD6]);
+            let len = u64::try_from(self.link_meta.len()).unwrap_or(u64::MAX);
+            mix(&len.to_le_bytes());
+            mix(&self.link_meta);
         }
         hash
     }
@@ -1283,13 +1401,17 @@ impl RulProgram {
     #[must_use]
     pub fn to_rl_bytes(&self) -> Vec<u8> {
         let total_bytes = RL_HEADER_SIZE
-            + (self.arenas.len() + self.proofs.len() + self.nodes.len()) * RL_FRAME_SIZE;
+            + (self.arenas.len() + self.proofs.len() + self.nodes.len()) * RL_FRAME_SIZE
+            + self.const_data.len()
+            + self.link_meta.len();
         let mut buf = Vec::with_capacity(total_bytes);
 
         let graph_hash = self.compute_graph_hash();
         let arena_count = u32::try_from(self.arenas.len()).unwrap_or(u32::MAX);
         let proof_count = u32::try_from(self.proofs.len()).unwrap_or(u32::MAX);
         let node_count = u32::try_from(self.nodes.len()).unwrap_or(u32::MAX);
+        let const_data_bytes = u32::try_from(self.const_data.len()).unwrap_or(u32::MAX);
+        let link_meta_bytes = u32::try_from(self.link_meta.len()).unwrap_or(u32::MAX);
 
         buf.extend_from_slice(&RL_MAGIC);
         buf.extend_from_slice(&graph_hash.to_le_bytes());
@@ -1298,7 +1420,9 @@ impl RulProgram {
         buf.extend_from_slice(&proof_count.to_le_bytes());
         buf.extend_from_slice(&node_count.to_le_bytes());
         buf.extend_from_slice(&self.output_node.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 24]);
+        buf.extend_from_slice(&const_data_bytes.to_le_bytes());
+        buf.extend_from_slice(&link_meta_bytes.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 16]);
 
         for arena in &self.arenas {
             buf.extend_from_slice(&arena.to_bytes());
@@ -1309,13 +1433,15 @@ impl RulProgram {
         for node in &self.nodes {
             buf.extend_from_slice(&node.to_bytes());
         }
+        buf.extend_from_slice(&self.const_data);
+        buf.extend_from_slice(&self.link_meta);
         buf
     }
 
     /// Decodes a `.rl` binary image from a byte slice with zero text parsing.
     ///
     /// # Errors
-    /// Returns [`RulFormatError`] if magic bytes, hash integrity, or frame sizes are invalid.
+    /// Returns [`RulFormatError`] if magic bytes, reserved header bytes, hash integrity, or section sizes are invalid.
     pub fn from_rl_bytes(bytes: &[u8]) -> Result<Self, RulFormatError> {
         let header: &[u8; RL_HEADER_SIZE] = bytes
             .get(0..RL_HEADER_SIZE)
@@ -1338,18 +1464,34 @@ impl RulProgram {
         let proof_count = u32::from_le_bytes([header[28], header[29], header[30], header[31]]);
         let node_count = u32::from_le_bytes([header[32], header[33], header[34], header[35]]);
         let output_node = u32::from_le_bytes([header[36], header[37], header[38], header[39]]);
+        let const_data_bytes = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
+        let link_meta_bytes = u32::from_le_bytes([header[44], header[45], header[46], header[47]]);
+
+        if header[48..64].iter().any(|&b| b != 0) {
+            return Err(RulFormatError::InvalidReservedHeader);
+        }
 
         if arena_count > MAX_SECTION_ITEMS
             || proof_count > MAX_SECTION_ITEMS
             || node_count > MAX_SECTION_ITEMS
+            || const_data_bytes > MAX_CONST_DATA_BYTES
+            || link_meta_bytes > MAX_LINK_META_BYTES
         {
             return Err(RulFormatError::SectionTooLarge);
         }
 
         let total_frames = (arena_count as usize)
-            .saturating_add(proof_count as usize)
-            .saturating_add(node_count as usize);
-        let expected_len = RL_HEADER_SIZE.saturating_add(total_frames * RL_FRAME_SIZE);
+            .checked_add(proof_count as usize)
+            .and_then(|v| v.checked_add(node_count as usize))
+            .ok_or(RulFormatError::SectionTooLarge)?;
+        let frames_bytes = total_frames
+            .checked_mul(RL_FRAME_SIZE)
+            .ok_or(RulFormatError::SectionTooLarge)?;
+        let expected_len = RL_HEADER_SIZE
+            .checked_add(frames_bytes)
+            .and_then(|v| v.checked_add(const_data_bytes as usize))
+            .and_then(|v| v.checked_add(link_meta_bytes as usize))
+            .ok_or(RulFormatError::SectionTooLarge)?;
         if bytes.len() != expected_len {
             return Err(RulFormatError::LengthMismatch {
                 expected: expected_len,
@@ -1385,12 +1527,27 @@ impl RulProgram {
             offset += RL_FRAME_SIZE;
         }
 
+        let const_len = const_data_bytes as usize;
+        let const_data = bytes
+            .get(offset..offset + const_len)
+            .ok_or(RulFormatError::TruncatedSection("ConstData"))?
+            .to_vec();
+        offset += const_len;
+
+        let link_len = link_meta_bytes as usize;
+        let link_meta = bytes
+            .get(offset..offset + link_len)
+            .ok_or(RulFormatError::TruncatedSection("LinkMeta"))?
+            .to_vec();
+
         let program = Self {
             capability_mask,
             arenas,
             proofs,
             nodes,
             output_node,
+            const_data,
+            link_meta,
         };
         let actual_hash = program.compute_graph_hash();
         if actual_hash != expected_hash {
@@ -1437,6 +1594,8 @@ pub enum RulFormatError {
     InvalidTokenMode(u32),
     /// Unrecognized `ProofRuleKind` encoding.
     InvalidProofRule(u16),
+    /// Non-zero trailing reserved bytes in `RulHeader[48..64]`.
+    InvalidReservedHeader,
 }
 
 impl fmt::Display for RulFormatError {
@@ -1462,6 +1621,9 @@ impl fmt::Display for RulFormatError {
             Self::InvalidScheduleHint(sh) => write!(f, "invalid ScheduleHint byte: {sh:#04x}"),
             Self::InvalidTokenMode(raw) => write!(f, "invalid TokenOp encoding: {raw:#010x}"),
             Self::InvalidProofRule(rule) => write!(f, "invalid ProofRuleKind: {rule}"),
+            Self::InvalidReservedHeader => {
+                write!(f, "non-zero reserved bytes in .rl header[48..64]")
+            }
         }
     }
 }

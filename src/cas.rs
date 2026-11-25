@@ -245,6 +245,31 @@ pub struct VerifiedCasEntry {
     pub summary: VerifiedSummary,
 }
 
+/// Errors returned by [`RulCasStore::insert_verified`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasError {
+    /// Program failed $O(N)$ linear verification before admission.
+    VerificationFailed(VerifyDiagnostic),
+    /// A distinct program is already stored under the same 64-bit [`CasHash`].
+    HashCollision {
+        /// Colliding 64-bit content hash.
+        hash: CasHash,
+    },
+}
+
+impl fmt::Display for CasError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VerificationFailed(diag) => write!(f, "CAS verification failed: {diag}"),
+            Self::HashCollision { hash } => {
+                write!(f, "CAS hash collision for distinct program at {hash}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CasError {}
+
 /// In-memory Content-Addressed Store (`rul-cas`) that only admits statically verified `.rl` graphs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RulCasStore {
@@ -263,11 +288,21 @@ impl RulCasStore {
     /// Verifies `program` in $O(N)$ and inserts it into the content-addressed store under its
     /// 64-bit graph hash.
     ///
+    /// Re-inserting an identical program is idempotent. Attempting to insert a distinct program
+    /// whose 64-bit hash collides with an existing entry is rejected with [`CasError::HashCollision`].
+    ///
     /// # Errors
-    /// Returns [`VerifyDiagnostic`] if the program fails linear verification.
-    pub fn insert_verified(&mut self, program: RulProgram) -> Result<CasHash, VerifyDiagnostic> {
-        let summary = verify_program(&program)?;
+    /// Returns [`CasError::VerificationFailed`] if the program fails linear verification,
+    /// or [`CasError::HashCollision`] if a non-equal program already occupies the same [`CasHash`].
+    pub fn insert_verified(&mut self, program: RulProgram) -> Result<CasHash, CasError> {
+        let summary = verify_program(&program).map_err(CasError::VerificationFailed)?;
         let hash = CasHash::from_program(&program);
+        if let Some(existing) = self.entries.get(&hash) {
+            if existing.program == program {
+                return Ok(hash);
+            }
+            return Err(CasError::HashCollision { hash });
+        }
         self.entries.insert(
             hash,
             VerifiedCasEntry {
@@ -277,6 +312,23 @@ impl RulCasStore {
             },
         );
         Ok(hash)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_with_forced_hash_for_test(
+        &mut self,
+        forced_hash: CasHash,
+        program: RulProgram,
+        summary: VerifiedSummary,
+    ) {
+        self.entries.insert(
+            forced_hash,
+            VerifiedCasEntry {
+                hash: forced_hash,
+                program,
+                summary,
+            },
+        );
     }
 
     /// Retrieves a verified `.rl` entry by its 64-bit [`CasHash`].

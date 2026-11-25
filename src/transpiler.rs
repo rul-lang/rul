@@ -327,6 +327,8 @@ impl SymbolicGraphBuilder {
             proofs: self.proofs,
             nodes: self.nodes,
             output_node,
+            const_data: Vec::new(),
+            link_meta: Vec::new(),
         })
     }
 }
@@ -344,8 +346,11 @@ pub fn disassemble_rl(program: &RulProgram) -> String {
     );
     let _ = writeln!(
         out,
-        "HEADER : Magic=\"RUL\\x00\\x01\\x00\\x00\\x00\" | Hash={hash:#018x} | CapMask={:#06x} | Output=Node({})",
-        program.capability_mask, program.output_node
+        "HEADER : Magic=\"RUL\\x00\\x01\\x00\\x00\\x00\" | Hash={hash:#018x} | CapMask={:#06x} | Output=Node({}) | ConstData={}B | LinkMeta={}B",
+        program.capability_mask,
+        program.output_node,
+        program.const_data.len(),
+        program.link_meta.len()
     );
 
     for arena in &program.arenas {
@@ -414,6 +419,16 @@ pub fn disassemble_rl(program: &RulProgram) -> String {
             format!("func_id={}, arg0={arg0}, arg1={arg1}", frame.in_a)
         } else if frame.opcode == Opcode::CallArg {
             format!("arg2={}, arg3={}", frame.in_a, frame.in_b)
+        } else if frame.opcode == Opcode::ConstDataLen {
+            format!("seg={}", frame.in_a)
+        } else if frame.opcode == Opcode::ConstDataLoad {
+            format!("seg={}, idx={}", frame.in_a, frame.in_b)
+        } else if frame.opcode == Opcode::BrTable {
+            format!("sel={}, table={}", frame.in_a, frame.in_b)
+        } else if frame.opcode == Opcode::CallIndirect {
+            let (table_id, idx_node) = frame.decode_in_a_u16_pair();
+            let (arg0, arg1) = frame.decode_u16_pair();
+            format!("table={table_id}, idx={idx_node}, arg0={arg0}, arg1={arg1}")
         } else {
             format!("in_a={}, in_b={}", frame.in_a, frame.in_b)
         };
@@ -488,7 +503,82 @@ pub fn program_to_rls(program: &RulProgram) -> String {
         );
     }
 
+    let contiguous_const = const_data_is_contiguous_partition(program);
+    if !program.const_data.is_empty() && !contiguous_const {
+        let _ = writeln!(
+            out,
+            "const_data hex \"{}\"",
+            encode_hex(&program.const_data)
+        );
+    }
+    if !program.link_meta.is_empty() {
+        let _ = writeln!(out, "link_meta hex \"{}\"", encode_hex(&program.link_meta));
+    }
+
     for (idx, proof) in program.proofs.iter().enumerate() {
+        if contiguous_const {
+            match proof.rule_kind {
+                ProofRuleKind::ConstDataSeg => {
+                    let lo = proof.bound_lo as usize;
+                    let hi = lo.saturating_add(proof.bound_hi as usize);
+                    if let Some(slice) = program.const_data.get(lo..hi) {
+                        if is_printable_rls_string(slice) {
+                            let _ = writeln!(
+                                out,
+                                "data seg {} \"{}\"",
+                                proof.target_arena,
+                                escape_rls_string(slice)
+                            );
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "data seg {} hex \"{}\"",
+                                proof.target_arena,
+                                encode_hex(slice)
+                            );
+                        }
+                        continue;
+                    }
+                }
+                ProofRuleKind::BrTableSpec => {
+                    let lo = proof.bound_lo as usize;
+                    let byte_len = (proof.bound_hi as usize).saturating_mul(4);
+                    if let Some(slice) = program.const_data.get(lo..lo.saturating_add(byte_len)) {
+                        let mut targets = String::new();
+                        for (i, chunk) in slice.as_chunks::<4>().0.iter().enumerate() {
+                            if i > 0 {
+                                targets.push(',');
+                            }
+                            let d = u32::from_le_bytes(*chunk);
+                            let _ = write!(targets, "{d}");
+                        }
+                        let _ = writeln!(
+                            out,
+                            "br_table {} default={} targets={targets}",
+                            proof.witness_node, proof.target_arena
+                        );
+                        continue;
+                    }
+                }
+                ProofRuleKind::CallTable => {
+                    let lo = proof.bound_lo as usize;
+                    let byte_len = (proof.bound_hi as usize).saturating_mul(4);
+                    if let Some(slice) = program.const_data.get(lo..lo.saturating_add(byte_len)) {
+                        let mut funcs = String::new();
+                        for (i, chunk) in slice.as_chunks::<4>().0.iter().enumerate() {
+                            if i > 0 {
+                                funcs.push(',');
+                            }
+                            let fid = u32::from_le_bytes(*chunk);
+                            let _ = write!(funcs, "{fid}");
+                        }
+                        let _ = writeln!(out, "call_table {} funcs={funcs}", proof.target_arena);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
         if proof.rule_kind == ProofRuleKind::FuncRegionEffect {
             if let Some(eff) = proof.decode_func_region_effect() {
                 let slot_s = eff
@@ -524,6 +614,10 @@ pub fn program_to_rls(program: &RulProgram) -> String {
             ProofRuleKind::RegionDecl => "region_decl",
             ProofRuleKind::RegionIndexInBounds => "region_index_in_bounds",
             ProofRuleKind::FuncRegionEffect => "func_region_effect",
+            ProofRuleKind::ConstDataSeg => "const_data_seg",
+            ProofRuleKind::ConstDataInBounds => "const_data_in_bounds",
+            ProofRuleKind::BrTableSpec => "br_table_spec",
+            ProofRuleKind::CallTable => "call_table",
         };
         let (hi_str, witness_str) = if proof.rule_kind == ProofRuleKind::FuncSig {
             if let Some(sig) = proof.decode_func_sig() {
@@ -662,6 +756,32 @@ pub fn program_to_rls(program: &RulProgram) -> String {
                 "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={} b={b_ref} c={c_ref}",
                 frame.schedule.fusion_group, frame.proof_idx, frame.in_a
             );
+        } else if frame.opcode == Opcode::CallIndirect {
+            let (table_id, idx_node) = frame.decode_in_a_u16_pair();
+            let (arg0, arg1) = frame.decode_u16_pair();
+            let sentinel = u32::from(CALL_ARG_SENTINEL);
+            let idx_ref = format_node_ref(
+                current_func_start,
+                total_nodes,
+                frame.opcode,
+                true,
+                idx_node,
+            );
+            let b_ref = if arg0 == sentinel {
+                "none".to_owned()
+            } else {
+                format_node_ref(current_func_start, total_nodes, frame.opcode, false, arg0)
+            };
+            let c_ref = if arg1 == sentinel {
+                "none".to_owned()
+            } else {
+                format_node_ref(current_func_start, total_nodes, frame.opcode, false, arg1)
+            };
+            let _ = writeln!(
+                out,
+                "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} table={table_id} idx={idx_ref} b={b_ref} c={c_ref}",
+                frame.schedule.fusion_group, frame.proof_idx
+            );
         } else if frame.opcode == Opcode::CallArg {
             let sentinel = u32::from(CALL_ARG_SENTINEL);
             let a_ref = if frame.in_a == sentinel {
@@ -713,6 +833,7 @@ pub fn program_to_rls(program: &RulProgram) -> String {
             Opcode::ArenaInput
                 | Opcode::ArenaMutate
                 | Opcode::LocalSet
+                | Opcode::ConstDataLoad
                 | Opcode::RegionNew
                 | Opcode::RegionGrow
                 | Opcode::RegionLoad
@@ -732,6 +853,7 @@ pub fn program_to_rls(program: &RulProgram) -> String {
         } else if matches!(
             frame.opcode,
             Opcode::LocalGet
+                | Opcode::ConstDataLen
                 | Opcode::Block
                 | Opcode::Loop
                 | Opcode::Br
@@ -748,7 +870,7 @@ pub fn program_to_rls(program: &RulProgram) -> String {
                 "node $n{idx} = {op_str} {lane_str} fg={} pol={pol_str} proof={} tok={tok_str} a={} b={}",
                 frame.schedule.fusion_group, frame.proof_idx, frame.in_a, frame.in_b
             );
-        } else if matches!(frame.opcode, Opcode::If | Opcode::BrIf) {
+        } else if matches!(frame.opcode, Opcode::If | Opcode::BrIf | Opcode::BrTable) {
             let a_ref = format_node_ref(
                 current_func_start,
                 total_nodes,
@@ -822,6 +944,10 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
     let mut arenas: Vec<ArenaDescriptor> = Vec::new();
     let mut proofs: Vec<ProofEntry> = Vec::new();
     let mut nodes: Vec<NodeFrame> = Vec::new();
+    let mut const_data: Vec<u8> = Vec::new();
+    let mut link_meta: Vec<u8> = Vec::new();
+    let mut seg_symbols: HashMap<String, u16> = HashMap::new();
+    let mut next_seg_id: u16 = 0;
     let mut global_symbols: HashMap<String, u32> = HashMap::new();
     let mut func_symbols: HashMap<String, u32> = HashMap::new();
     let mut current_func_start: Option<u32> = None;
@@ -830,7 +956,7 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
 
     for (line_idx, raw_line) in source.lines().enumerate() {
         let line_no = line_idx + 1;
-        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let line = strip_rls_comment(raw_line).trim();
         if line.is_empty() {
             continue;
         }
@@ -855,8 +981,34 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
                 let arena = parse_arena_line(line_no, parts, arenas.len())?;
                 arenas.push(arena);
             }
+            "data" => {
+                let proof = parse_data_seg_line(
+                    line_no,
+                    line,
+                    &mut const_data,
+                    &mut seg_symbols,
+                    &mut next_seg_id,
+                )?;
+                proofs.push(proof);
+            }
+            "const_data" => {
+                let bytes = parse_hex_section_line(line_no, line, "const_data")?;
+                const_data.extend_from_slice(&bytes);
+            }
+            "link_meta" => {
+                let bytes = parse_hex_section_line(line_no, line, "link_meta")?;
+                link_meta.extend_from_slice(&bytes);
+            }
+            "br_table" => {
+                let proof = parse_br_table_line(line_no, parts, &mut const_data)?;
+                proofs.push(proof);
+            }
+            "call_table" => {
+                let proof = parse_call_table_line(line_no, parts, &mut const_data)?;
+                proofs.push(proof);
+            }
             "proof" => {
-                let proof = parse_proof_line(line_no, parts)?;
+                let proof = parse_proof_line(line_no, parts, &seg_symbols)?;
                 proofs.push(proof);
             }
             "node" => {
@@ -866,6 +1018,7 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
                     &mut nodes,
                     &mut global_symbols,
                     &mut func_symbols,
+                    &seg_symbols,
                     &mut current_func_start,
                     &mut ctrl_depth,
                 )?;
@@ -902,6 +1055,8 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
         proofs,
         nodes,
         output_node,
+        const_data,
+        link_meta,
     })
 }
 
@@ -1018,6 +1173,7 @@ fn parse_region_state(line_no: usize, raw: &str) -> Result<u32, RlsError> {
 fn parse_proof_line<'a>(
     line_no: usize,
     mut parts: impl Iterator<Item = &'a str>,
+    seg_symbols: &HashMap<String, u16>,
 ) -> Result<ProofEntry, RlsError> {
     let first_tok = parts.next().ok_or_else(|| RlsError::LineParse {
         line: line_no,
@@ -1057,6 +1213,12 @@ fn parse_proof_line<'a>(
                     "func_region_effect" | "FuncRegionEffect" | "8" => {
                         ProofRuleKind::FuncRegionEffect
                     }
+                    "const_data_seg" | "ConstDataSeg" | "9" => ProofRuleKind::ConstDataSeg,
+                    "const_data_in_bounds" | "ConstDataInBounds" | "10" => {
+                        ProofRuleKind::ConstDataInBounds
+                    }
+                    "br_table_spec" | "BrTableSpec" | "11" => ProofRuleKind::BrTableSpec,
+                    "call_table" | "CallTable" | "12" => ProofRuleKind::CallTable,
                     _ => {
                         return Err(RlsError::LineParse {
                             line: line_no,
@@ -1066,10 +1228,14 @@ fn parse_proof_line<'a>(
                 };
             }
             "target" | "func" => {
-                target_arena = v.parse::<u16>().map_err(|_e| RlsError::LineParse {
-                    line: line_no,
-                    message: format!("invalid target arena '{v}'"),
-                })?;
+                target_arena = if let Some(&seg_id) = seg_symbols.get(v) {
+                    seg_id
+                } else {
+                    v.parse::<u16>().map_err(|_e| RlsError::LineParse {
+                        line: line_no,
+                        message: format!("invalid target arena '{v}'"),
+                    })?
+                };
             }
             "lo" | "slot" => {
                 bound_lo = if v == "none" || v == "None" {
@@ -1215,12 +1381,17 @@ fn parse_proof_line<'a>(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single-pass .rls node line parser tracking symbol tables and control depth"
+)]
 fn parse_node_line<'a>(
     line_no: usize,
     mut parts: impl Iterator<Item = &'a str>,
     nodes: &mut Vec<NodeFrame>,
     global_symbols: &mut HashMap<String, u32>,
     func_symbols: &mut HashMap<String, u32>,
+    seg_symbols: &HashMap<String, u16>,
     current_func_start: &mut Option<u32>,
     ctrl_depth: &mut usize,
 ) -> Result<(), RlsError> {
@@ -1260,6 +1431,8 @@ fn parse_node_line<'a>(
     let mut raw_a: Option<&str> = None;
     let mut raw_b: Option<&str> = None;
     let mut raw_c: Option<&str> = None;
+    let mut raw_table: Option<&str> = None;
+    let mut raw_idx: Option<&str> = None;
 
     for kv in parts {
         let Some((k, v)) = kv.split_once('=') else {
@@ -1315,6 +1488,12 @@ fn parse_node_line<'a>(
             "c" => {
                 raw_c = Some(v);
             }
+            "table" => {
+                raw_table = Some(v);
+            }
+            "idx" => {
+                raw_idx = Some(v);
+            }
             _ => {
                 return Err(RlsError::LineParse {
                     line: line_no,
@@ -1360,8 +1539,40 @@ fn parse_node_line<'a>(
         }
         f
     } else {
-        let in_a = if let Some(a_str) = raw_a {
-            if matches!(
+        let in_a = if opcode == Opcode::CallIndirect {
+            let table_str = raw_table.or(raw_a).ok_or_else(|| RlsError::LineParse {
+                line: line_no,
+                message: "CallIndirect requires table=<u16> and idx=<node>".to_owned(),
+            })?;
+            let idx_str = raw_idx.ok_or_else(|| RlsError::LineParse {
+                line: line_no,
+                message: "CallIndirect requires table=<u16> and idx=<node>".to_owned(),
+            })?;
+            let table_id = table_str.parse::<u16>().map_err(|_e| RlsError::LineParse {
+                line: line_no,
+                message: format!("invalid CallIndirect table id '{table_str}'"),
+            })?;
+            let idx_node = resolve_sym_or_u32(line_no, idx_str, active_symbols)?;
+            let idx16 = u16::try_from(idx_node).map_err(|_e| {
+                RlsError::Symbol(TranspileError::FmaOperandIndexOverflow {
+                    symbol: idx_str.to_owned(),
+                    node_idx: idx_node,
+                })
+            })?;
+            NodeFrame::encode_u16_pair(table_id, idx16)
+        } else if let Some(a_str) = raw_a {
+            if matches!(opcode, Opcode::ConstDataLen | Opcode::ConstDataLoad) {
+                if let Some(&seg_id) = seg_symbols.get(a_str) {
+                    u32::from(seg_id)
+                } else {
+                    a_str.parse::<u32>().map_err(|_e| RlsError::LineParse {
+                        line: line_no,
+                        message: format!(
+                            "expected numeric or named const data segment for a=, got '{a_str}'"
+                        ),
+                    })?
+                }
+            } else if matches!(
                 opcode,
                 Opcode::ArenaInput
                     | Opcode::ArenaMutate
@@ -1426,7 +1637,7 @@ fn parse_node_line<'a>(
                 })
             })?;
             NodeFrame::encode_u16_pair(b16, c16)
-        } else if opcode == Opcode::Call {
+        } else if matches!(opcode, Opcode::Call | Opcode::CallIndirect) {
             let arg0 = match raw_b {
                 None | Some("none") => CALL_ARG_SENTINEL,
                 Some(b_str) => {
@@ -1461,6 +1672,7 @@ fn parse_node_line<'a>(
             if matches!(
                 opcode,
                 Opcode::LocalGet
+                    | Opcode::ConstDataLen
                     | Opcode::Block
                     | Opcode::Loop
                     | Opcode::If
@@ -1468,6 +1680,7 @@ fn parse_node_line<'a>(
                     | Opcode::End
                     | Opcode::Br
                     | Opcode::BrIf
+                    | Opcode::BrTable
                     | Opcode::RegionLen
                     | Opcode::RegionFree
                     | Opcode::RegionLease
@@ -1705,6 +1918,8 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::ConstI64 => "ConstI64",
         Opcode::LocalGet => "LocalGet",
         Opcode::LocalSet => "LocalSet",
+        Opcode::ConstDataLen => "ConstDataLen",
+        Opcode::ConstDataLoad => "ConstDataLoad",
         Opcode::Add => "Add",
         Opcode::Sub => "Sub",
         Opcode::Mul => "Mul",
@@ -1762,6 +1977,8 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::Return => "Return",
         Opcode::Call => "Call",
         Opcode::CallArg => "CallArg",
+        Opcode::BrTable => "BrTable",
+        Opcode::CallIndirect => "CallIndirect",
     }
 }
 
@@ -1796,6 +2013,8 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "ConstI64" => Opcode::ConstI64,
         "LocalGet" => Opcode::LocalGet,
         "LocalSet" => Opcode::LocalSet,
+        "ConstDataLen" => Opcode::ConstDataLen,
+        "ConstDataLoad" => Opcode::ConstDataLoad,
         "Add" => Opcode::Add,
         "Sub" => Opcode::Sub,
         "Mul" => Opcode::Mul,
@@ -1853,6 +2072,8 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "Return" => Opcode::Return,
         "Call" => Opcode::Call,
         "CallArg" => Opcode::CallArg,
+        "BrTable" => Opcode::BrTable,
+        "CallIndirect" => Opcode::CallIndirect,
         _ => {
             return Err(RlsError::LineParse {
                 line: line_no,
@@ -1982,4 +2203,480 @@ fn format_node_ref(
     } else {
         idx.to_string()
     }
+}
+
+fn strip_rls_comment(raw_line: &str) -> &str {
+    let bytes = raw_line.as_bytes();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_quotes = false;
+            }
+        } else if b == b'"' {
+            in_quotes = true;
+        } else if b == b'#' {
+            return raw_line.get(..i).unwrap_or(raw_line);
+        }
+    }
+    raw_line
+}
+
+fn const_data_is_contiguous_partition(program: &RulProgram) -> bool {
+    let mut cursor: usize = 0;
+    for proof in &program.proofs {
+        match proof.rule_kind {
+            ProofRuleKind::ConstDataSeg => {
+                if proof.witness_node != 0 {
+                    return false;
+                }
+                let lo = proof.bound_lo as usize;
+                let len = proof.bound_hi as usize;
+                if lo != cursor {
+                    return false;
+                }
+                let Some(next) = cursor.checked_add(len) else {
+                    return false;
+                };
+                if next > program.const_data.len() {
+                    return false;
+                }
+                cursor = next;
+            }
+            ProofRuleKind::BrTableSpec => {
+                let lo = proof.bound_lo as usize;
+                let count = proof.bound_hi as usize;
+                if count == 0 || lo != cursor {
+                    return false;
+                }
+                let Some(byte_len) = count.checked_mul(4) else {
+                    return false;
+                };
+                let Some(next) = cursor.checked_add(byte_len) else {
+                    return false;
+                };
+                if next > program.const_data.len() {
+                    return false;
+                }
+                cursor = next;
+            }
+            ProofRuleKind::CallTable => {
+                if proof.witness_node != 0 {
+                    return false;
+                }
+                let lo = proof.bound_lo as usize;
+                let count = proof.bound_hi as usize;
+                if count == 0 || lo != cursor {
+                    return false;
+                }
+                let Some(byte_len) = count.checked_mul(4) else {
+                    return false;
+                };
+                let Some(next) = cursor.checked_add(byte_len) else {
+                    return false;
+                };
+                if next > program.const_data.len() {
+                    return false;
+                }
+                cursor = next;
+            }
+            _ => {}
+        }
+    }
+    cursor == program.const_data.len()
+}
+
+fn is_printable_rls_string(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&b| matches!(b, 0x20..=0x7E | b'\n' | b'\r' | b'\t'))
+}
+
+fn escape_rls_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7E => out.push(char::from(b)),
+            other => {
+                let _ = write!(out, "\\x{other:02x}");
+            }
+        }
+    }
+    out
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hex(line_no: usize, raw: &str) -> Result<Vec<u8>, RlsError> {
+    let mut nibbles: Vec<u8> = Vec::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_whitespace() || b == b'_' {
+            continue;
+        }
+        let n = hex_nibble(b).ok_or_else(|| RlsError::LineParse {
+            line: line_no,
+            message: format!("invalid hex byte in '{raw}'"),
+        })?;
+        nibbles.push(n);
+    }
+    if (nibbles.len() & 1) != 0 {
+        return Err(RlsError::LineParse {
+            line: line_no,
+            message: "hex literal must have an even number of hex digits".to_owned(),
+        });
+    }
+    let mut out = Vec::with_capacity(nibbles.len() / 2);
+    for &[hi, lo] in nibbles.as_chunks::<2>().0 {
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn parse_quoted_rls_string(line_no: usize, raw: &str) -> Result<Vec<u8>, RlsError> {
+    let trimmed = raw.trim();
+    let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return Err(RlsError::LineParse {
+            line: line_no,
+            message: format!("expected double-quoted string literal, got '{trimmed}'"),
+        });
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some(&b) = bytes.get(i) else {
+            break;
+        };
+        if b == b'"' {
+            return Err(RlsError::LineParse {
+                line: line_no,
+                message: "unescaped '\"' inside string literal".to_owned(),
+            });
+        }
+        if b == b'\\' {
+            let Some(&esc) = bytes.get(i + 1) else {
+                return Err(RlsError::LineParse {
+                    line: line_no,
+                    message: "unterminated escape sequence in string literal".to_owned(),
+                });
+            };
+            match esc {
+                b'\\' => {
+                    out.push(b'\\');
+                    i += 2;
+                }
+                b'"' => {
+                    out.push(b'"');
+                    i += 2;
+                }
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'0' => {
+                    out.push(0);
+                    i += 2;
+                }
+                b'x' => {
+                    let (Some(&h1), Some(&h2)) = (bytes.get(i + 2), bytes.get(i + 3)) else {
+                        return Err(RlsError::LineParse {
+                            line: line_no,
+                            message: "truncated \\xHH escape in string literal".to_owned(),
+                        });
+                    };
+                    let (Some(n1), Some(n2)) = (hex_nibble(h1), hex_nibble(h2)) else {
+                        return Err(RlsError::LineParse {
+                            line: line_no,
+                            message: "invalid hex digit in \\xHH escape".to_owned(),
+                        });
+                    };
+                    out.push((n1 << 4) | n2);
+                    i += 4;
+                }
+                other => {
+                    return Err(RlsError::LineParse {
+                        line: line_no,
+                        message: format!("unknown string escape '\\{}'", char::from(other)),
+                    });
+                }
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn split_first_token(s: &str) -> Option<(&str, &str)> {
+    let trimmed = s.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(pos) = trimmed.find(char::is_whitespace) {
+        Some((
+            trimmed.get(..pos).unwrap_or(""),
+            trimmed.get(pos..).unwrap_or("").trim_start(),
+        ))
+    } else {
+        Some((trimmed, ""))
+    }
+}
+
+fn parse_data_seg_line(
+    line_no: usize,
+    line: &str,
+    const_data: &mut Vec<u8>,
+    seg_symbols: &mut HashMap<String, u16>,
+    next_seg_id: &mut u16,
+) -> Result<ProofEntry, RlsError> {
+    let (_, rest) = split_first_token(line).ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "malformed data directive".to_owned(),
+    })?;
+    let (kw, rest) = split_first_token(rest).ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "expected 'seg' after 'data'".to_owned(),
+    })?;
+    if kw != "seg" {
+        return Err(RlsError::LineParse {
+            line: line_no,
+            message: format!("expected 'data seg <id> ...', got 'data {kw}'"),
+        });
+    }
+    let (id_tok, rest) = split_first_token(rest).ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "missing segment id after 'data seg'".to_owned(),
+    })?;
+    let seg_id = if let Ok(num) = id_tok.parse::<u16>() {
+        *next_seg_id = (*next_seg_id).max(num.saturating_add(1));
+        num
+    } else {
+        if seg_symbols.contains_key(id_tok) {
+            return Err(RlsError::Symbol(TranspileError::DuplicateSymbol(
+                id_tok.to_owned(),
+            )));
+        }
+        let assigned = *next_seg_id;
+        *next_seg_id = assigned.saturating_add(1);
+        seg_symbols.insert(id_tok.to_owned(), assigned);
+        assigned
+    };
+
+    let bytes = if let Some(after_hex) = rest.strip_prefix("hex") {
+        if after_hex.is_empty()
+            || !after_hex
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            return Err(RlsError::LineParse {
+                line: line_no,
+                message: "expected whitespace and quoted hex string after 'hex'".to_owned(),
+            });
+        }
+        let trimmed = after_hex.trim();
+        let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+            return Err(RlsError::LineParse {
+                line: line_no,
+                message: format!("expected quoted hex string, got '{trimmed}'"),
+            });
+        };
+        decode_hex(line_no, inner)?
+    } else {
+        parse_quoted_rls_string(line_no, rest)?
+    };
+
+    let offset = u32::try_from(const_data.len()).map_err(|_e| RlsError::LineParse {
+        line: line_no,
+        message: "const_data section offset exceeds u32::MAX".to_owned(),
+    })?;
+    let len = u32::try_from(bytes.len()).map_err(|_e| RlsError::LineParse {
+        line: line_no,
+        message: "const_data segment length exceeds u32::MAX".to_owned(),
+    })?;
+    const_data.extend_from_slice(&bytes);
+    Ok(ProofEntry::const_data_seg(seg_id, offset, len))
+}
+
+fn parse_hex_section_line(
+    line_no: usize,
+    line: &str,
+    directive: &str,
+) -> Result<Vec<u8>, RlsError> {
+    let (_, rest) = split_first_token(line).ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: format!("malformed {directive} directive"),
+    })?;
+    let (kw, rest) = split_first_token(rest).ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: format!("expected 'hex' after '{directive}'"),
+    })?;
+    if kw != "hex" {
+        return Err(RlsError::LineParse {
+            line: line_no,
+            message: format!("expected '{directive} hex \"...\"', got '{kw}'"),
+        });
+    }
+    let trimmed = rest.trim();
+    let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return Err(RlsError::LineParse {
+            line: line_no,
+            message: format!("expected quoted hex string in {directive}"),
+        });
+    };
+    decode_hex(line_no, inner)
+}
+
+fn parse_br_table_line<'a>(
+    line_no: usize,
+    mut parts: impl Iterator<Item = &'a str>,
+    const_data: &mut Vec<u8>,
+) -> Result<ProofEntry, RlsError> {
+    let id_tok = parts.next().ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "missing br_table id".to_owned(),
+    })?;
+    let br_table_id = id_tok.parse::<u32>().map_err(|_e| RlsError::LineParse {
+        line: line_no,
+        message: format!("invalid br_table id '{id_tok}'"),
+    })?;
+    let mut default_depth: Option<u16> = None;
+    let mut targets_raw: Option<&str> = None;
+    for kv in parts {
+        let Some((k, v)) = kv.split_once('=') else {
+            return Err(RlsError::LineParse {
+                line: line_no,
+                message: format!("expected key=value in br_table directive, got '{kv}'"),
+            });
+        };
+        match k {
+            "default" => {
+                default_depth = Some(v.parse::<u16>().map_err(|_e| RlsError::LineParse {
+                    line: line_no,
+                    message: format!("invalid br_table default depth '{v}'"),
+                })?);
+            }
+            "targets" => {
+                targets_raw = Some(v);
+            }
+            _ => {
+                return Err(RlsError::LineParse {
+                    line: line_no,
+                    message: format!("unknown br_table attribute '{k}'"),
+                });
+            }
+        }
+    }
+    let def = default_depth.ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "br_table requires default=<u16>".to_owned(),
+    })?;
+    let targets_str = targets_raw.ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "br_table requires targets=<d0,d1,...>".to_owned(),
+    })?;
+    let offset = u32::try_from(const_data.len()).map_err(|_e| RlsError::LineParse {
+        line: line_no,
+        message: "const_data section offset exceeds u32::MAX".to_owned(),
+    })?;
+    let mut count: u32 = 0;
+    for tok in targets_str.split(',') {
+        let d = tok
+            .trim()
+            .parse::<u32>()
+            .map_err(|_e| RlsError::LineParse {
+                line: line_no,
+                message: format!("invalid br_table target depth '{tok}'"),
+            })?;
+        const_data.extend_from_slice(&d.to_le_bytes());
+        count = count.saturating_add(1);
+    }
+    Ok(ProofEntry::br_table_spec(br_table_id, def, offset, count))
+}
+
+fn parse_call_table_line<'a>(
+    line_no: usize,
+    mut parts: impl Iterator<Item = &'a str>,
+    const_data: &mut Vec<u8>,
+) -> Result<ProofEntry, RlsError> {
+    let id_tok = parts.next().ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "missing call_table id".to_owned(),
+    })?;
+    let table_id = id_tok.parse::<u16>().map_err(|_e| RlsError::LineParse {
+        line: line_no,
+        message: format!("invalid call_table id '{id_tok}'"),
+    })?;
+    let mut funcs_raw: Option<&str> = None;
+    for kv in parts {
+        let Some((k, v)) = kv.split_once('=') else {
+            return Err(RlsError::LineParse {
+                line: line_no,
+                message: format!("expected key=value in call_table directive, got '{kv}'"),
+            });
+        };
+        if k == "funcs" {
+            funcs_raw = Some(v);
+        } else {
+            return Err(RlsError::LineParse {
+                line: line_no,
+                message: format!("unknown call_table attribute '{k}'"),
+            });
+        }
+    }
+    let funcs_str = funcs_raw.ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: "call_table requires funcs=<f0,f1,...>".to_owned(),
+    })?;
+    let offset = u32::try_from(const_data.len()).map_err(|_e| RlsError::LineParse {
+        line: line_no,
+        message: "const_data section offset exceeds u32::MAX".to_owned(),
+    })?;
+    let mut count: u32 = 0;
+    for tok in funcs_str.split(',') {
+        let fid = tok
+            .trim()
+            .parse::<u32>()
+            .map_err(|_e| RlsError::LineParse {
+                line: line_no,
+                message: format!("invalid call_table func_id '{tok}'"),
+            })?;
+        const_data.extend_from_slice(&fid.to_le_bytes());
+        count = count.saturating_add(1);
+    }
+    Ok(ProofEntry::call_table(table_id, offset, count))
 }

@@ -303,6 +303,28 @@ pub enum ExecError {
         /// Attempted live ISA stack frame units sum.
         stack_units: u32,
     },
+    /// `ConstDataLoad` byte offset fell outside `[0, seg_len - elem_bytes]` (`AOT_EXIT_GATHER_OOB = 71`).
+    ConstDataOutOfBounds {
+        /// Offending `ConstDataLoad` node index.
+        node_idx: u32,
+        /// Target constant-data segment identifier.
+        seg_id: u32,
+        /// Observed byte offset index.
+        index: i64,
+        /// Byte length of the target constant-data segment.
+        seg_len: u32,
+    },
+    /// `CallIndirect` index fell outside `0..entry_count` (`AOT_EXIT_INDIRECT_CALL_OOB = 76`).
+    IndirectCallOutOfBounds {
+        /// Offending `CallIndirect` node index.
+        node_idx: u32,
+        /// Target `CallTable` identifier.
+        table_id: u32,
+        /// Observed table index.
+        index: i64,
+        /// Entry count of the target `CallTable`.
+        entry_count: u32,
+    },
 }
 
 impl fmt::Display for ExecError {
@@ -364,6 +386,24 @@ impl fmt::Display for ExecError {
             } => write!(
                 f,
                 "call stack guard exceeded (depth={call_depth}/{MAX_CALL_DEPTH}, stack_units={stack_units}/{MAX_STACK_UNITS})"
+            ),
+            Self::ConstDataOutOfBounds {
+                node_idx,
+                seg_id,
+                index,
+                seg_len,
+            } => write!(
+                f,
+                "const data load out of bounds at node #{node_idx} (seg #{seg_id}): index={index}, seg_len={seg_len}"
+            ),
+            Self::IndirectCallOutOfBounds {
+                node_idx,
+                table_id,
+                index,
+                entry_count,
+            } => write!(
+                f,
+                "indirect call index out of bounds at node #{node_idx} (table #{table_id}): index={index}, entry_count={entry_count}"
             ),
         }
     }
@@ -450,7 +490,9 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
-            | Opcode::CallArg => {}
+            | Opcode::CallArg
+            | Opcode::ConstDataLen
+            | Opcode::CallIndirect => {}
             Opcode::ArenaSlice
             | Opcode::Abs
             | Opcode::Sqrt
@@ -466,13 +508,15 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::RingEnqueue
             | Opcode::AssertContract
             | Opcode::If
-            | Opcode::BrIf => {
+            | Opcode::BrIf
+            | Opcode::BrTable => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
                     *a = true;
                 }
             }
             Opcode::ArenaMutate
             | Opcode::LocalSet
+            | Opcode::ConstDataLoad
             | Opcode::RegionNew
             | Opcode::RegionGrow
             | Opcode::RegionLoad => {
@@ -830,6 +874,201 @@ fn take_output_region_bytes(
 }
 
 #[derive(Debug, Clone, Copy)]
+struct Tier0ConstSeg {
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Tier0BrTable {
+    default_depth: usize,
+    case_depths: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct Tier0CallTable {
+    func_ids: Vec<usize>,
+}
+
+struct Tier0ConstTables {
+    const_segs: Vec<Tier0ConstSeg>,
+    br_tables: Vec<Tier0BrTable>,
+    call_tables: Vec<Tier0CallTable>,
+}
+
+fn scan_tier0_const_tables(program: &RulProgram) -> Result<Tier0ConstTables, ExecError> {
+    let mut raw_segs: Vec<(usize, Tier0ConstSeg)> = Vec::new();
+    let mut raw_br: Vec<(usize, Tier0BrTable)> = Vec::new();
+    let mut raw_call: Vec<(usize, Tier0CallTable)> = Vec::new();
+
+    for proof in &program.proofs {
+        match proof.rule_kind {
+            ProofRuleKind::ConstDataSeg => {
+                raw_segs.push((
+                    usize::from(proof.target_arena),
+                    Tier0ConstSeg {
+                        offset: proof.bound_lo as usize,
+                        len: proof.bound_hi as usize,
+                    },
+                ));
+            }
+            ProofRuleKind::BrTableSpec => {
+                let lo = proof.bound_lo as usize;
+                let count = proof.bound_hi as usize;
+                let slice = program
+                    .const_data
+                    .get(lo..lo.saturating_add(count.saturating_mul(4)))
+                    .ok_or(ExecError::InvalidOperandState(0))?;
+                let mut case_depths = Vec::with_capacity(count);
+                for chunk in slice.as_chunks::<4>().0 {
+                    let d = u32::from_le_bytes(*chunk);
+                    case_depths.push(d as usize);
+                }
+                raw_br.push((
+                    proof.witness_node as usize,
+                    Tier0BrTable {
+                        default_depth: usize::from(proof.target_arena),
+                        case_depths,
+                    },
+                ));
+            }
+            ProofRuleKind::CallTable => {
+                let lo = proof.bound_lo as usize;
+                let count = proof.bound_hi as usize;
+                let slice = program
+                    .const_data
+                    .get(lo..lo.saturating_add(count.saturating_mul(4)))
+                    .ok_or(ExecError::InvalidOperandState(0))?;
+                let mut func_ids = Vec::with_capacity(count);
+                for chunk in slice.as_chunks::<4>().0 {
+                    let fid = u32::from_le_bytes(*chunk);
+                    func_ids.push(fid as usize);
+                }
+                raw_call.push((usize::from(proof.target_arena), Tier0CallTable { func_ids }));
+            }
+            _ => {}
+        }
+    }
+
+    let mut segs: Vec<Tier0ConstSeg> = vec![Tier0ConstSeg { offset: 0, len: 0 }; raw_segs.len()];
+    for (id, seg) in raw_segs {
+        if let Some(slot) = segs.get_mut(id) {
+            *slot = seg;
+        }
+    }
+    let mut br_tables: Vec<Tier0BrTable> = vec![
+        Tier0BrTable {
+            default_depth: 0,
+            case_depths: Vec::new(),
+        };
+        raw_br.len()
+    ];
+    for (id, bt) in raw_br {
+        if let Some(slot) = br_tables.get_mut(id) {
+            *slot = bt;
+        }
+    }
+    let mut call_tables: Vec<Tier0CallTable> = vec![
+        Tier0CallTable {
+            func_ids: Vec::new(),
+        };
+        raw_call.len()
+    ];
+    for (id, ct) in raw_call {
+        if let Some(slot) = call_tables.get_mut(id) {
+            *slot = ct;
+        }
+    }
+    Ok(Tier0ConstTables {
+        const_segs: segs,
+        br_tables,
+        call_tables,
+    })
+}
+
+fn eval_const_data_load_tier0<'a>(
+    program: &RulProgram,
+    const_segs: &[Tier0ConstSeg],
+    frame: &NodeFrame,
+    node_idx: u32,
+    idx_i64: i64,
+) -> Result<EvalValue<'a>, ExecError> {
+    let seg = const_segs
+        .get(frame.in_a as usize)
+        .copied()
+        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+    let seg_len_u32 = u32::try_from(seg.len).unwrap_or(u32::MAX);
+    let elem_bytes = if frame.type_lane.elem == ElemType::I64 {
+        8usize
+    } else {
+        1usize
+    };
+    let Ok(idx_usize) = usize::try_from(idx_i64) else {
+        return Err(ExecError::ConstDataOutOfBounds {
+            node_idx,
+            seg_id: frame.in_a,
+            index: idx_i64,
+            seg_len: seg_len_u32,
+        });
+    };
+    let Some(end_rel) = idx_usize.checked_add(elem_bytes) else {
+        return Err(ExecError::ConstDataOutOfBounds {
+            node_idx,
+            seg_id: frame.in_a,
+            index: idx_i64,
+            seg_len: seg_len_u32,
+        });
+    };
+    if end_rel > seg.len {
+        return Err(ExecError::ConstDataOutOfBounds {
+            node_idx,
+            seg_id: frame.in_a,
+            index: idx_i64,
+            seg_len: seg_len_u32,
+        });
+    }
+    let abs_lo = seg.offset.saturating_add(idx_usize);
+    let abs_hi = abs_lo.saturating_add(elem_bytes);
+    let slice = program
+        .const_data
+        .get(abs_lo..abs_hi)
+        .ok_or(ExecError::ConstDataOutOfBounds {
+            node_idx,
+            seg_id: frame.in_a,
+            index: idx_i64,
+            seg_len: seg_len_u32,
+        })?;
+    if frame.type_lane.elem == ElemType::I64 {
+        let arr: [u8; 8] = slice
+            .try_into()
+            .map_err(|_e| ExecError::InvalidOperandState(node_idx))?;
+        Ok(EvalValue::ScalarI64(i64::from_le_bytes(arr)))
+    } else {
+        let byte = slice
+            .first()
+            .copied()
+            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+        Ok(EvalValue::ScalarU8(byte))
+    }
+}
+
+fn select_br_table_header(
+    sel_val: &EvalValue<'_>,
+    default_hdr: usize,
+    case_hdrs: &[usize],
+    node_idx: u32,
+) -> Result<usize, ExecError> {
+    let idx_opt = match *sel_val {
+        EvalValue::ScalarI64(v) => usize::try_from(v).ok(),
+        EvalValue::ScalarU8(b) => Some(usize::from(b)),
+        _ => return Err(ExecError::InvalidOperandState(node_idx)),
+    };
+    Ok(idx_opt
+        .and_then(|i| case_hdrs.get(i).copied())
+        .unwrap_or(default_hdr))
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Tier0FuncMeta {
     start: usize,
     end: usize,
@@ -871,6 +1110,11 @@ fn eval_functions_tier0<'a>(
     input_bytes: &[u8],
 ) -> Result<StructuredTier0Output<'a>, ExecError> {
     let (mut regions, output_region_slot) = init_tier0_regions(program, input_bytes)?;
+    let Tier0ConstTables {
+        const_segs,
+        br_tables,
+        call_tables,
+    } = scan_tier0_const_tables(program)?;
     let n = program.nodes.len();
 
     let mut sigs_raw: Vec<FuncSigInfo> = Vec::new();
@@ -894,6 +1138,7 @@ fn eval_functions_tier0<'a>(
     let mut else_to_if: Vec<usize> = vec![0; n];
     let mut header_to_end: Vec<usize> = vec![0; n];
     let mut br_target_header: Vec<usize> = vec![0; n];
+    let mut br_table_targets: Vec<Option<(usize, Vec<usize>)>> = vec![None; n];
     let mut stack: Vec<usize> = Vec::new();
     let mut func_starts: Vec<usize> = vec![0; func_count];
     let mut func_ends: Vec<usize> = vec![0; func_count];
@@ -965,6 +1210,34 @@ fn eval_functions_tier0<'a>(
                     .ok_or(ExecError::InvalidOperandState(node_idx))?;
                 if let Some(slot) = br_target_header.get_mut(idx) {
                     *slot = hdr;
+                }
+            }
+            Opcode::BrTable => {
+                let spec = br_tables
+                    .get(frame.in_b as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let def_pos = stack
+                    .len()
+                    .checked_sub(1 + spec.default_depth)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let default_hdr = stack
+                    .get(def_pos)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let mut case_hdrs = Vec::with_capacity(spec.case_depths.len());
+                for &d in &spec.case_depths {
+                    let pos = stack
+                        .len()
+                        .checked_sub(1 + d)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let hdr = stack
+                        .get(pos)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    case_hdrs.push(hdr);
+                }
+                if let Some(slot) = br_table_targets.get_mut(idx) {
+                    *slot = Some((default_hdr, case_hdrs));
                 }
             }
             _ => {}
@@ -1279,6 +1552,129 @@ fn eval_functions_tier0<'a>(
                         act.pc += 1;
                     }
                     FuncStepAction::Continue
+                }
+                Opcode::BrTable => {
+                    let sel_val = act
+                        .values
+                        .get(frame.in_a as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let (default_hdr, case_hdrs) = br_table_targets
+                        .get(pc)
+                        .and_then(Option::as_ref)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let hdr = select_br_table_header(sel_val, *default_hdr, case_hdrs, node_idx)?;
+                    act.pc = step_func_branch_target(
+                        program,
+                        hdr,
+                        act.func_start,
+                        node_idx,
+                        &header_to_end,
+                        &mut act.loop_fuel,
+                    )?;
+                    FuncStepAction::Continue
+                }
+                Opcode::ConstDataLen => {
+                    let seg = const_segs
+                        .get(frame.in_a as usize)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let seg_len = i64::try_from(seg.len)
+                        .map_err(|_e| ExecError::InvalidOperandState(node_idx))?;
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = EvalValue::ScalarI64(seg_len);
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::ConstDataLoad => {
+                    let idx_val = act
+                        .values
+                        .get(frame.in_b as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarI64(idx_i64) = *idx_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    let loaded =
+                        eval_const_data_load_tier0(program, &const_segs, frame, node_idx, idx_i64)?;
+                    let slot = act
+                        .values
+                        .get_mut(rel_pc)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    *slot = loaded;
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::CallIndirect => {
+                    let (table_id, index_node) = frame.decode_in_a_u16_pair();
+                    let table = call_tables
+                        .get(table_id as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let idx_val = act
+                        .values
+                        .get(index_node as usize)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let EvalValue::ScalarI64(idx_i64) = *idx_val else {
+                        return Err(ExecError::InvalidOperandState(node_idx));
+                    };
+                    let entry_count = u32::try_from(table.func_ids.len()).unwrap_or(u32::MAX);
+                    let Ok(idx_usize) = usize::try_from(idx_i64) else {
+                        return Err(ExecError::IndirectCallOutOfBounds {
+                            node_idx,
+                            table_id,
+                            index: idx_i64,
+                            entry_count,
+                        });
+                    };
+                    let target_func_id = table.func_ids.get(idx_usize).copied().ok_or(
+                        ExecError::IndirectCallOutOfBounds {
+                            node_idx,
+                            table_id,
+                            index: idx_i64,
+                            entry_count,
+                        },
+                    )?;
+                    let callee = funcs
+                        .get(target_func_id)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let (arg0_raw, arg1_raw) = frame.decode_u16_pair();
+                    let sentinel = u32::from(CALL_ARG_SENTINEL);
+                    let mut args = [
+                        EvalValue::Unused,
+                        EvalValue::Unused,
+                        EvalValue::Unused,
+                        EvalValue::Unused,
+                    ];
+                    if arg0_raw != sentinel {
+                        args[0] = act
+                            .values
+                            .get(arg0_raw as usize)
+                            .cloned()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    }
+                    if arg1_raw != sentinel {
+                        args[1] = act
+                            .values
+                            .get(arg1_raw as usize)
+                            .cloned()
+                            .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    }
+                    if let Some((a2, a3_opt)) = act.pending_call_args.take() {
+                        args[2] = a2;
+                        if let Some(a3) = a3_opt {
+                            args[3] = a3;
+                        }
+                    }
+                    act.pc += 1;
+                    let ret_dest_rel = callee.sig.ret_elem.map(|_| rel_pc);
+                    FuncStepAction::PushCall {
+                        target_func_id,
+                        args,
+                        arity: usize::from(callee.sig.arity),
+                        ret_dest_rel,
+                    }
                 }
                 Opcode::Return => {
                     let ret_val = if frame.in_a != 0 {
@@ -1684,12 +2080,18 @@ fn eval_structured_tier0<'a>(
         return eval_functions_tier0(program, inputs, input_bytes);
     }
     let (mut regions, output_region_slot) = init_tier0_regions(program, input_bytes)?;
+    let Tier0ConstTables {
+        const_segs,
+        br_tables,
+        call_tables: _,
+    } = scan_tier0_const_tables(program)?;
 
     let n = program.nodes.len();
     let mut if_to_else: Vec<Option<usize>> = vec![None; n];
     let mut else_to_if: Vec<usize> = vec![0; n];
     let mut header_to_end: Vec<usize> = vec![0; n];
     let mut br_target_header: Vec<usize> = vec![0; n];
+    let mut br_table_targets: Vec<Option<(usize, Vec<usize>)>> = vec![None; n];
     let mut stack: Vec<usize> = Vec::new();
 
     for (idx, frame) in program.nodes.iter().enumerate() {
@@ -1744,6 +2146,34 @@ fn eval_structured_tier0<'a>(
                     .ok_or(ExecError::InvalidOperandState(node_idx))?;
                 if let Some(slot) = br_target_header.get_mut(idx) {
                     *slot = hdr;
+                }
+            }
+            Opcode::BrTable => {
+                let spec = br_tables
+                    .get(frame.in_b as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let def_pos = stack
+                    .len()
+                    .checked_sub(1 + spec.default_depth)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let default_hdr = stack
+                    .get(def_pos)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let mut case_hdrs = Vec::with_capacity(spec.case_depths.len());
+                for &d in &spec.case_depths {
+                    let pos = stack
+                        .len()
+                        .checked_sub(1 + d)
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    let hdr = stack
+                        .get(pos)
+                        .copied()
+                        .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                    case_hdrs.push(hdr);
+                }
+                if let Some(slot) = br_table_targets.get_mut(idx) {
+                    *slot = Some((default_hdr, case_hdrs));
                 }
             }
             _ => {}
@@ -1922,6 +2352,45 @@ fn eval_structured_tier0<'a>(
                 } else {
                     pc += 1;
                 }
+            }
+            Opcode::BrTable => {
+                let sel_val = values
+                    .get(frame.in_a as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let (default_hdr, case_hdrs) = br_table_targets
+                    .get(pc)
+                    .and_then(Option::as_ref)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let hdr = select_br_table_header(sel_val, *default_hdr, case_hdrs, node_idx)?;
+                pc = step_branch_target(program, hdr, node_idx, &header_to_end, &mut loop_fuel)?;
+            }
+            Opcode::ConstDataLen => {
+                let seg = const_segs
+                    .get(frame.in_a as usize)
+                    .copied()
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let seg_len = i64::try_from(seg.len)
+                    .map_err(|_e| ExecError::InvalidOperandState(node_idx))?;
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = EvalValue::ScalarI64(seg_len);
+                pc += 1;
+            }
+            Opcode::ConstDataLoad => {
+                let idx_val = values
+                    .get(frame.in_b as usize)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                let EvalValue::ScalarI64(idx_i64) = *idx_val else {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                };
+                let loaded =
+                    eval_const_data_load_tier0(program, &const_segs, frame, node_idx, idx_i64)?;
+                let slot = values
+                    .get_mut(pc)
+                    .ok_or(ExecError::InvalidOperandState(node_idx))?;
+                *slot = loaded;
+                pc += 1;
             }
             Opcode::RegionNew => {
                 let slot_idx = frame.in_a as usize;
@@ -2563,7 +3032,11 @@ fn eval_node_tier0<'a>(
         | Opcode::Func
         | Opcode::Return
         | Opcode::Call
-        | Opcode::CallArg => Err(ExecError::UnsupportedInColumnarTier),
+        | Opcode::CallArg
+        | Opcode::ConstDataLen
+        | Opcode::ConstDataLoad
+        | Opcode::BrTable
+        | Opcode::CallIndirect => Err(ExecError::UnsupportedInColumnarTier),
     }
 }
 
@@ -3224,7 +3697,11 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
-            | Opcode::CallArg => return None,
+            | Opcode::CallArg
+            | Opcode::ConstDataLen
+            | Opcode::ConstDataLoad
+            | Opcode::BrTable
+            | Opcode::CallIndirect => return None,
         };
         if let Some(slot) = phases.get_mut(idx) {
             *slot = phase;
