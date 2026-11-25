@@ -10,8 +10,9 @@ use std::fmt::{self, Write as _};
 
 use crate::bytecode::{
     ArenaDescriptor, ElemType, ExecPolicy, NodeFrame, Opcode, ProofEntry, ProofRuleKind,
-    RegionRole, RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane,
+    RegionRole, RegionState, RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane,
     CALL_ARG_SENTINEL, CAP_DIVERGE, CAP_GPU_DISPATCH, CAP_NET_RING, CAP_NONE, CAP_STORAGE_DMA,
+    REGION_FOOTPRINT_NONE,
 };
 
 /// Error returned when resolving symbolic labels in [`SymbolicGraphBuilder`].
@@ -397,6 +398,13 @@ pub fn disassemble_rl(program: &RulProgram) -> String {
         } else if frame.opcode == Opcode::RegionStore {
             let (idx_node, val_node) = frame.decode_u16_pair();
             format!("slot={}, idx={idx_node}, val={val_node}", frame.in_a)
+        } else if frame.opcode == Opcode::RegionMove {
+            format!("src={}, dst={}", frame.in_a, frame.in_b)
+        } else if matches!(
+            frame.opcode,
+            Opcode::RegionLease | Opcode::RegionEndLease | Opcode::RegionDrop
+        ) {
+            format!("slot={}", frame.in_a)
         } else if frame.opcode == Opcode::Func {
             format!("func_id={}", frame.in_a)
         } else if frame.opcode == Opcode::Return {
@@ -481,6 +489,32 @@ pub fn program_to_rls(program: &RulProgram) -> String {
     }
 
     for (idx, proof) in program.proofs.iter().enumerate() {
+        if proof.rule_kind == ProofRuleKind::FuncRegionEffect {
+            if let Some(eff) = proof.decode_func_region_effect() {
+                let slot_s = eff
+                    .slot
+                    .map_or_else(|| "none".to_owned(), |s| s.to_string());
+                let pre_s = format_region_state(eff.pre);
+                let post_s = format_region_state(eff.post);
+                let _ = writeln!(
+                    out,
+                    "proof {} rule=func_region_effect func={} slot={slot_s} pre={pre_s} post={post_s}",
+                    idx + 1,
+                    eff.func_id,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "proof {} rule=func_region_effect target={} lo={} hi={} witness={}",
+                    idx + 1,
+                    proof.target_arena,
+                    proof.bound_lo,
+                    proof.bound_hi,
+                    proof.witness_node,
+                );
+            }
+            continue;
+        }
         let rule_str = match proof.rule_kind {
             ProofRuleKind::SliceBounds => "slice_bounds",
             ProofRuleKind::GatherIndexInBounds => "gather_bounds",
@@ -489,6 +523,7 @@ pub fn program_to_rls(program: &RulProgram) -> String {
             ProofRuleKind::FuncSig => "func_sig",
             ProofRuleKind::RegionDecl => "region_decl",
             ProofRuleKind::RegionIndexInBounds => "region_index_in_bounds",
+            ProofRuleKind::FuncRegionEffect => "func_region_effect",
         };
         let (hi_str, witness_str) = if proof.rule_kind == ProofRuleKind::FuncSig {
             if let Some(sig) = proof.decode_func_sig() {
@@ -702,6 +737,10 @@ pub fn program_to_rls(program: &RulProgram) -> String {
                 | Opcode::Br
                 | Opcode::RegionLen
                 | Opcode::RegionFree
+                | Opcode::RegionLease
+                | Opcode::RegionEndLease
+                | Opcode::RegionMove
+                | Opcode::RegionDrop
                 | Opcode::Func
         ) {
             let _ = writeln!(
@@ -950,16 +989,45 @@ fn parse_arena_line<'a>(
     })
 }
 
+fn format_region_state(state: RegionState) -> &'static str {
+    match state {
+        RegionState::Owned => "owned",
+        RegionState::Leased => "leased",
+        RegionState::Moved => "moved",
+    }
+}
+
+fn parse_region_state(line_no: usize, raw: &str) -> Result<u32, RlsError> {
+    if let Some(num) = parse_u64_auto(raw) {
+        return u32::try_from(num).map_err(|_e| RlsError::LineParse {
+            line: line_no,
+            message: format!("invalid region state '{raw}'"),
+        });
+    }
+    match raw {
+        "owned" | "Owned" => Ok(RegionState::Owned as u32),
+        "leased" | "Leased" => Ok(RegionState::Leased as u32),
+        "moved" | "Moved" => Ok(RegionState::Moved as u32),
+        _ => Err(RlsError::LineParse {
+            line: line_no,
+            message: format!("unknown region state '{raw}'"),
+        }),
+    }
+}
+
 fn parse_proof_line<'a>(
     line_no: usize,
     mut parts: impl Iterator<Item = &'a str>,
 ) -> Result<ProofEntry, RlsError> {
-    let _idx_tok = parts.next().ok_or_else(|| RlsError::LineParse {
+    let first_tok = parts.next().ok_or_else(|| RlsError::LineParse {
         line: line_no,
         message: "missing proof index".to_owned(),
     })?;
 
-    let mut rule_kind = ProofRuleKind::SliceBounds;
+    let mut rule_kind = match first_tok {
+        "func_region_effect" | "FuncRegionEffect" => ProofRuleKind::FuncRegionEffect,
+        _ => ProofRuleKind::SliceBounds,
+    };
     let mut target_arena: u16 = 0;
     let mut bound_lo: u32 = 0;
     let mut raw_hi: Option<&str> = None;
@@ -986,6 +1054,9 @@ fn parse_proof_line<'a>(
                     "region_index_in_bounds" | "RegionIndexInBounds" | "7" => {
                         ProofRuleKind::RegionIndexInBounds
                     }
+                    "func_region_effect" | "FuncRegionEffect" | "8" => {
+                        ProofRuleKind::FuncRegionEffect
+                    }
                     _ => {
                         return Err(RlsError::LineParse {
                             line: line_no,
@@ -994,22 +1065,31 @@ fn parse_proof_line<'a>(
                     }
                 };
             }
-            "target" => {
+            "target" | "func" => {
                 target_arena = v.parse::<u16>().map_err(|_e| RlsError::LineParse {
                     line: line_no,
                     message: format!("invalid target arena '{v}'"),
                 })?;
             }
-            "lo" => {
-                bound_lo = v.parse::<u32>().map_err(|_e| RlsError::LineParse {
-                    line: line_no,
-                    message: format!("invalid bound_lo '{v}'"),
-                })?;
+            "lo" | "slot" => {
+                bound_lo = if v == "none" || v == "None" {
+                    REGION_FOOTPRINT_NONE
+                } else if let Some(num) = parse_u64_auto(v) {
+                    u32::try_from(num).map_err(|_e| RlsError::LineParse {
+                        line: line_no,
+                        message: format!("invalid bound_lo '{v}'"),
+                    })?
+                } else {
+                    return Err(RlsError::LineParse {
+                        line: line_no,
+                        message: format!("invalid bound_lo '{v}'"),
+                    });
+                };
             }
-            "hi" => {
+            "hi" | "pre" => {
                 raw_hi = Some(v);
             }
-            "witness" => {
+            "witness" | "post" => {
                 raw_witness = Some(v);
             }
             _ => {
@@ -1019,6 +1099,36 @@ fn parse_proof_line<'a>(
                 });
             }
         }
+    }
+
+    if rule_kind == ProofRuleKind::FuncRegionEffect {
+        let bound_hi = match raw_hi {
+            Some(hi_str) => parse_region_state(line_no, hi_str)?,
+            None if bound_lo == REGION_FOOTPRINT_NONE => 0,
+            None => {
+                return Err(RlsError::LineParse {
+                    line: line_no,
+                    message: "func_region_effect requires pre=<owned|leased|moved>".to_owned(),
+                });
+            }
+        };
+        let witness_node = match raw_witness {
+            Some(w_str) => parse_region_state(line_no, w_str)?,
+            None if bound_lo == REGION_FOOTPRINT_NONE => 0,
+            None => {
+                return Err(RlsError::LineParse {
+                    line: line_no,
+                    message: "func_region_effect requires post=<owned|leased|moved>".to_owned(),
+                });
+            }
+        };
+        return Ok(ProofEntry {
+            rule_kind,
+            target_arena,
+            bound_lo,
+            bound_hi,
+            witness_node,
+        });
     }
 
     let hi_str = raw_hi.ok_or_else(|| RlsError::LineParse {
@@ -1266,6 +1376,10 @@ fn parse_node_line<'a>(
                     | Opcode::RegionLoad
                     | Opcode::RegionStore
                     | Opcode::RegionFree
+                    | Opcode::RegionLease
+                    | Opcode::RegionEndLease
+                    | Opcode::RegionMove
+                    | Opcode::RegionDrop
                     | Opcode::Func
                     | Opcode::Call
             ) {
@@ -1356,6 +1470,10 @@ fn parse_node_line<'a>(
                     | Opcode::BrIf
                     | Opcode::RegionLen
                     | Opcode::RegionFree
+                    | Opcode::RegionLease
+                    | Opcode::RegionEndLease
+                    | Opcode::RegionMove
+                    | Opcode::RegionDrop
                     | Opcode::Func
                     | Opcode::Return
             ) {
@@ -1636,6 +1754,10 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::RegionLoad => "RegionLoad",
         Opcode::RegionStore => "RegionStore",
         Opcode::RegionFree => "RegionFree",
+        Opcode::RegionLease => "RegionLease",
+        Opcode::RegionEndLease => "RegionEndLease",
+        Opcode::RegionMove => "RegionMove",
+        Opcode::RegionDrop => "RegionDrop",
         Opcode::Func => "Func",
         Opcode::Return => "Return",
         Opcode::Call => "Call",
@@ -1723,6 +1845,10 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "RegionLoad" => Opcode::RegionLoad,
         "RegionStore" => Opcode::RegionStore,
         "RegionFree" => Opcode::RegionFree,
+        "RegionLease" => Opcode::RegionLease,
+        "RegionEndLease" => Opcode::RegionEndLease,
+        "RegionMove" => Opcode::RegionMove,
+        "RegionDrop" => Opcode::RegionDrop,
         "Func" => Opcode::Func,
         "Return" => Opcode::Return,
         "Call" => Opcode::Call,

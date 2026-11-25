@@ -35,6 +35,9 @@ pub const MAX_FUNC_NODES: usize = 65_535;
 /// Sentinel packed 16-bit operand value indicating an unused argument slot in `Call` / `CallArg`.
 pub const CALL_ARG_SENTINEL: u16 = 0xFFFF;
 
+/// Sentinel `bound_lo` value in [`ProofRuleKind::FuncRegionEffect`] declaring an empty function region footprint (`dom(f) = 0`).
+pub const REGION_FOOTPRINT_NONE: u32 = 0xFFFF;
+
 /// Computes the ISA-defined stack budget in 8-byte frame units for a function spanning `node_count` nodes.
 #[must_use]
 pub const fn func_frame_units(node_count: usize) -> u32 {
@@ -181,6 +184,14 @@ pub enum Opcode {
     RegionStore = 0x64,
     /// Release a declared region's mapping and set length to `0` (`in_a = slot`, `in_b = 0`; requires `min_len == 0`; void).
     RegionFree = 0x65,
+    /// Begin a compile-time read lease on a declared region (`in_a = slot`, `in_b = 0`; `Owned -> Leased`; void, zero runtime cost).
+    RegionLease = 0x66,
+    /// End a compile-time read lease on a declared region (`in_a = slot`, `in_b = 0`; `Leased -> Owned`; void, zero runtime cost).
+    RegionEndLease = 0x67,
+    /// Move ownership of a declared region descriptor (`in_a = src_slot`, `in_b = dst_slot`; `src: Owned -> Moved`, `dst: Moved -> Owned`; void).
+    RegionMove = 0x68,
+    /// Unmap and drop a declared region (`in_a = slot`, `in_b = 0`; `Owned -> Moved`; requires `Plain` role and `min_len == 0`; void).
+    RegionDrop = 0x69,
 }
 
 impl Opcode {
@@ -250,6 +261,10 @@ impl Opcode {
             0x63 => Ok(Self::RegionLoad),
             0x64 => Ok(Self::RegionStore),
             0x65 => Ok(Self::RegionFree),
+            0x66 => Ok(Self::RegionLease),
+            0x67 => Ok(Self::RegionEndLease),
+            0x68 => Ok(Self::RegionMove),
+            0x69 => Ok(Self::RegionDrop),
             other => Err(RulFormatError::UnknownOpcode(other)),
         }
     }
@@ -289,6 +304,10 @@ impl Opcode {
                 | Self::RegionLoad
                 | Self::RegionStore
                 | Self::RegionFree
+                | Self::RegionLease
+                | Self::RegionEndLease
+                | Self::RegionMove
+                | Self::RegionDrop
         )
     }
 
@@ -303,6 +322,10 @@ impl Opcode {
                 | Self::RegionLoad
                 | Self::RegionStore
                 | Self::RegionFree
+                | Self::RegionLease
+                | Self::RegionEndLease
+                | Self::RegionMove
+                | Self::RegionDrop
         )
     }
 }
@@ -696,6 +719,8 @@ pub enum ProofRuleKind {
     RegionDecl = 6,
     /// Certifies that a `RegionLoad` or `RegionStore` index is `< bound_hi <= min_len` for `target_arena = slot`.
     RegionIndexInBounds = 7,
+    /// Declares a function's region footprint and typestate transition (`target_arena = func_id`, `bound_lo = slot or 0xFFFF`, `bound_hi = pre`, `witness_node = post`).
+    FuncRegionEffect = 8,
 }
 
 impl ProofRuleKind {
@@ -708,9 +733,48 @@ impl ProofRuleKind {
             5 => Ok(Self::FuncSig),
             6 => Ok(Self::RegionDecl),
             7 => Ok(Self::RegionIndexInBounds),
+            8 => Ok(Self::FuncRegionEffect),
             other => Err(RulFormatError::InvalidProofRule(other)),
         }
     }
+}
+
+/// Compile-time ownership typestate of a statically declared region slot (`0..64`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RegionState {
+    /// Exclusive ownership: reads, mutations, leases, moves, and drops are permitted (`0`).
+    Owned = 0,
+    /// Active compile-time read lease: reads permitted, mutations and nested leases rejected (`1`).
+    Leased = 1,
+    /// Moved or dropped: all accesses rejected except restoring `Owned` via `RegionNew` or `RegionMove` destination (`2`).
+    Moved = 2,
+}
+
+impl RegionState {
+    /// Decodes a raw `u32` tag into a [`RegionState`].
+    #[must_use]
+    pub const fn from_u32(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Owned),
+            1 => Some(Self::Leased),
+            2 => Some(Self::Moved),
+            _ => None,
+        }
+    }
+}
+
+/// Decoded per-slot function region effect from a [`ProofRuleKind::FuncRegionEffect`] entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuncRegionEffectInfo {
+    /// Function identifier (`target_arena`).
+    pub func_id: u16,
+    /// Region slot in `0..64`, or `None` for the empty-footprint sentinel (`0xFFFF`).
+    pub slot: Option<u16>,
+    /// Required region typestate on function entry (always `Owned` when `slot` is `None`).
+    pub pre: RegionState,
+    /// Guaranteed region typestate on function exit (always `Owned` when `slot` is `None`).
+    pub post: RegionState,
 }
 
 /// Decoded function signature from a [`ProofRuleKind::FuncSig`] proof entry.
@@ -842,6 +906,71 @@ impl ProofEntry {
             return None;
         };
         Some((elem, role))
+    }
+
+    /// Constructs a [`ProofRuleKind::FuncRegionEffect`] entry for `func_id`.
+    ///
+    /// Pass `slot = None` to encode the empty-footprint sentinel (`bound_lo = 0xFFFF`, `bound_hi = 0`, `witness_node = 0`).
+    #[must_use]
+    pub const fn func_region_effect(
+        func_id: u16,
+        slot: Option<u16>,
+        pre: RegionState,
+        post: RegionState,
+    ) -> Self {
+        match slot {
+            Some(s) => Self {
+                rule_kind: ProofRuleKind::FuncRegionEffect,
+                target_arena: func_id,
+                bound_lo: s as u32,
+                bound_hi: pre as u32,
+                witness_node: post as u32,
+            },
+            None => Self {
+                rule_kind: ProofRuleKind::FuncRegionEffect,
+                target_arena: func_id,
+                bound_lo: REGION_FOOTPRINT_NONE,
+                bound_hi: 0,
+                witness_node: 0,
+            },
+        }
+    }
+
+    /// Decodes a [`FuncRegionEffectInfo`] from a [`ProofRuleKind::FuncRegionEffect`] proof entry.
+    ///
+    /// Returns `None` if `rule_kind != FuncRegionEffect`, if the empty-footprint sentinel (`0xFFFF`)
+    /// has non-zero `bound_hi` or `witness_node`, if `slot >= MAX_REGION_SLOTS`, or if `pre`/`post` is invalid.
+    #[must_use]
+    pub const fn decode_func_region_effect(self) -> Option<FuncRegionEffectInfo> {
+        if !matches!(self.rule_kind, ProofRuleKind::FuncRegionEffect) {
+            return None;
+        }
+        if self.bound_lo == REGION_FOOTPRINT_NONE {
+            if self.bound_hi != 0 || self.witness_node != 0 {
+                return None;
+            }
+            return Some(FuncRegionEffectInfo {
+                func_id: self.target_arena,
+                slot: None,
+                pre: RegionState::Owned,
+                post: RegionState::Owned,
+            });
+        }
+        if self.bound_lo >= MAX_REGION_SLOTS as u32 {
+            return None;
+        }
+        let Some(pre) = RegionState::from_u32(self.bound_hi) else {
+            return None;
+        };
+        let Some(post) = RegionState::from_u32(self.witness_node) else {
+            return None;
+        };
+        Some(FuncRegionEffectInfo {
+            func_id: self.target_arena,
+            slot: Some(self.bound_lo as u16),
+            pre,
+            post,
+        })
     }
 
     /// Encodes the proof entry into 16 bytes.
@@ -1074,6 +1203,7 @@ impl RulProgram {
                     ProofRuleKind::FuncSig
                         | ProofRuleKind::RegionDecl
                         | ProofRuleKind::RegionIndexInBounds
+                        | ProofRuleKind::FuncRegionEffect
                 )
             })
     }

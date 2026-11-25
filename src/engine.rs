@@ -443,6 +443,10 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Br
             | Opcode::RegionLen
             | Opcode::RegionFree
+            | Opcode::RegionLease
+            | Opcode::RegionEndLease
+            | Opcode::RegionMove
+            | Opcode::RegionDrop
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
@@ -735,6 +739,36 @@ struct Tier0Region {
     min_len: usize,
     max_len: usize,
     storage: RegionStorage,
+}
+
+fn move_tier0_region_storage(
+    regions: &mut [Option<Tier0Region>; MAX_REGION_SLOTS],
+    src_slot: u32,
+    dst_slot: u32,
+) -> Result<(), ExecError> {
+    let src_idx = src_slot as usize;
+    let dst_idx = dst_slot as usize;
+    if src_idx == dst_idx {
+        return Err(ExecError::RegionAllocationFailed { slot: src_slot });
+    }
+    let moved_storage = {
+        let src_reg = regions
+            .get_mut(src_idx)
+            .and_then(Option::as_mut)
+            .ok_or(ExecError::RegionAllocationFailed { slot: src_slot })?;
+        let empty = match &src_reg.storage {
+            RegionStorage::U8(_) => RegionStorage::U8(Vec::new()),
+            RegionStorage::I64(_) => RegionStorage::I64(Vec::new()),
+            RegionStorage::F64(_) => RegionStorage::F64(Vec::new()),
+        };
+        std::mem::replace(&mut src_reg.storage, empty)
+    };
+    let dst_reg = regions
+        .get_mut(dst_idx)
+        .and_then(Option::as_mut)
+        .ok_or(ExecError::RegionAllocationFailed { slot: dst_slot })?;
+    dst_reg.storage = moved_storage;
+    Ok(())
 }
 
 type StructuredTier0Output<'a> = (Vec<EvalValue<'a>>, usize, Option<Vec<u8>>);
@@ -1502,13 +1536,22 @@ fn eval_functions_tier0<'a>(
                     act.pc += 1;
                     FuncStepAction::Continue
                 }
-                Opcode::RegionFree => {
+                Opcode::RegionFree | Opcode::RegionDrop => {
                     let slot_idx = frame.in_a as usize;
                     let region = regions
                         .get_mut(slot_idx)
                         .and_then(Option::as_mut)
                         .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
                     region.storage.free_storage();
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::RegionLease | Opcode::RegionEndLease => {
+                    act.pc += 1;
+                    FuncStepAction::Continue
+                }
+                Opcode::RegionMove => {
+                    move_tier0_region_storage(&mut regions, frame.in_a, frame.in_b)?;
                     act.pc += 1;
                     FuncStepAction::Continue
                 }
@@ -2047,13 +2090,20 @@ fn eval_structured_tier0<'a>(
                 }
                 pc += 1;
             }
-            Opcode::RegionFree => {
+            Opcode::RegionFree | Opcode::RegionDrop => {
                 let slot_idx = frame.in_a as usize;
                 let region = regions
                     .get_mut(slot_idx)
                     .and_then(Option::as_mut)
                     .ok_or(ExecError::RegionAllocationFailed { slot: frame.in_a })?;
                 region.storage.free_storage();
+                pc += 1;
+            }
+            Opcode::RegionLease | Opcode::RegionEndLease => {
+                pc += 1;
+            }
+            Opcode::RegionMove => {
+                move_tier0_region_storage(&mut regions, frame.in_a, frame.in_b)?;
                 pc += 1;
             }
             _ => {
@@ -2506,6 +2556,10 @@ fn eval_node_tier0<'a>(
         | Opcode::RegionLoad
         | Opcode::RegionStore
         | Opcode::RegionFree
+        | Opcode::RegionLease
+        | Opcode::RegionEndLease
+        | Opcode::RegionMove
+        | Opcode::RegionDrop
         | Opcode::Func
         | Opcode::Return
         | Opcode::Call
@@ -3163,6 +3217,10 @@ fn build_l1_tile_plan(program: &RulProgram, live: &[bool]) -> Option<L1TilePlan>
             | Opcode::RegionLoad
             | Opcode::RegionStore
             | Opcode::RegionFree
+            | Opcode::RegionLease
+            | Opcode::RegionEndLease
+            | Opcode::RegionMove
+            | Opcode::RegionDrop
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call

@@ -567,6 +567,10 @@ pub fn compile_to_elf64_bytes(
             | Opcode::RegionLoad
             | Opcode::RegionStore
             | Opcode::RegionFree
+            | Opcode::RegionLease
+            | Opcode::RegionEndLease
+            | Opcode::RegionMove
+            | Opcode::RegionDrop
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
@@ -700,6 +704,10 @@ pub fn compile_to_elf64_bytes(
             | Opcode::RegionLoad
             | Opcode::RegionStore
             | Opcode::RegionFree
+            | Opcode::RegionLease
+            | Opcode::RegionEndLease
+            | Opcode::RegionMove
+            | Opcode::RegionDrop
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
@@ -2376,6 +2384,29 @@ fn emit_sc_region_free(code: &mut Vec<u8>, slot: usize) -> Result<(), AotError> 
     Ok(())
 }
 
+/// Emits $O(1)$ 24-byte descriptor transfer (`base`, `len`, `cap`) from `src_slot` to `dst_slot`
+/// using scratch `rax`/`r11` and zeroes `src_slot`'s descriptor (no syscall barrier).
+fn emit_sc_region_move(code: &mut Vec<u8>, src_slot: usize, dst_slot: usize) {
+    let src_base = sc_region_off(src_slot, 0);
+    let src_len = sc_region_off(src_slot, 8);
+    let src_cap = sc_region_off(src_slot, 16);
+    let dst_base = sc_region_off(dst_slot, 0);
+    let dst_len = sc_region_off(dst_slot, 8);
+    let dst_cap = sc_region_off(dst_slot, 16);
+
+    emit_load_reg_r15(code, REG_RAX, src_base);
+    emit_load_reg_r15(code, REG_R11, src_len);
+    emit_store_r15_reg(code, REG_RAX, dst_base);
+    emit_store_r15_reg(code, REG_R11, dst_len);
+    emit_load_reg_r15(code, REG_RAX, src_cap);
+    emit_store_r15_reg(code, REG_RAX, dst_cap);
+
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    emit_store_r15_reg(code, REG_RAX, src_base);
+    emit_store_r15_reg(code, REG_RAX, src_len);
+    emit_store_r15_reg(code, REG_RAX, src_cap);
+}
+
 fn emit_sc_output_region_epilogue(code: &mut Vec<u8>, out_slot: usize) -> Result<(), AotError> {
     let off_base = sc_region_off(out_slot, 0);
     let off_len = sc_region_off(out_slot, 8);
@@ -3403,13 +3434,14 @@ fn sc_analyze_unit(
                 }
                 barriers = barriers.saturating_add(1);
             }
-            Opcode::RegionFree => {
+            Opcode::RegionFree | Opcode::RegionDrop => {
                 if !scratch.has_any_barrier {
                     scratch.has_any_barrier = true;
                     scratch.call_prefix.resize(len.saturating_add(1), 0);
                 }
                 barriers = barriers.saturating_add(1);
             }
+            Opcode::RegionLease | Opcode::RegionEndLease | Opcode::RegionMove => {}
             Opcode::RegionLen => {
                 if let Some(info) = scratch.nodes.get_mut(idx) {
                     info.set_elem(ElemType::I64);
@@ -5436,9 +5468,13 @@ fn sc_emit_unit(
                         }
                     }
                 }
-                Opcode::RegionFree => {
+                Opcode::RegionFree | Opcode::RegionDrop => {
                     let slot = frame.in_a as usize;
                     emit_sc_region_free(out, slot)?;
+                }
+                Opcode::RegionLease | Opcode::RegionEndLease => {}
+                Opcode::RegionMove => {
+                    emit_sc_region_move(out, frame.in_a as usize, frame.in_b as usize);
                 }
                 Opcode::Return => {
                     if frame.in_a != 0 {
@@ -6456,6 +6492,10 @@ fn emit_x86_64_machine_code(
                 | Opcode::RegionLoad
                 | Opcode::RegionStore
                 | Opcode::RegionFree
+                | Opcode::RegionLease
+                | Opcode::RegionEndLease
+                | Opcode::RegionMove
+                | Opcode::RegionDrop
                 | Opcode::Func
                 | Opcode::Return
                 | Opcode::Call
@@ -6807,6 +6847,10 @@ fn emit_x86_64_machine_code(
                 | Opcode::RegionLoad
                 | Opcode::RegionStore
                 | Opcode::RegionFree
+                | Opcode::RegionLease
+                | Opcode::RegionEndLease
+                | Opcode::RegionMove
+                | Opcode::RegionDrop
                 | Opcode::Func
                 | Opcode::Return
                 | Opcode::Call
@@ -7189,6 +7233,10 @@ fn emit_x86_64_machine_code(
             | Opcode::RegionLoad
             | Opcode::RegionStore
             | Opcode::RegionFree
+            | Opcode::RegionLease
+            | Opcode::RegionEndLease
+            | Opcode::RegionMove
+            | Opcode::RegionDrop
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call
@@ -8066,6 +8114,10 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::Br
             | Opcode::RegionLen
             | Opcode::RegionFree
+            | Opcode::RegionLease
+            | Opcode::RegionEndLease
+            | Opcode::RegionMove
+            | Opcode::RegionDrop
             | Opcode::Func
             | Opcode::Return
             | Opcode::Call

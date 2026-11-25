@@ -8,12 +8,14 @@
 //!    with strict `origin_arena` binding (preventing cross-arena proof spoofing).
 //! 4. Zero-trust hardware [`CAP_NET_RING`] capability sandboxing.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::bytecode::{
-    ElemType, FuncSigInfo, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole, RulProgram,
-    SimdWidth, TokenMode, TypeLane, CALL_ARG_SENTINEL, CAP_DIVERGE, CAP_NET_RING, MAX_FUNC_NODES,
-    MAX_REGION_BYTES, MAX_REGION_SLOTS, MAX_SECTION_ITEMS,
+    func_frame_units, ElemType, FuncSigInfo, NodeFrame, Opcode, ProofEntry, ProofRuleKind,
+    RegionRole, RegionState, RulProgram, SimdWidth, TokenMode, TypeLane, CALL_ARG_SENTINEL,
+    CAP_DIVERGE, CAP_NET_RING, MAX_FUNC_NODES, MAX_REGION_BYTES, MAX_REGION_SLOTS,
+    MAX_SECTION_ITEMS,
 };
 
 /// Shape and static length inferred in $O(1)$ per node during the single-pass scan.
@@ -32,6 +34,22 @@ pub enum ValueShape {
     },
 }
 
+/// Sound static worst-case resource bounds computed in a single $O(N)$ verification pass
+/// for sandbox programs without [`CAP_DIVERGE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCostSummary {
+    /// Sound saturating upper bound on dynamic execution steps (scalar ops = `1`, columnar ops = `len`).
+    pub worst_case_steps: u64,
+    /// Maximum live call depth (`1` for top-level/leaf programs, `1 + max(callee.max_call_depth)` across calls).
+    pub max_call_depth: u32,
+    /// Maximum sum of ISA frame units (`func_frame_units(f)`) along any call chain from entry (`0` for non-function programs).
+    pub max_stack_units: u32,
+    /// Maximum stack allocation in bytes (`max_stack_units * 8 + 4096` guard page when functions exist, else `0`).
+    pub max_stack_bytes: u64,
+    /// Maximum declared region bytes (page-rounded + 4 KiB descriptor page if any region) plus columnar arena bytes.
+    pub max_region_bytes: u64,
+}
+
 /// Summary returned when a `.rl` program passes $O(N)$ verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSummary {
@@ -45,6 +63,8 @@ pub struct VerifiedSummary {
     pub output_elem: ElemType,
     /// True if all array accesses are proven bounds-safe at compile time (0 runtime checks).
     pub zero_runtime_bounds_checks: bool,
+    /// Static worst-case resource summary for sandbox programs without [`CAP_DIVERGE`], or `None` when [`CAP_DIVERGE`] is set.
+    pub static_cost: Option<StaticCostSummary>,
 }
 
 /// Machine-readable diagnostic returned to an AI Agent on verification failure.
@@ -187,6 +207,57 @@ pub enum VerifyErrorKind {
         /// Observed node count inside the function scope.
         node_count: usize,
     },
+    /// Attempted a region mutation or nested lease while a compile-time read lease is live.
+    MutationUnderLiveLease {
+        /// Offending declared region slot (`0..64`).
+        slot: u16,
+    },
+    /// Attempted to access, lease, drop, or move from a region slot currently in the `Moved` state.
+    UseOfMovedRegion {
+        /// Offending declared region slot (`0..64`).
+        slot: u16,
+    },
+    /// Function accessed a region slot outside its declared footprint `dom(f)`.
+    RegionOutsideFootprint {
+        /// Offending declared region slot (`0..64`).
+        slot: u16,
+    },
+    /// Callee function footprint `dom(g)` is not a subset of caller footprint `dom(f)`.
+    CalleeFootprintExceedsCaller {
+        /// Target callee function identifier.
+        callee_func_id: u16,
+        /// Bitmask of slots in `dom(g) \ dom(f)`.
+        extra_mask: u64,
+    },
+    /// Region `(owned_mask, leased_mask)` typestate mismatched at a join, call precondition, function return, or `RegionEndLease`/`RegionMove`.
+    RegionTypestateMismatch {
+        /// Expected `owned_mask`.
+        expected_owned: u64,
+        /// Expected `leased_mask`.
+        expected_leased: u64,
+        /// Observed `owned_mask`.
+        actual_owned: u64,
+        /// Observed `leased_mask`.
+        actual_leased: u64,
+    },
+    /// Loop body fall-through or back-edge violated the loop entry `(owned_mask, leased_mask)` typestate invariant.
+    LoopTypestateInvariantViolation {
+        /// Loop entry `owned_mask`.
+        expected_owned: u64,
+        /// Loop entry `leased_mask`.
+        expected_leased: u64,
+        /// Observed `owned_mask`.
+        actual_owned: u64,
+        /// Observed `leased_mask`.
+        actual_leased: u64,
+    },
+    /// Invalid [`ProofRuleKind::FuncRegionEffect`] sidecar proof entry or function footprint contract.
+    InvalidRegionEffect {
+        /// Offending function identifier.
+        func_id: u16,
+        /// Reason the effect declaration was rejected.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for VerifyDiagnostic {
@@ -268,6 +339,18 @@ struct PendingCallArg {
 struct CompletedFunc {
     sig: FuncSigInfo,
     start_node: u32,
+    worst_case_steps: u64,
+    max_call_depth: u32,
+    max_stack_units: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FuncRegionContract {
+    dom_mask: u64,
+    pre_owned: u64,
+    pre_leased: u64,
+    post_owned: u64,
+    post_leased: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,33 +372,381 @@ struct ControlFrame {
     header_node: u32,
     sig: Option<ParsedBlockSig>,
     entry_init: u64,
-    entry_undo_len: usize,
-    entry_bumps: u64,
+    entry_arena_root: u32,
     entry_reachable: bool,
+    entry_region_owned: u64,
+    entry_region_leased: u64,
     has_branch_or_join: bool,
     has_exit_path: bool,
     exit_init: u64,
-    exit_delta: Option<ArenaDelta>,
+    exit_region_owned: u64,
+    exit_region_leased: u64,
+    exit_arena_root: u32,
+    parent_steps: u64,
+    then_steps: u64,
+    loop_bound: u32,
     scope_nodes: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExitSnapshot {
+    local_init: u64,
+    region_owned: u64,
+    region_leased: u64,
+}
+
+/// Hash-consed persistent binary trie for exact, order-independent `AffineToken` version states.
+///
+/// Guarantees across any program with `N` nodes and `A` arenas (where addressable `arena_id: u16`,
+/// so trie height `H = ceil(log2(min(A, 65536))) <= 16`):
+/// - Zero heap allocation when no `ArenaMutate` occurs.
+/// - Canonical state IDs: two arena version vectors are identical across all `A` arenas if and
+///   only if their `root: u32` IDs are equal, regardless of mutation order or control nesting.
+/// - Straight-line write-combining (`pending`) + batch trie updates bound total trie work and
+///   allocated nodes across the entire verification pass to `O(N * H) = O(N)` time and `O(N + A)`
+///   memory (at most `16` internal-node steps per distinct mutated arena per control boundary).
+/// - Control-flow joins (`join_control_exit`), `Else`/`End` rollbacks/restores, and `Loop`
+///   invariant checks each run in `O(1)` (`u32` comparison/assignment) on the happy path and
+///   `O(H) <= 16` steps to pinpoint the lowest-indexed differing arena on mismatch.
+#[derive(Debug, Default)]
+struct ArenaVersionTrie {
+    height: u32,
+    /// Internal trie nodes indexed by `id - 1`; ID `0` is the canonical all-initial subtree.
+    nodes: Vec<(u32, u32)>,
+    /// Canonical interning table mapping `(left_id, right_id)` to a unique non-zero node ID.
+    intern: HashMap<(u32, u32), u32>,
+    /// Straight-line write-combining buffer `(arena_id, live_version)` since the last control boundary.
+    pending: Vec<(u16, u16)>,
+    /// Lazily allocated 1-based index into `pending` per addressable arena.
+    pending_slot: Vec<u32>,
+    /// Current committed canonical trie root.
+    root: u32,
+    #[cfg(test)]
+    join_work_steps: u64,
+}
+
+impl ArenaVersionTrie {
+    fn new(num_arenas: usize) -> Self {
+        let effective = num_arenas.min(usize::from(u16::MAX) + 1);
+        let height = if effective <= 1 {
+            0
+        } else {
+            (effective - 1).ilog2() + 1
+        };
+        Self {
+            height,
+            nodes: Vec::new(),
+            intern: HashMap::new(),
+            pending: Vec::new(),
+            pending_slot: Vec::new(),
+            root: 0,
+            #[cfg(test)]
+            join_work_steps: 0,
+        }
+    }
+
+    #[cfg(test)]
+    const fn join_work_steps(&self) -> u64 {
+        self.join_work_steps
+    }
+
+    #[cfg(not(test))]
+    const fn join_work_steps(&self) -> u64 {
+        0
+    }
+
+    fn note_join_work(&mut self) {
+        #[cfg(test)]
+        {
+            self.join_work_steps = self.join_work_steps.saturating_add(1);
+        }
+    }
+
+    fn encode_leaf(ver: u16, initial_ver: u16) -> u32 {
+        if ver == initial_ver {
+            0
+        } else {
+            u32::from(ver) + 1
+        }
+    }
+
+    fn decode_leaf(leaf_id: u32, initial_ver: u16) -> u16 {
+        if leaf_id == 0 {
+            initial_ver
+        } else {
+            u16::try_from(leaf_id - 1).unwrap_or(initial_ver)
+        }
+    }
+
+    fn intern_pair(&mut self, left: u32, right: u32) -> u32 {
+        if left == 0 && right == 0 {
+            return 0;
+        }
+        if let Some(&existing) = self.intern.get(&(left, right)) {
+            return existing;
+        }
+        let new_id = u32::try_from(self.nodes.len() + 1).unwrap_or(u32::MAX);
+        self.nodes.push((left, right));
+        self.intern.insert((left, right), new_id);
+        new_id
+    }
+
+    fn get_version_from_root(&self, root: u32, arena_id: u16, initial_ver: u16) -> u16 {
+        let mut cur = root;
+        let mut level = self.height;
+        while level > 0 {
+            if cur == 0 {
+                return initial_ver;
+            }
+            level -= 1;
+            let bit = (u32::from(arena_id) >> level) & 1;
+            let (left, right) = self
+                .nodes
+                .get((cur - 1) as usize)
+                .copied()
+                .unwrap_or((0, 0));
+            cur = if bit == 0 { left } else { right };
+        }
+        Self::decode_leaf(cur, initial_ver)
+    }
+
+    fn get_version(&self, arena_id: u16, initial_ver: u16) -> u16 {
+        if !self.pending.is_empty() {
+            let slot = self
+                .pending_slot
+                .get(usize::from(arena_id))
+                .copied()
+                .unwrap_or(0);
+            if slot != 0 {
+                if let Some(&(_, ver)) = self.pending.get((slot - 1) as usize) {
+                    return ver;
+                }
+            }
+        }
+        self.get_version_from_root(self.root, arena_id, initial_ver)
+    }
+
+    fn set_live_version(&mut self, arena_id: u16, new_ver: u16, num_arenas: usize) {
+        let a_idx = usize::from(arena_id);
+        let effective_len = num_arenas.min(usize::from(u16::MAX) + 1);
+        if self.pending_slot.len() < effective_len {
+            self.pending_slot.resize(effective_len, 0);
+        }
+        let slot = self.pending_slot.get(a_idx).copied().unwrap_or(0);
+        if slot != 0 {
+            if let Some(entry) = self.pending.get_mut((slot - 1) as usize) {
+                entry.1 = new_ver;
+            }
+        } else {
+            let new_slot = u32::try_from(self.pending.len() + 1).unwrap_or(u32::MAX);
+            self.pending.push((arena_id, new_ver));
+            if let Some(s) = self.pending_slot.get_mut(a_idx) {
+                *s = new_slot;
+            }
+        }
+    }
+
+    fn set_version_in_root(
+        &mut self,
+        root: u32,
+        arena_id: u16,
+        new_ver: u16,
+        initial_ver: u16,
+    ) -> u32 {
+        let leaf = Self::encode_leaf(new_ver, initial_ver);
+        if self.height == 0 {
+            return leaf;
+        }
+        let mut path = [(0u32, 0u8); 16];
+        let mut cur = root;
+        let mut level = self.height;
+        while level > 0 {
+            level -= 1;
+            let bit = ((u32::from(arena_id) >> level) & 1) as u8;
+            let (left, right) = if cur == 0 {
+                (0, 0)
+            } else {
+                self.nodes
+                    .get((cur - 1) as usize)
+                    .copied()
+                    .unwrap_or((0, 0))
+            };
+            let (next, sibling) = if bit == 0 {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            if let Some(slot) = path.get_mut(level as usize) {
+                *slot = (sibling, bit);
+            }
+            cur = next;
+        }
+        let mut child = leaf;
+        for level in 0..self.height {
+            self.note_join_work();
+            let (sibling, bit) = path.get(level as usize).copied().unwrap_or((0, 0));
+            let (left, right) = if bit == 0 {
+                (child, sibling)
+            } else {
+                (sibling, child)
+            };
+            child = self.intern_pair(left, right);
+        }
+        child
+    }
+
+    fn batch_set_range(
+        &mut self,
+        cur: u32,
+        level: u32,
+        base: u32,
+        entries: &[(u16, u16)],
+        program: &RulProgram,
+    ) -> u32 {
+        if entries.is_empty() {
+            return cur;
+        }
+        if level == 0 {
+            let Some(&(arena_id, new_ver)) = entries.first() else {
+                return cur;
+            };
+            let init_ver = program
+                .arenas
+                .get(usize::from(arena_id))
+                .map_or(0, |desc| desc.initial_version);
+            return Self::encode_leaf(new_ver, init_ver);
+        }
+        self.note_join_work();
+        let child_level = level - 1;
+        let mid = base + (1u32 << child_level);
+        let split = entries.partition_point(|&(id, _)| u32::from(id) < mid);
+        let left_entries = entries.get(..split).unwrap_or(&[]);
+        let right_entries = entries.get(split..).unwrap_or(&[]);
+        let (old_left, old_right) = if cur == 0 {
+            (0, 0)
+        } else {
+            self.nodes
+                .get((cur - 1) as usize)
+                .copied()
+                .unwrap_or((0, 0))
+        };
+        let new_left = self.batch_set_range(old_left, child_level, base, left_entries, program);
+        let new_right = self.batch_set_range(old_right, child_level, mid, right_entries, program);
+        self.intern_pair(new_left, new_right)
+    }
+
+    fn commit_root(&mut self, program: &RulProgram) -> u32 {
+        if self.pending.is_empty() {
+            return self.root;
+        }
+        if self.pending.len() == 1 {
+            if let Some((arena_id, new_ver)) = self.pending.pop() {
+                let a_idx = usize::from(arena_id);
+                if let Some(s) = self.pending_slot.get_mut(a_idx) {
+                    *s = 0;
+                }
+                let init_ver = program
+                    .arenas
+                    .get(a_idx)
+                    .map_or(0, |desc| desc.initial_version);
+                self.root = self.set_version_in_root(self.root, arena_id, new_ver, init_ver);
+            }
+            return self.root;
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        for &(arena_id, _) in &pending {
+            if let Some(s) = self.pending_slot.get_mut(usize::from(arena_id)) {
+                *s = 0;
+            }
+        }
+        pending.sort_unstable_by_key(|&(id, _)| id);
+        self.root = self.batch_set_range(self.root, self.height, 0, &pending, program);
+        pending.clear();
+        self.pending = pending;
+        self.root
+    }
+
+    fn restore_root(&mut self, target_root: u32) {
+        if !self.pending.is_empty() {
+            for &(arena_id, _) in &self.pending {
+                if let Some(s) = self.pending_slot.get_mut(usize::from(arena_id)) {
+                    *s = 0;
+                }
+            }
+            self.pending.clear();
+        }
+        self.root = target_root;
+    }
+
+    fn find_first_diff(
+        &self,
+        root_a: u32,
+        root_b: u32,
+        program: &RulProgram,
+    ) -> Option<(u16, u16, u16)> {
+        if root_a == root_b {
+            return None;
+        }
+        let mut a = root_a;
+        let mut b = root_b;
+        let mut arena_bits: u32 = 0;
+        let mut level = self.height;
+        while level > 0 {
+            level -= 1;
+            let (al, ar) = if a == 0 {
+                (0, 0)
+            } else {
+                self.nodes.get((a - 1) as usize).copied().unwrap_or((0, 0))
+            };
+            let (bl, br) = if b == 0 {
+                (0, 0)
+            } else {
+                self.nodes.get((b - 1) as usize).copied().unwrap_or((0, 0))
+            };
+            if al != bl {
+                a = al;
+                b = bl;
+            } else {
+                arena_bits |= 1u32 << level;
+                a = ar;
+                b = br;
+            }
+        }
+        let arena_id = u16::try_from(arena_bits).unwrap_or(0);
+        let init_ver = program
+            .arenas
+            .get(usize::from(arena_id))
+            .map_or(0, |desc| desc.initial_version);
+        Some((
+            arena_id,
+            Self::decode_leaf(a, init_ver),
+            Self::decode_leaf(b, init_ver),
+        ))
+    }
 }
 
 struct VerifierState {
     local_types: [Option<ElemType>; 64],
     local_init: u64,
     reachable: bool,
-    undo_log: Vec<(u16, u16)>,
-    version_bumps: u64,
+    arena_state: ArenaVersionTrie,
     node_visible: Vec<bool>,
     control_stack: Vec<ControlFrame>,
     regions: [Option<RegionDeclInfo>; MAX_REGION_SLOTS],
+    region_owned: u64,
+    region_leased: u64,
     has_unproven_region_access: bool,
     func_sigs: Vec<FuncSigInfo>,
+    func_contracts: Vec<FuncRegionContract>,
     current_func: Option<ActiveFunc>,
     pending_call_arg: Option<PendingCallArg>,
     next_func_id: u32,
     completed_funcs: Vec<CompletedFunc>,
     has_func_mode: bool,
     seen_non_func_top_level: bool,
+    cur_steps: u64,
+    cur_max_callee_depth: u32,
+    cur_max_callee_stack_units: u32,
 }
 
 fn scan_func_sigs(program: &RulProgram) -> Result<Vec<FuncSigInfo>, VerifyDiagnostic> {
@@ -507,12 +938,229 @@ fn scan_region_decls(
     Ok(regions)
 }
 
+const fn align_up_4096(bytes: u64) -> u64 {
+    bytes.div_ceil(4096).saturating_mul(4096)
+}
+
+const fn shape_steps(shape: ValueShape) -> u64 {
+    match shape {
+        ValueShape::Scalar => 1,
+        ValueShape::Column(len) | ValueShape::Compacted { max_len: len, .. } => {
+            if len == 0 {
+                1
+            } else {
+                len as u64
+            }
+        }
+    }
+}
+
+fn declared_region_mask(regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS]) -> u64 {
+    let mut mask = 0u64;
+    for (idx, opt) in regions.iter().enumerate() {
+        if opt.is_some() {
+            mask |= 1u64 << idx;
+        }
+    }
+    mask
+}
+
+fn compute_max_region_bytes(
+    program: &RulProgram,
+    regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS],
+) -> u64 {
+    let mut total: u64 = 0;
+    let mut has_any_region = false;
+    for decl in regions.iter().flatten() {
+        has_any_region = true;
+        let raw_bytes =
+            u64::from(decl.max_len).saturating_mul(decl.elem.region_elem_bytes() as u64);
+        total = total.saturating_add(align_up_4096(raw_bytes));
+    }
+    if has_any_region {
+        total = total.saturating_add(4096);
+    }
+    for arena in &program.arenas {
+        let arena_bytes = u64::from(arena.element_count)
+            .saturating_mul(arena.type_lane.elem.region_elem_bytes() as u64);
+        total = total.saturating_add(arena_bytes);
+    }
+    total
+}
+
+fn scan_func_region_contracts(
+    program: &RulProgram,
+    regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS],
+    declared_mask: u64,
+    func_sigs: &[FuncSigInfo],
+) -> Result<Vec<FuncRegionContract>, VerifyDiagnostic> {
+    #[derive(Clone, Copy, Default)]
+    struct RawContract {
+        has_any: bool,
+        has_none: bool,
+        dom_mask: u64,
+        pre_owned: u64,
+        pre_leased: u64,
+        post_owned: u64,
+        post_leased: u64,
+    }
+
+    let func_count = func_sigs.len();
+    let mut raw: Vec<RawContract> = vec![RawContract::default(); func_count];
+
+    for proof in &program.proofs {
+        if proof.rule_kind != ProofRuleKind::FuncRegionEffect {
+            continue;
+        }
+        if func_count == 0 {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidRegionEffect {
+                    func_id: proof.target_arena,
+                    reason: "FuncRegionEffect requires FuncSig declarations",
+                },
+            });
+        }
+        let eff = proof.decode_func_region_effect().ok_or(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidRegionEffect {
+                func_id: proof.target_arena,
+                reason: "malformed FuncRegionEffect proof entry",
+            },
+        })?;
+        let Some(entry) = raw.get_mut(usize::from(eff.func_id)) else {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::UnknownFunction(u32::from(eff.func_id)),
+            });
+        };
+        if let Some(slot) = eff.slot {
+            if entry.has_none {
+                return Err(VerifyDiagnostic {
+                    node_idx: 0,
+                    kind: VerifyErrorKind::InvalidRegionEffect {
+                        func_id: eff.func_id,
+                        reason: "cannot combine empty-footprint sentinel with region slot effects",
+                    },
+                });
+            }
+            if regions.get(usize::from(slot)).and_then(|r| *r).is_none() {
+                return Err(VerifyDiagnostic {
+                    node_idx: 0,
+                    kind: VerifyErrorKind::UnknownRegion(u32::from(slot)),
+                });
+            }
+            let bit = 1u64 << slot;
+            if (entry.dom_mask & bit) != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx: 0,
+                    kind: VerifyErrorKind::InvalidRegionEffect {
+                        func_id: eff.func_id,
+                        reason: "duplicate FuncRegionEffect for same function and region slot",
+                    },
+                });
+            }
+            entry.has_any = true;
+            entry.dom_mask |= bit;
+            match eff.pre {
+                RegionState::Owned => entry.pre_owned |= bit,
+                RegionState::Leased => entry.pre_leased |= bit,
+                RegionState::Moved => {}
+            }
+            match eff.post {
+                RegionState::Owned => entry.post_owned |= bit,
+                RegionState::Leased => entry.post_leased |= bit,
+                RegionState::Moved => {}
+            }
+        } else {
+            if entry.has_none {
+                return Err(VerifyDiagnostic {
+                    node_idx: 0,
+                    kind: VerifyErrorKind::InvalidRegionEffect {
+                        func_id: eff.func_id,
+                        reason: "duplicate empty-footprint FuncRegionEffect sentinel",
+                    },
+                });
+            }
+            if entry.dom_mask != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx: 0,
+                    kind: VerifyErrorKind::InvalidRegionEffect {
+                        func_id: eff.func_id,
+                        reason: "cannot combine empty-footprint sentinel with region slot effects",
+                    },
+                });
+            }
+            entry.has_any = true;
+            entry.has_none = true;
+        }
+    }
+
+    let mut contracts = Vec::with_capacity(func_count);
+    for r in raw {
+        let c = if !r.has_any {
+            FuncRegionContract {
+                dom_mask: declared_mask,
+                pre_owned: declared_mask,
+                pre_leased: 0,
+                post_owned: declared_mask,
+                post_leased: 0,
+            }
+        } else if r.has_none {
+            FuncRegionContract {
+                dom_mask: 0,
+                pre_owned: 0,
+                pre_leased: 0,
+                post_owned: 0,
+                post_leased: 0,
+            }
+        } else {
+            FuncRegionContract {
+                dom_mask: r.dom_mask,
+                pre_owned: r.pre_owned,
+                pre_leased: r.pre_leased,
+                post_owned: r.post_owned,
+                post_leased: r.post_leased,
+            }
+        };
+        contracts.push(c);
+    }
+
+    if let Some(entry_contract) = contracts.last().copied() {
+        let entry_id = u16::try_from(func_count.saturating_sub(1)).unwrap_or(0);
+        if (entry_contract.pre_owned & entry_contract.dom_mask) != entry_contract.dom_mask
+            || entry_contract.pre_leased != 0
+        {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidRegionEffect {
+                    func_id: entry_id,
+                    reason: "entry function precondition must be Owned for every region in its footprint",
+                },
+            });
+        }
+    }
+
+    Ok(contracts)
+}
+
 /// Verifies an [`RulProgram`] in a single forward pass ($O(N)$ time and $O(N)$ state).
 ///
 /// # Errors
 /// Returns a structured [`VerifyDiagnostic`] pinpointing the exact node index and rule
 /// violation if any safety, ownership, bounds, or capability invariant fails.
 pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDiagnostic> {
+    verify_program_core(program).map(|(summary, _)| summary)
+}
+
+#[cfg(test)]
+pub(crate) fn verify_program_with_join_work(
+    program: &RulProgram,
+) -> Result<(VerifiedSummary, u64), VerifyDiagnostic> {
+    verify_program_core(program)
+}
+
+fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), VerifyDiagnostic> {
     let node_count = program.nodes.len();
     if node_count == 0 || (program.output_node as usize) >= node_count {
         return Err(VerifyDiagnostic {
@@ -521,13 +1169,14 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         });
     }
 
-    // One linear pre-scan of the proof table to index statically declared regions and function signatures.
+    // One linear pre-scan of the proof table to index declared regions, function signatures, and region contracts.
     let regions = scan_region_decls(program)?;
+    let declared_mask = declared_region_mask(&regions);
     let func_sigs = scan_func_sigs(program)?;
+    let func_contracts = scan_func_region_contracts(program, &regions, declared_mask, &func_sigs)?;
     let has_func_mode = !func_sigs.is_empty();
-
-    // Track live AffineToken version per Arena.
-    let mut arena_versions: Vec<u16> = program.arenas.iter().map(|a| a.initial_version).collect();
+    let sandbox_mode = (program.capability_mask & CAP_DIVERGE) == 0;
+    let max_region_bytes = compute_max_region_bytes(program, &regions);
 
     // Track inferred ValueShape, ElemType, and origin Arena per SSA node.
     let mut metas: Vec<NodeMeta> = Vec::with_capacity(node_count);
@@ -535,19 +1184,24 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         local_types: [None; 64],
         local_init: 0,
         reachable: true,
-        undo_log: Vec::new(),
-        version_bumps: 0,
+        arena_state: ArenaVersionTrie::new(program.arenas.len()),
         node_visible: Vec::with_capacity(node_count),
         control_stack: Vec::new(),
         regions,
+        region_owned: if has_func_mode { 0 } else { declared_mask },
+        region_leased: 0,
         has_unproven_region_access: false,
         func_sigs,
+        func_contracts,
         current_func: None,
         pending_call_arg: None,
         next_func_id: 0,
         completed_funcs: Vec::new(),
         has_func_mode,
         seen_non_func_top_level: false,
+        cur_steps: 0,
+        cur_max_callee_depth: 0,
+        cur_max_callee_stack_units: 0,
     };
     let mut max_fusion_group: u8 = 0;
     let mut has_gather = false;
@@ -617,18 +1271,40 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
             has_gather = true;
         }
 
+        let was_reachable = state.reachable;
+
         // 1. Verify AffineToken / ReadLease transition if present.
-        verify_token_transition(program, frame, node_idx, &mut arena_versions, &mut state)?;
+        verify_token_transition(program, frame, node_idx, &mut state)?;
 
         // 2. Verify opcode-specific topological edges, types, shapes, control stack, and proofs.
-        let meta = verify_node_semantics(
-            program,
-            frame,
-            node_idx,
-            &metas,
-            &mut arena_versions,
-            &mut state,
-        )?;
+        let meta = verify_node_semantics(program, frame, node_idx, &metas, &mut state)?;
+
+        if was_reachable
+            && !matches!(
+                frame.opcode,
+                Opcode::Block
+                    | Opcode::Loop
+                    | Opcode::If
+                    | Opcode::Else
+                    | Opcode::End
+                    | Opcode::Func
+                    | Opcode::Call
+            )
+        {
+            let step_cost = match frame.opcode {
+                Opcode::ReduceSum | Opcode::ReduceMax | Opcode::ReduceMin => {
+                    let abs_src = state
+                        .current_func
+                        .map_or(frame.in_a, |a| a.start_node.saturating_add(frame.in_a));
+                    metas
+                        .get(abs_src as usize)
+                        .map_or(1, |m| shape_steps(m.shape))
+                }
+                _ => shape_steps(meta.shape),
+            };
+            state.cur_steps = state.cur_steps.saturating_add(step_cost);
+        }
+
         metas.push(meta);
         state.node_visible.push(!meta.is_void);
         if !meta.is_void {
@@ -699,13 +1375,31 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
                 kind: VerifyErrorKind::InvalidOutputNode(program.output_node),
             });
         }
-        return Ok(VerifiedSummary {
-            node_count,
-            fusion_groups: usize::from(max_fusion_group),
-            output_shape: ValueShape::Scalar,
-            output_elem: entry_ret_elem,
-            zero_runtime_bounds_checks: !has_gather && !state.has_unproven_region_access,
-        });
+        let static_cost = if sandbox_mode {
+            let max_stack_bytes = u64::from(entry.max_stack_units)
+                .saturating_mul(8)
+                .saturating_add(4096);
+            Some(StaticCostSummary {
+                worst_case_steps: entry.worst_case_steps,
+                max_call_depth: entry.max_call_depth,
+                max_stack_units: entry.max_stack_units,
+                max_stack_bytes,
+                max_region_bytes,
+            })
+        } else {
+            None
+        };
+        return Ok((
+            VerifiedSummary {
+                node_count,
+                fusion_groups: usize::from(max_fusion_group),
+                output_shape: ValueShape::Scalar,
+                output_elem: entry_ret_elem,
+                zero_runtime_bounds_checks: !has_gather && !state.has_unproven_region_access,
+                static_cost,
+            },
+            state.arena_state.join_work_steps(),
+        ));
     }
 
     let output_idx = program.output_node as usize;
@@ -728,42 +1422,59 @@ pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDia
         });
     }
 
-    Ok(VerifiedSummary {
-        node_count,
-        fusion_groups: usize::from(max_fusion_group),
-        output_shape: output_meta.shape,
-        output_elem: output_meta.elem,
-        zero_runtime_bounds_checks: !has_gather && !state.has_unproven_region_access,
-    })
+    let static_cost = if sandbox_mode {
+        Some(StaticCostSummary {
+            worst_case_steps: state.cur_steps,
+            max_call_depth: 1,
+            max_stack_units: 0,
+            max_stack_bytes: 0,
+            max_region_bytes,
+        })
+    } else {
+        None
+    };
+
+    Ok((
+        VerifiedSummary {
+            node_count,
+            fusion_groups: usize::from(max_fusion_group),
+            output_shape: output_meta.shape,
+            output_elem: output_meta.elem,
+            zero_runtime_bounds_checks: !has_gather && !state.has_unproven_region_access,
+            static_cost,
+        },
+        state.arena_state.join_work_steps(),
+    ))
 }
 
 fn verify_token_transition(
     program: &RulProgram,
     frame: &NodeFrame,
     node_idx: u32,
-    arena_versions: &mut [u16],
     state: &mut VerifierState,
 ) -> Result<(), VerifyDiagnostic> {
     match frame.token_op.mode {
         TokenMode::PureValue => Ok(()),
         TokenMode::ReadLease => {
             let arena_idx = usize::from(frame.token_op.arena_id);
-            let live_ver = arena_versions
-                .get(arena_idx)
-                .copied()
-                .ok_or(VerifyDiagnostic {
-                    node_idx,
-                    kind: VerifyErrorKind::UnknownArena(u32::from(frame.token_op.arena_id)),
-                })?;
-            if state.reachable && frame.token_op.version != live_ver {
-                return Err(VerifyDiagnostic {
-                    node_idx,
-                    kind: VerifyErrorKind::StaleOrConsumedToken {
-                        arena_id: frame.token_op.arena_id,
-                        provided_version: frame.token_op.version,
-                        expected_version: live_ver,
-                    },
-                });
+            let arena_desc = program.arenas.get(arena_idx).ok_or(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::UnknownArena(u32::from(frame.token_op.arena_id)),
+            })?;
+            if state.reachable {
+                let live_ver = state
+                    .arena_state
+                    .get_version(frame.token_op.arena_id, arena_desc.initial_version);
+                if frame.token_op.version != live_ver {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::StaleOrConsumedToken {
+                            arena_id: frame.token_op.arena_id,
+                            provided_version: frame.token_op.version,
+                            expected_version: live_ver,
+                        },
+                    });
+                }
             }
             Ok(())
         }
@@ -779,10 +1490,6 @@ fn verify_token_transition(
                     kind: VerifyErrorKind::ImmutableArenaMutation(frame.token_op.arena_id),
                 });
             }
-            let live_ver_slot = arena_versions.get_mut(arena_idx).ok_or(VerifyDiagnostic {
-                node_idx,
-                kind: VerifyErrorKind::UnknownArena(u32::from(frame.token_op.arena_id)),
-            })?;
             if !state.reachable {
                 let _ = frame
                     .token_op
@@ -794,26 +1501,30 @@ fn verify_token_transition(
                     })?;
                 return Ok(());
             }
-            if frame.token_op.version != *live_ver_slot {
+            let live_ver = state
+                .arena_state
+                .get_version(frame.token_op.arena_id, arena_desc.initial_version);
+            if frame.token_op.version != live_ver {
                 return Err(VerifyDiagnostic {
                     node_idx,
                     kind: VerifyErrorKind::StaleOrConsumedToken {
                         arena_id: frame.token_op.arena_id,
                         provided_version: frame.token_op.version,
-                        expected_version: *live_ver_slot,
+                        expected_version: live_ver,
                     },
                 });
             }
             // Linear consumption: advance version so old token can never be reused,
             // and reject u16::MAX overflow so version can never wrap around to 0!
-            let prev_ver = *live_ver_slot;
-            let next_ver = prev_ver.checked_add(1).ok_or(VerifyDiagnostic {
+            let next_ver = live_ver.checked_add(1).ok_or(VerifyDiagnostic {
                 node_idx,
                 kind: VerifyErrorKind::TokenVersionOverflow(frame.token_op.arena_id),
             })?;
-            *live_ver_slot = next_ver;
-            state.undo_log.push((frame.token_op.arena_id, prev_ver));
-            state.version_bumps += 1;
+            state.arena_state.set_live_version(
+                frame.token_op.arena_id,
+                next_ver,
+                program.arenas.len(),
+            );
             Ok(())
         }
     }
@@ -896,7 +1607,7 @@ fn parse_block_sig(
     program: &RulProgram,
     frame: &NodeFrame,
     node_idx: u32,
-    arena_versions: &[u16],
+    arena_state: &ArenaVersionTrie,
     reachable: bool,
 ) -> Result<Option<ParsedBlockSig>, VerifyDiagnostic> {
     if frame.proof_idx == 0 {
@@ -1007,13 +1718,7 @@ fn parse_block_sig(
         });
     }
     if reachable {
-        let live_ver = arena_versions
-            .get(arena_idx)
-            .copied()
-            .ok_or(VerifyDiagnostic {
-                node_idx,
-                kind: VerifyErrorKind::UnknownArena(u32::from(proof.target_arena)),
-            })?;
+        let live_ver = arena_state.get_version(proof.target_arena, arena_desc.initial_version);
         if live_ver != entry_version {
             return Err(VerifyDiagnostic {
                 node_idx,
@@ -1036,41 +1741,19 @@ fn parse_block_sig(
     }))
 }
 
-fn rollback_arena_mutations(
-    arena_versions: &mut [u16],
-    undo_log: &mut Vec<(u16, u16)>,
-    version_bumps: &mut u64,
-    target_undo_len: usize,
-    target_bumps: u64,
-) {
-    while undo_log.len() > target_undo_len {
-        if let Some((arena_id, prev_ver)) = undo_log.pop() {
-            if let Some(slot) = arena_versions.get_mut(usize::from(arena_id)) {
-                *slot = prev_ver;
-            }
-        }
-    }
-    *version_bumps = target_bumps;
-}
-
 fn check_loop_arena_invariant(
+    program: &RulProgram,
     node_idx: u32,
     loop_frame: &ControlFrame,
-    arena_versions: &[u16],
-    undo_log: &[(u16, u16)],
-    version_bumps: u64,
+    arena_state: &mut ArenaVersionTrie,
 ) -> Result<(), VerifyDiagnostic> {
-    if version_bumps == loop_frame.entry_bumps {
+    let cur_root = arena_state.commit_root(program);
+    if cur_root == loop_frame.entry_arena_root {
         return Ok(());
     }
-    let (arena_id, entry_ver) = undo_log
-        .get(loop_frame.entry_undo_len)
-        .copied()
-        .unwrap_or((0, 0));
-    let actual_ver = arena_versions
-        .get(usize::from(arena_id))
-        .copied()
-        .unwrap_or(0);
+    let (arena_id, actual_ver, entry_ver) = arena_state
+        .find_first_diff(cur_root, loop_frame.entry_arena_root, program)
+        .unwrap_or((0, 0, 0));
     Err(VerifyDiagnostic {
         node_idx,
         kind: VerifyErrorKind::StaleOrConsumedToken {
@@ -1081,112 +1764,202 @@ fn check_loop_arena_invariant(
     })
 }
 
-fn merge_exit_delta(
-    ctrl: &mut ControlFrame,
+fn check_loop_region_invariant(
     node_idx: u32,
-    cur_init: u64,
-    path_delta: Option<ArenaDelta>,
+    loop_frame: &ControlFrame,
+    cur_region_owned: u64,
+    cur_region_leased: u64,
 ) -> Result<(), VerifyDiagnostic> {
-    if !ctrl.has_exit_path {
-        ctrl.has_exit_path = true;
-        ctrl.exit_init = cur_init;
-        ctrl.exit_delta = path_delta;
+    if cur_region_owned == loop_frame.entry_region_owned
+        && cur_region_leased == loop_frame.entry_region_leased
+    {
         return Ok(());
     }
-
-    ctrl.exit_init &= cur_init;
-    if ctrl.exit_delta == path_delta {
-        return Ok(());
-    }
-
-    let (arena_id, provided_version, expected_version) = match (ctrl.exit_delta, path_delta) {
-        (Some(prev), None) => (prev.arena_id, prev.entry_version, prev.exit_version),
-        (None, Some(cur)) => (cur.arena_id, cur.exit_version, cur.entry_version),
-        (Some(prev), Some(cur)) if prev.arena_id == cur.arena_id => {
-            (cur.arena_id, cur.exit_version, prev.exit_version)
-        }
-        (Some(prev), Some(_cur)) => (prev.arena_id, prev.entry_version, prev.exit_version),
-        (None, None) => (0, 0, 0),
-    };
     Err(VerifyDiagnostic {
         node_idx,
-        kind: VerifyErrorKind::StaleOrConsumedToken {
-            arena_id,
-            provided_version,
-            expected_version,
+        kind: VerifyErrorKind::LoopTypestateInvariantViolation {
+            expected_owned: loop_frame.entry_region_owned,
+            expected_leased: loop_frame.entry_region_leased,
+            actual_owned: cur_region_owned,
+            actual_leased: cur_region_leased,
         },
     })
 }
 
-fn join_control_exit(
-    ctrl: &mut ControlFrame,
+fn check_region_in_footprint(
     node_idx: u32,
-    cur_init: u64,
-    cur_arenas: &[u16],
-    undo_log: &[(u16, u16)],
-    cur_bumps: u64,
+    slot: u16,
+    state: &VerifierState,
 ) -> Result<(), VerifyDiagnostic> {
-    let bumps = cur_bumps.saturating_sub(ctrl.entry_bumps);
-    let path_delta = if let Some(decl) = ctrl.sig.and_then(|s| s.arena_delta) {
-        let act_target = cur_arenas
-            .get(usize::from(decl.arena_id))
-            .copied()
-            .unwrap_or(0);
-        if act_target != decl.exit_version {
+    if let Some(active) = state.current_func {
+        let dom = state
+            .func_contracts
+            .get(usize::from(active.sig.func_id))
+            .map_or(0, |c| c.dom_mask);
+        if (dom & (1u64 << slot)) == 0 {
             return Err(VerifyDiagnostic {
                 node_idx,
-                kind: VerifyErrorKind::StaleOrConsumedToken {
-                    arena_id: decl.arena_id,
-                    provided_version: act_target,
-                    expected_version: decl.exit_version,
+                kind: VerifyErrorKind::RegionOutsideFootprint { slot },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_region_read(
+    node_idx: u32,
+    slot: u16,
+    state: &VerifierState,
+) -> Result<(), VerifyDiagnostic> {
+    if !state.reachable {
+        return Ok(());
+    }
+    let bit = 1u64 << slot;
+    if ((state.region_owned | state.region_leased) & bit) == 0 {
+        return Err(VerifyDiagnostic {
+            node_idx,
+            kind: VerifyErrorKind::UseOfMovedRegion { slot },
+        });
+    }
+    Ok(())
+}
+
+fn check_region_mutate(
+    node_idx: u32,
+    slot: u16,
+    state: &VerifierState,
+) -> Result<(), VerifyDiagnostic> {
+    if !state.reachable {
+        return Ok(());
+    }
+    let bit = 1u64 << slot;
+    if (state.region_leased & bit) != 0 {
+        return Err(VerifyDiagnostic {
+            node_idx,
+            kind: VerifyErrorKind::MutationUnderLiveLease { slot },
+        });
+    }
+    if (state.region_owned & bit) == 0 {
+        return Err(VerifyDiagnostic {
+            node_idx,
+            kind: VerifyErrorKind::UseOfMovedRegion { slot },
+        });
+    }
+    Ok(())
+}
+
+fn join_control_exit(
+    program: &RulProgram,
+    ctrl: &mut ControlFrame,
+    node_idx: u32,
+    snap: ExitSnapshot,
+    arena_state: &mut ArenaVersionTrie,
+) -> Result<(), VerifyDiagnostic> {
+    let cur_root = arena_state.commit_root(program);
+    arena_state.note_join_work();
+    if let Some(decl) = ctrl.sig.and_then(|s| s.arena_delta) {
+        let init_ver = program
+            .arenas
+            .get(usize::from(decl.arena_id))
+            .map_or(0, |a| a.initial_version);
+        let expected_root = if ctrl.has_exit_path {
+            ctrl.exit_arena_root
+        } else {
+            arena_state.set_version_in_root(
+                ctrl.entry_arena_root,
+                decl.arena_id,
+                decl.exit_version,
+                init_ver,
+            )
+        };
+        if cur_root != expected_root {
+            let act_target = arena_state.get_version_from_root(cur_root, decl.arena_id, init_ver);
+            if act_target != decl.exit_version {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::StaleOrConsumedToken {
+                        arena_id: decl.arena_id,
+                        provided_version: act_target,
+                        expected_version: decl.exit_version,
+                    },
+                });
+            }
+            if let Some((arena_id, provided_version, expected_version)) =
+                arena_state.find_first_diff(cur_root, expected_root, program)
+            {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::StaleOrConsumedToken {
+                        arena_id,
+                        provided_version,
+                        expected_version,
+                    },
+                });
+            }
+        }
+        if !ctrl.has_exit_path {
+            ctrl.has_exit_path = true;
+            ctrl.exit_init = snap.local_init;
+            ctrl.exit_region_owned = snap.region_owned;
+            ctrl.exit_region_leased = snap.region_leased;
+            ctrl.exit_arena_root = expected_root;
+            return Ok(());
+        }
+        ctrl.exit_init &= snap.local_init;
+        if ctrl.exit_region_owned != snap.region_owned
+            || ctrl.exit_region_leased != snap.region_leased
+        {
+            return Err(VerifyDiagnostic {
+                node_idx,
+                kind: VerifyErrorKind::RegionTypestateMismatch {
+                    expected_owned: ctrl.exit_region_owned,
+                    expected_leased: ctrl.exit_region_leased,
+                    actual_owned: snap.region_owned,
+                    actual_leased: snap.region_leased,
                 },
             });
         }
-        let expected_bumps = u64::from(decl.exit_version.saturating_sub(decl.entry_version));
-        if bumps != expected_bumps {
-            let tail = undo_log.get(ctrl.entry_undo_len..).unwrap_or(&[]);
-            for &(id, prev_v) in tail {
-                if id != decl.arena_id {
-                    let act_other = cur_arenas.get(usize::from(id)).copied().unwrap_or(0);
-                    return Err(VerifyDiagnostic {
-                        node_idx,
-                        kind: VerifyErrorKind::StaleOrConsumedToken {
-                            arena_id: id,
-                            provided_version: act_other,
-                            expected_version: prev_v,
-                        },
-                    });
-                }
-            }
-        }
-        if decl.exit_version > decl.entry_version {
-            Some(decl)
-        } else {
-            None
-        }
-    } else if bumps == 0 {
-        None
-    } else {
-        let (first_id, first_entry_v) =
-            undo_log.get(ctrl.entry_undo_len).copied().unwrap_or((0, 0));
-        let first_cur_v = cur_arenas.get(usize::from(first_id)).copied().unwrap_or(0);
-        let first_bumps = u64::from(first_cur_v.saturating_sub(first_entry_v));
-        if first_bumps != bumps {
+        return Ok(());
+    }
+
+    if !ctrl.has_exit_path {
+        ctrl.has_exit_path = true;
+        ctrl.exit_init = snap.local_init;
+        ctrl.exit_region_owned = snap.region_owned;
+        ctrl.exit_region_leased = snap.region_leased;
+        ctrl.exit_arena_root = cur_root;
+        return Ok(());
+    }
+
+    ctrl.exit_init &= snap.local_init;
+    if ctrl.exit_region_owned != snap.region_owned || ctrl.exit_region_leased != snap.region_leased
+    {
+        return Err(VerifyDiagnostic {
+            node_idx,
+            kind: VerifyErrorKind::RegionTypestateMismatch {
+                expected_owned: ctrl.exit_region_owned,
+                expected_leased: ctrl.exit_region_leased,
+                actual_owned: snap.region_owned,
+                actual_leased: snap.region_leased,
+            },
+        });
+    }
+
+    if cur_root != ctrl.exit_arena_root {
+        if let Some((arena_id, provided_version, expected_version)) =
+            arena_state.find_first_diff(cur_root, ctrl.exit_arena_root, program)
+        {
             return Err(VerifyDiagnostic {
                 node_idx,
-                kind: VerifyErrorKind::InvalidControlFlow(
-                    "mutating multiple distinct arenas across a branch join requires nested BlockSig scopes",
-                ),
+                kind: VerifyErrorKind::StaleOrConsumedToken {
+                    arena_id,
+                    provided_version,
+                    expected_version,
+                },
             });
         }
-        Some(ArenaDelta {
-            arena_id: first_id,
-            entry_version: first_entry_v,
-            exit_version: first_cur_v,
-        })
-    };
-
-    merge_exit_delta(ctrl, node_idx, cur_init, path_delta)
+    }
+    Ok(())
 }
 
 fn seal_scope_nodes(scope_nodes: &mut Vec<usize>, node_visible: &mut [bool]) {
@@ -1283,7 +2056,6 @@ fn verify_node_semantics(
     frame: &NodeFrame,
     node_idx: u32,
     metas: &[NodeMeta],
-    arena_versions: &mut [u16],
     state: &mut VerifierState,
 ) -> Result<NodeMeta, VerifyDiagnostic> {
     match frame.opcode {
@@ -2213,19 +2985,37 @@ fn verify_node_semantics(
                     ),
                 });
             }
-            let sig = parse_block_sig(program, frame, node_idx, arena_versions, state.reachable)?;
+            let sig = parse_block_sig(
+                program,
+                frame,
+                node_idx,
+                &state.arena_state,
+                state.reachable,
+            )?;
+            let entry_arena_root = state.arena_state.commit_root(program);
+            if state.reachable {
+                state.cur_steps = state.cur_steps.saturating_add(1);
+            }
+            let parent_steps = state.cur_steps;
+            state.cur_steps = 0;
             state.control_stack.push(ControlFrame {
                 kind: ControlKind::Block,
                 header_node: node_idx,
                 sig,
                 entry_init: state.local_init,
-                entry_undo_len: state.undo_log.len(),
-                entry_bumps: state.version_bumps,
+                entry_arena_root,
                 entry_reachable: state.reachable,
+                entry_region_owned: state.region_owned,
+                entry_region_leased: state.region_leased,
                 has_branch_or_join: false,
                 has_exit_path: false,
                 exit_init: state.local_init,
-                exit_delta: None,
+                exit_region_owned: state.region_owned,
+                exit_region_leased: state.region_leased,
+                exit_arena_root: entry_arena_root,
+                parent_steps,
+                then_steps: 0,
+                loop_bound: 0,
                 scope_nodes: Vec::new(),
             });
             Ok(NodeMeta::VOID)
@@ -2240,7 +3030,7 @@ fn verify_node_semantics(
                     ),
                 });
             }
-            if frame.proof_idx == 0 {
+            let loop_bound = if frame.proof_idx == 0 {
                 if (program.capability_mask & CAP_DIVERGE) == 0 {
                     return Err(VerifyDiagnostic {
                         node_idx,
@@ -2250,6 +3040,7 @@ fn verify_node_semantics(
                         },
                     });
                 }
+                0
             } else {
                 let proof = program.proofs.get(usize::from(frame.proof_idx - 1)).ok_or(
                     VerifyDiagnostic {
@@ -2277,19 +3068,32 @@ fn verify_node_semantics(
                         },
                     });
                 }
+                proof.bound_hi
+            };
+            let entry_arena_root = state.arena_state.commit_root(program);
+            if state.reachable {
+                state.cur_steps = state.cur_steps.saturating_add(1);
             }
+            let parent_steps = state.cur_steps;
+            state.cur_steps = 0;
             state.control_stack.push(ControlFrame {
                 kind: ControlKind::Loop,
                 header_node: node_idx,
                 sig: None,
                 entry_init: state.local_init,
-                entry_undo_len: state.undo_log.len(),
-                entry_bumps: state.version_bumps,
+                entry_arena_root,
                 entry_reachable: state.reachable,
+                entry_region_owned: state.region_owned,
+                entry_region_leased: state.region_leased,
                 has_branch_or_join: false,
                 has_exit_path: false,
                 exit_init: state.local_init,
-                exit_delta: None,
+                exit_region_owned: state.region_owned,
+                exit_region_leased: state.region_leased,
+                exit_arena_root: entry_arena_root,
+                parent_steps,
+                then_steps: 0,
+                loop_bound,
                 scope_nodes: Vec::new(),
             });
             Ok(NodeMeta::VOID)
@@ -2321,19 +3125,37 @@ fn verify_node_semantics(
                     },
                 });
             }
-            let sig = parse_block_sig(program, frame, node_idx, arena_versions, state.reachable)?;
+            let sig = parse_block_sig(
+                program,
+                frame,
+                node_idx,
+                &state.arena_state,
+                state.reachable,
+            )?;
+            let entry_arena_root = state.arena_state.commit_root(program);
+            if state.reachable {
+                state.cur_steps = state.cur_steps.saturating_add(1);
+            }
+            let parent_steps = state.cur_steps;
+            state.cur_steps = 0;
             state.control_stack.push(ControlFrame {
                 kind: ControlKind::If { has_else: false },
                 header_node: node_idx,
                 sig,
                 entry_init: state.local_init,
-                entry_undo_len: state.undo_log.len(),
-                entry_bumps: state.version_bumps,
+                entry_arena_root,
                 entry_reachable: state.reachable,
+                entry_region_owned: state.region_owned,
+                entry_region_leased: state.region_leased,
                 has_branch_or_join: true,
                 has_exit_path: false,
                 exit_init: state.local_init,
-                exit_delta: None,
+                exit_region_owned: state.region_owned,
+                exit_region_leased: state.region_leased,
+                exit_arena_root: entry_arena_root,
+                parent_steps,
+                then_steps: 0,
+                loop_bound: 0,
                 scope_nodes: Vec::new(),
             });
             Ok(NodeMeta::VOID)
@@ -2407,14 +3229,22 @@ fn verify_node_semantics(
                 });
             }
 
-            let (entry_init, entry_undo_len, entry_bumps, entry_reachable) = {
+            let (
+                entry_init,
+                entry_arena_root,
+                entry_reachable,
+                entry_region_owned,
+                entry_region_leased,
+            ) = {
                 let VerifierState {
                     ref mut control_stack,
                     ref mut node_visible,
-                    ref undo_log,
-                    version_bumps,
+                    ref mut arena_state,
                     local_init,
+                    region_owned,
+                    region_leased,
                     reachable,
+                    cur_steps,
                     ..
                 } = *state;
                 let top = control_stack.last_mut().ok_or(VerifyDiagnostic {
@@ -2424,30 +3254,32 @@ fn verify_node_semantics(
                 seal_scope_nodes(&mut top.scope_nodes, node_visible);
                 if reachable {
                     join_control_exit(
+                        program,
                         top,
                         node_idx,
-                        local_init,
-                        arena_versions,
-                        undo_log,
-                        version_bumps,
+                        ExitSnapshot {
+                            local_init,
+                            region_owned,
+                            region_leased,
+                        },
+                        arena_state,
                     )?;
                 }
+                top.then_steps = cur_steps;
                 top.kind = ControlKind::If { has_else: true };
                 (
                     top.entry_init,
-                    top.entry_undo_len,
-                    top.entry_bumps,
+                    top.entry_arena_root,
                     top.entry_reachable,
+                    top.entry_region_owned,
+                    top.entry_region_leased,
                 )
             };
             state.local_init = entry_init;
-            rollback_arena_mutations(
-                arena_versions,
-                &mut state.undo_log,
-                &mut state.version_bumps,
-                entry_undo_len,
-                entry_bumps,
-            );
+            state.region_owned = entry_region_owned;
+            state.region_leased = entry_region_leased;
+            state.cur_steps = 0;
+            state.arena_state.restore_root(entry_arena_root);
             state.reachable = entry_reachable;
             Ok(NodeMeta::VOID)
         }
@@ -2599,134 +3431,166 @@ fn verify_node_semantics(
 
             match popped.kind {
                 ControlKind::Block => {
+                    let body_steps = state.cur_steps;
+                    state.cur_steps = popped.parent_steps.saturating_add(body_steps);
                     let needs_join = popped.has_branch_or_join
                         || popped.sig.and_then(|s| s.arena_delta).is_some();
                     if !needs_join {
                         if !state.reachable {
-                            rollback_arena_mutations(
-                                arena_versions,
-                                &mut state.undo_log,
-                                &mut state.version_bumps,
-                                popped.entry_undo_len,
-                                popped.entry_bumps,
-                            );
+                            state.arena_state.restore_root(popped.entry_arena_root);
                             state.local_init = popped.entry_init;
+                            state.region_owned = popped.entry_region_owned;
+                            state.region_leased = popped.entry_region_leased;
                         }
                     } else {
                         if state.reachable {
                             join_control_exit(
+                                program,
                                 &mut popped,
                                 node_idx,
-                                state.local_init,
-                                arena_versions,
-                                &state.undo_log,
-                                state.version_bumps,
+                                ExitSnapshot {
+                                    local_init: state.local_init,
+                                    region_owned: state.region_owned,
+                                    region_leased: state.region_leased,
+                                },
+                                &mut state.arena_state,
                             )?;
                         }
-                        rollback_arena_mutations(
-                            arena_versions,
-                            &mut state.undo_log,
-                            &mut state.version_bumps,
-                            popped.entry_undo_len,
-                            popped.entry_bumps,
-                        );
                         if popped.has_exit_path {
                             state.reachable = popped.entry_reachable;
                             state.local_init = popped.exit_init;
+                            state.region_owned = popped.exit_region_owned;
+                            state.region_leased = popped.exit_region_leased;
                             if popped.entry_reachable {
-                                if let Some(d) = popped.exit_delta {
-                                    if let Some(slot) =
-                                        arena_versions.get_mut(usize::from(d.arena_id))
-                                    {
-                                        *slot = d.exit_version;
-                                    }
-                                    state.undo_log.push((d.arena_id, d.entry_version));
-                                    state.version_bumps +=
-                                        u64::from(d.exit_version.saturating_sub(d.entry_version));
-                                }
+                                state.arena_state.restore_root(popped.exit_arena_root);
+                            } else {
+                                state.arena_state.restore_root(popped.entry_arena_root);
                             }
                         } else {
                             state.reachable = false;
                             state.local_init = popped.entry_init;
+                            state.region_owned = popped.entry_region_owned;
+                            state.region_leased = popped.entry_region_leased;
+                            state.arena_state.restore_root(popped.entry_arena_root);
                         }
                     }
                 }
                 ControlKind::If { has_else } => {
+                    let branch_steps = if has_else {
+                        popped.then_steps.max(state.cur_steps)
+                    } else {
+                        state.cur_steps
+                    };
+                    state.cur_steps = popped.parent_steps.saturating_add(branch_steps);
                     if state.reachable {
                         join_control_exit(
+                            program,
                             &mut popped,
                             node_idx,
-                            state.local_init,
-                            arena_versions,
-                            &state.undo_log,
-                            state.version_bumps,
+                            ExitSnapshot {
+                                local_init: state.local_init,
+                                region_owned: state.region_owned,
+                                region_leased: state.region_leased,
+                            },
+                            &mut state.arena_state,
                         )?;
                     }
-                    rollback_arena_mutations(
-                        arena_versions,
-                        &mut state.undo_log,
-                        &mut state.version_bumps,
-                        popped.entry_undo_len,
-                        popped.entry_bumps,
-                    );
+                    state.arena_state.restore_root(popped.entry_arena_root);
                     if !has_else && popped.entry_reachable {
-                        let entry_init = popped.entry_init;
+                        let entry_snap = ExitSnapshot {
+                            local_init: popped.entry_init,
+                            region_owned: popped.entry_region_owned,
+                            region_leased: popped.entry_region_leased,
+                        };
                         join_control_exit(
+                            program,
                             &mut popped,
                             node_idx,
-                            entry_init,
-                            arena_versions,
-                            &state.undo_log,
-                            state.version_bumps,
+                            entry_snap,
+                            &mut state.arena_state,
                         )?;
                     }
                     if popped.has_exit_path {
                         state.reachable = popped.entry_reachable;
                         state.local_init = popped.exit_init;
+                        state.region_owned = popped.exit_region_owned;
+                        state.region_leased = popped.exit_region_leased;
                         if popped.entry_reachable {
-                            if let Some(d) = popped.exit_delta {
-                                if let Some(slot) = arena_versions.get_mut(usize::from(d.arena_id))
-                                {
-                                    *slot = d.exit_version;
-                                }
-                                state.undo_log.push((d.arena_id, d.entry_version));
-                                state.version_bumps +=
-                                    u64::from(d.exit_version.saturating_sub(d.entry_version));
-                            }
+                            state.arena_state.restore_root(popped.exit_arena_root);
                         }
                     } else {
                         state.reachable = false;
                         state.local_init = popped.entry_init;
+                        state.region_owned = popped.entry_region_owned;
+                        state.region_leased = popped.entry_region_leased;
                     }
                 }
                 ControlKind::Loop => {
+                    let iters = u64::from(popped.loop_bound).saturating_add(1);
+                    let loop_steps = state.cur_steps.saturating_mul(iters);
+                    state.cur_steps = popped.parent_steps.saturating_add(loop_steps);
                     if state.reachable {
                         check_loop_arena_invariant(
+                            program,
                             node_idx,
                             &popped,
-                            arena_versions,
-                            &state.undo_log,
-                            state.version_bumps,
+                            &mut state.arena_state,
+                        )?;
+                        check_loop_region_invariant(
+                            node_idx,
+                            &popped,
+                            state.region_owned,
+                            state.region_leased,
                         )?;
                     } else {
-                        rollback_arena_mutations(
-                            arena_versions,
-                            &mut state.undo_log,
-                            &mut state.version_bumps,
-                            popped.entry_undo_len,
-                            popped.entry_bumps,
-                        );
+                        state.arena_state.restore_root(popped.entry_arena_root);
                         state.local_init = popped.entry_init;
+                        state.region_owned = popped.entry_region_owned;
+                        state.region_leased = popped.entry_region_leased;
                     }
                 }
                 ControlKind::Func { sig, start_node } => {
+                    if state.reachable {
+                        if let Some(contract) =
+                            state.func_contracts.get(usize::from(sig.func_id)).copied()
+                        {
+                            if state.region_owned != contract.post_owned
+                                || state.region_leased != contract.post_leased
+                            {
+                                return Err(VerifyDiagnostic {
+                                    node_idx,
+                                    kind: VerifyErrorKind::RegionTypestateMismatch {
+                                        expected_owned: contract.post_owned,
+                                        expected_leased: contract.post_leased,
+                                        actual_owned: state.region_owned,
+                                        actual_leased: state.region_leased,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    let func_node_count = (node_idx - start_node) as usize + 1;
+                    let frame_units = func_frame_units(func_node_count);
+                    let max_call_depth = 1u32.saturating_add(state.cur_max_callee_depth);
+                    let max_stack_units =
+                        frame_units.saturating_add(state.cur_max_callee_stack_units);
+                    let worst_case_steps = state.cur_steps.max(1);
                     state.current_func = None;
                     state.local_types = [None; 64];
                     state.local_init = 0;
+                    state.region_owned = 0;
+                    state.region_leased = 0;
                     state.reachable = true;
-                    state
-                        .completed_funcs
-                        .push(CompletedFunc { sig, start_node });
+                    state.cur_steps = 0;
+                    state.cur_max_callee_depth = 0;
+                    state.cur_max_callee_stack_units = 0;
+                    state.completed_funcs.push(CompletedFunc {
+                        sig,
+                        start_node,
+                        worst_case_steps,
+                        max_call_depth,
+                        max_stack_units,
+                    });
                 }
             }
 
@@ -2745,9 +3609,10 @@ fn verify_node_semantics(
             let depth = frame.in_a as usize;
             let VerifierState {
                 ref mut control_stack,
-                ref undo_log,
-                version_bumps,
+                ref mut arena_state,
                 local_init,
+                region_owned,
+                region_leased,
                 ref mut reachable,
                 ..
             } = *state;
@@ -2786,23 +3651,21 @@ fn verify_node_semantics(
             if *reachable {
                 match target.kind {
                     ControlKind::Loop => {
-                        check_loop_arena_invariant(
-                            node_idx,
-                            target,
-                            arena_versions,
-                            undo_log,
-                            version_bumps,
-                        )?;
+                        check_loop_arena_invariant(program, node_idx, target, arena_state)?;
+                        check_loop_region_invariant(node_idx, target, region_owned, region_leased)?;
                     }
                     ControlKind::Block | ControlKind::If { .. } => {
                         target.has_branch_or_join = true;
                         join_control_exit(
+                            program,
                             target,
                             node_idx,
-                            local_init,
-                            arena_versions,
-                            undo_log,
-                            version_bumps,
+                            ExitSnapshot {
+                                local_init,
+                                region_owned,
+                                region_leased,
+                            },
+                            arena_state,
                         )?;
                     }
                     ControlKind::Func { .. } => {}
@@ -2841,9 +3704,10 @@ fn verify_node_semantics(
             let depth = frame.in_b as usize;
             let VerifierState {
                 ref mut control_stack,
-                ref undo_log,
-                version_bumps,
+                ref mut arena_state,
                 local_init,
+                region_owned,
+                region_leased,
                 reachable,
                 ..
             } = *state;
@@ -2882,23 +3746,21 @@ fn verify_node_semantics(
             if reachable {
                 match target.kind {
                     ControlKind::Loop => {
-                        check_loop_arena_invariant(
-                            node_idx,
-                            target,
-                            arena_versions,
-                            undo_log,
-                            version_bumps,
-                        )?;
+                        check_loop_arena_invariant(program, node_idx, target, arena_state)?;
+                        check_loop_region_invariant(node_idx, target, region_owned, region_leased)?;
                     }
                     ControlKind::Block | ControlKind::If { .. } => {
                         target.has_branch_or_join = true;
                         join_control_exit(
+                            program,
                             target,
                             node_idx,
-                            local_init,
-                            arena_versions,
-                            undo_log,
-                            version_bumps,
+                            ExitSnapshot {
+                                local_init,
+                                region_owned,
+                                region_leased,
+                            },
+                            arena_state,
                         )?;
                     }
                     ControlKind::Func { .. } => {}
@@ -2915,6 +3777,7 @@ fn verify_node_semantics(
                 });
             }
             let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
             let len_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if len_meta.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
@@ -2952,6 +3815,24 @@ fn verify_node_semantics(
                     },
                 });
             }
+            if state.reachable {
+                let bit = 1u64 << decl.slot;
+                if (state.region_leased & bit) != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::MutationUnderLiveLease { slot: decl.slot },
+                    });
+                }
+                if (state.region_owned & bit) == 0 {
+                    if decl.role != RegionRole::Plain {
+                        return Err(VerifyDiagnostic {
+                            node_idx,
+                            kind: VerifyErrorKind::UseOfMovedRegion { slot: decl.slot },
+                        });
+                    }
+                    state.region_owned |= bit;
+                }
+            }
             Ok(NodeMeta::VOID)
         }
         Opcode::RegionGrow => {
@@ -2962,7 +3843,8 @@ fn verify_node_semantics(
                     kind: VerifyErrorKind::InvalidControlFlow("RegionGrow requires proof_idx == 0"),
                 });
             }
-            let _decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
             let add_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if add_meta.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
@@ -3000,6 +3882,7 @@ fn verify_node_semantics(
                     },
                 });
             }
+            check_region_mutate(node_idx, decl.slot, state)?;
             Ok(NodeMeta::value(ValueShape::Scalar, ElemType::I64, None))
         }
         Opcode::RegionLen => {
@@ -3012,7 +3895,8 @@ fn verify_node_semantics(
                     ),
                 });
             }
-            let _decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
             if frame.type_lane.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -3031,11 +3915,13 @@ fn verify_node_semantics(
                     },
                 });
             }
+            check_region_read(node_idx, decl.slot, state)?;
             Ok(NodeMeta::value(ValueShape::Scalar, ElemType::I64, None))
         }
         Opcode::RegionLoad => {
             require_pure_token(node_idx, frame)?;
             let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
             let idx_meta = get_prior_meta(node_idx, frame.in_b, metas, state)?;
             if idx_meta.elem != ElemType::I64 {
                 return Err(VerifyDiagnostic {
@@ -3073,6 +3959,7 @@ fn verify_node_semantics(
                     },
                 });
             }
+            check_region_read(node_idx, decl.slot, state)?;
             if frame.proof_idx == 0 {
                 state.has_unproven_region_access = true;
             } else {
@@ -3083,6 +3970,7 @@ fn verify_node_semantics(
         Opcode::RegionStore => {
             require_pure_token(node_idx, frame)?;
             let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
             let (idx_node, val_node) = frame.decode_u16_pair();
             let idx_meta = get_prior_meta(node_idx, idx_node, metas, state)?;
             if idx_meta.elem != ElemType::I64 {
@@ -3140,6 +4028,7 @@ fn verify_node_semantics(
                     },
                 });
             }
+            check_region_mutate(node_idx, decl.slot, state)?;
             if frame.proof_idx == 0 {
                 state.has_unproven_region_access = true;
             } else {
@@ -3158,6 +4047,7 @@ fn verify_node_semantics(
                 });
             }
             let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
             if decl.min_len != 0 {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -3184,6 +4074,290 @@ fn verify_node_semantics(
                         right: ValueShape::Column(0),
                     },
                 });
+            }
+            check_region_mutate(node_idx, decl.slot, state)?;
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::RegionLease => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "RegionLease requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
+            if frame.type_lane.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            if state.reachable {
+                let bit = 1u64 << decl.slot;
+                if (state.region_leased & bit) != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::MutationUnderLiveLease { slot: decl.slot },
+                    });
+                }
+                if (state.region_owned & bit) == 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UseOfMovedRegion { slot: decl.slot },
+                    });
+                }
+                state.region_owned &= !bit;
+                state.region_leased |= bit;
+            }
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::RegionEndLease => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "RegionEndLease requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
+            if frame.type_lane.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            if state.reachable {
+                let bit = 1u64 << decl.slot;
+                if ((state.region_owned | state.region_leased) & bit) == 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UseOfMovedRegion { slot: decl.slot },
+                    });
+                }
+                if (state.region_leased & bit) == 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::RegionTypestateMismatch {
+                            expected_owned: state.region_owned & !bit,
+                            expected_leased: state.region_leased | bit,
+                            actual_owned: state.region_owned,
+                            actual_leased: state.region_leased,
+                        },
+                    });
+                }
+                state.region_leased &= !bit;
+                state.region_owned |= bit;
+            }
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::RegionMove => {
+            require_pure_token(node_idx, frame)?;
+            if frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow("RegionMove requires proof_idx == 0"),
+                });
+            }
+            let src_decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            let dst_decl = lookup_region_decl(node_idx, frame.in_b, &state.regions)?;
+            check_region_in_footprint(node_idx, src_decl.slot, state)?;
+            check_region_in_footprint(node_idx, dst_decl.slot, state)?;
+            if src_decl.slot == dst_decl.slot {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "RegionMove requires distinct source and destination region slots",
+                    ),
+                });
+            }
+            if src_decl.role != RegionRole::Plain {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidRegionDecl {
+                        slot: src_decl.slot,
+                        reason: "RegionMove requires Plain role on source region",
+                    },
+                });
+            }
+            if dst_decl.role != RegionRole::Plain {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidRegionDecl {
+                        slot: dst_decl.slot,
+                        reason: "RegionMove requires Plain role on destination region",
+                    },
+                });
+            }
+            if src_decl.elem != dst_decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: src_decl.elem,
+                        actual: dst_decl.elem,
+                    },
+                });
+            }
+            if src_decl.max_len > dst_decl.max_len {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidRegionDecl {
+                        slot: dst_decl.slot,
+                        reason: "RegionMove source max_len exceeds destination max_len",
+                    },
+                });
+            }
+            if dst_decl.min_len != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidRegionDecl {
+                        slot: dst_decl.slot,
+                        reason: "RegionMove requires destination min_len == 0",
+                    },
+                });
+            }
+            if frame.type_lane.elem != src_decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: src_decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            if state.reachable {
+                let src_bit = 1u64 << src_decl.slot;
+                let dst_bit = 1u64 << dst_decl.slot;
+                if (state.region_leased & src_bit) != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::MutationUnderLiveLease {
+                            slot: src_decl.slot,
+                        },
+                    });
+                }
+                if (state.region_owned & src_bit) == 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::UseOfMovedRegion {
+                            slot: src_decl.slot,
+                        },
+                    });
+                }
+                if (state.region_leased & dst_bit) != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::MutationUnderLiveLease {
+                            slot: dst_decl.slot,
+                        },
+                    });
+                }
+                if (state.region_owned & dst_bit) != 0 {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::RegionTypestateMismatch {
+                            expected_owned: state.region_owned & !dst_bit,
+                            expected_leased: state.region_leased,
+                            actual_owned: state.region_owned,
+                            actual_leased: state.region_leased,
+                        },
+                    });
+                }
+                state.region_owned &= !src_bit;
+                state.region_owned |= dst_bit;
+            }
+            Ok(NodeMeta::VOID)
+        }
+        Opcode::RegionDrop => {
+            require_pure_token(node_idx, frame)?;
+            if frame.in_b != 0 || frame.proof_idx != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidControlFlow(
+                        "RegionDrop requires in_b == 0 and proof_idx == 0",
+                    ),
+                });
+            }
+            let decl = lookup_region_decl(node_idx, frame.in_a, &state.regions)?;
+            check_region_in_footprint(node_idx, decl.slot, state)?;
+            if decl.role != RegionRole::Plain {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidRegionDecl {
+                        slot: decl.slot,
+                        reason: "RegionDrop requires Plain role",
+                    },
+                });
+            }
+            if decl.min_len != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidRegionDecl {
+                        slot: decl.slot,
+                        reason: "RegionDrop is only permitted when min_len == 0",
+                    },
+                });
+            }
+            if frame.type_lane.elem != decl.elem {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: decl.elem,
+                        actual: frame.type_lane.elem,
+                    },
+                });
+            }
+            if frame.type_lane.width != SimdWidth::Scalar {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: ValueShape::Scalar,
+                        right: ValueShape::Column(0),
+                    },
+                });
+            }
+            check_region_mutate(node_idx, decl.slot, state)?;
+            if state.reachable {
+                state.region_owned &= !(1u64 << decl.slot);
             }
             Ok(NodeMeta::VOID)
         }
@@ -3261,12 +4435,29 @@ fn verify_node_semantics(
                     state.local_init |= 1u64 << i;
                 }
             }
+            let contract = state
+                .func_contracts
+                .get(expected_id as usize)
+                .copied()
+                .unwrap_or(FuncRegionContract {
+                    dom_mask: 0,
+                    pre_owned: 0,
+                    pre_leased: 0,
+                    post_owned: 0,
+                    post_leased: 0,
+                });
+            state.region_owned = contract.pre_owned;
+            state.region_leased = contract.pre_leased;
             state.reachable = true;
+            state.cur_steps = 0;
+            state.cur_max_callee_depth = 0;
+            state.cur_max_callee_stack_units = 0;
             state.current_func = Some(ActiveFunc {
                 sig,
                 start_node: node_idx,
             });
             state.next_func_id = expected_id.saturating_add(1);
+            let entry_arena_root = state.arena_state.commit_root(program);
             state.control_stack.push(ControlFrame {
                 kind: ControlKind::Func {
                     sig,
@@ -3275,13 +4466,19 @@ fn verify_node_semantics(
                 header_node: node_idx,
                 sig: None,
                 entry_init: state.local_init,
-                entry_undo_len: state.undo_log.len(),
-                entry_bumps: state.version_bumps,
+                entry_arena_root,
                 entry_reachable: true,
+                entry_region_owned: state.region_owned,
+                entry_region_leased: state.region_leased,
                 has_branch_or_join: false,
                 has_exit_path: false,
                 exit_init: state.local_init,
-                exit_delta: None,
+                exit_region_owned: state.region_owned,
+                exit_region_leased: state.region_leased,
+                exit_arena_root: entry_arena_root,
+                parent_steps: 0,
+                then_steps: 0,
+                loop_bound: 0,
                 scope_nodes: Vec::new(),
             });
             Ok(NodeMeta::VOID)
@@ -3325,6 +4522,27 @@ fn verify_node_semantics(
                     node_idx,
                     kind: VerifyErrorKind::InvalidControlFlow("void Return requires in_a == 0"),
                 });
+            }
+            if state.reachable {
+                if let Some(contract) = state
+                    .func_contracts
+                    .get(usize::from(active.sig.func_id))
+                    .copied()
+                {
+                    if state.region_owned != contract.post_owned
+                        || state.region_leased != contract.post_leased
+                    {
+                        return Err(VerifyDiagnostic {
+                            node_idx,
+                            kind: VerifyErrorKind::RegionTypestateMismatch {
+                                expected_owned: contract.post_owned,
+                                expected_leased: contract.post_leased,
+                                actual_owned: state.region_owned,
+                                actual_leased: state.region_leased,
+                            },
+                        });
+                    }
+                }
             }
             state.reachable = false;
             Ok(NodeMeta::VOID)
@@ -3500,6 +4718,76 @@ fn verify_node_semantics(
                                 actual: *actual,
                             },
                         });
+                    }
+                }
+            }
+
+            // Enforce the composable frame rule: dom(callee) ⊆ dom(caller), check callee pre on dom(callee),
+            // and apply callee post on dom(callee) while preserving slots outside dom(callee).
+            let caller_contract = state
+                .func_contracts
+                .get(usize::from(active.sig.func_id))
+                .copied()
+                .unwrap_or(FuncRegionContract {
+                    dom_mask: 0,
+                    pre_owned: 0,
+                    pre_leased: 0,
+                    post_owned: 0,
+                    post_leased: 0,
+                });
+            let callee_contract = state
+                .func_contracts
+                .get(target_id as usize)
+                .copied()
+                .unwrap_or(FuncRegionContract {
+                    dom_mask: 0,
+                    pre_owned: 0,
+                    pre_leased: 0,
+                    post_owned: 0,
+                    post_leased: 0,
+                });
+            let extra_mask = callee_contract.dom_mask & !caller_contract.dom_mask;
+            if extra_mask != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::CalleeFootprintExceedsCaller {
+                        callee_func_id: callee_sig.func_id,
+                        extra_mask,
+                    },
+                });
+            }
+            if state.reachable {
+                let dom = callee_contract.dom_mask;
+                let observed_owned = state.region_owned & dom;
+                let observed_leased = state.region_leased & dom;
+                if observed_owned != callee_contract.pre_owned
+                    || observed_leased != callee_contract.pre_leased
+                {
+                    return Err(VerifyDiagnostic {
+                        node_idx,
+                        kind: VerifyErrorKind::RegionTypestateMismatch {
+                            expected_owned: callee_contract.pre_owned,
+                            expected_leased: callee_contract.pre_leased,
+                            actual_owned: observed_owned,
+                            actual_leased: observed_leased,
+                        },
+                    });
+                }
+                state.region_owned = (state.region_owned & !dom) | callee_contract.post_owned;
+                state.region_leased = (state.region_leased & !dom) | callee_contract.post_leased;
+
+                if (program.capability_mask & CAP_DIVERGE) == 0 {
+                    if let Some(callee) = state.completed_funcs.get(target_id as usize).copied() {
+                        state.cur_steps = state
+                            .cur_steps
+                            .saturating_add(1)
+                            .saturating_add(callee.worst_case_steps);
+                        state.cur_max_callee_depth =
+                            state.cur_max_callee_depth.max(callee.max_call_depth);
+                        state.cur_max_callee_stack_units =
+                            state.cur_max_callee_stack_units.max(callee.max_stack_units);
+                    } else {
+                        state.cur_steps = state.cur_steps.saturating_add(1);
                     }
                 }
             }
