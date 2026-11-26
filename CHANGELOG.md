@@ -2,6 +2,48 @@
 
 All notable changes to the **Rul** (`.rl`) binary representation, verifier, 3-Tier execution engine, and `ELF64` AOT compiler are documented in this file.
 
+## [0.6.0] — 2026-11-26
+
+Milestone 2 (**Ownership Across Joins, Linking & Rul Standard Library**: `v0-6-ownership-1` through `v0-6-stdlib-exit-4`) — completing the 68-opcode ISA with zero new opcodes added for the standard library or exit programs.
+
+### Added (`v0-6-stdlib-exit-4` — Region-Backed Stdlib, Three Linked Exit Programs & Performance Gate)
+- **Region-backed Rul standard library modules (`stdlib/`, `cap 0x0`, zero new opcodes)**:
+  - Declared I/O region bounds across stdlib and exit programs: `std.io.in <= 128 MiB` (`134,217,728` bytes), `std.io.out <= 256 MiB` (`268,435,456` bytes, `MAX_REGION_BYTES`); exceeding declared region bounds fails closed via ISA exit codes `71`/`74`.
+  - `stdlib/vec.rls`: multi-instance growable `I64` & `U8` vector module using a descriptor table (`vec.meta`: up to 1,023 descriptors `[kind, offset, len, cap]`) and backing storage regions (`vec.i64_data` up to `4,194,304` `i64`s / `32 MiB`, `vec.u8_data` up to `16,777,216` bytes / `16 MiB`) supporting `>= 2` concurrent logical `Vec` instances, `BrTable` tagged-enum dispatch in `vec::clear`, exponential growth with frontier/relocation handling, and bulk span `vec::append_i64` / `vec::append_u8`.
+  - `stdlib/string.rls`: bulk/span RFC 3629 `str::utf8_validate` (256-byte `const_data` byte-class table + `BrTable` validating 1..4-byte UTF-8 and rejecting overlong encodings, UTF-16 surrogates `U+D800..U+DFFF`, `> U+10FFFF`, and truncated sequences), `str::eq_span`, 4x-unrolled `str::find_substr`, `str::parse_i64`, `str::fmt_i64`, and `str::append_input_span`, declaring `FuncRegionEffect` `Leased -> Leased` on `std.io.in`, with chunked `256 x 999,999` static `LoopBound` loops covering the full `128 MiB` input region (including long digit strings and `> 1,000,000`-byte patterns).
+  - `stdlib/hashmap.rls`: open-addressing power-of-two byte-keyed `I64` hash map using 64-bit FNV-1a (`map::init`, `map::set_span`, `map::get_span`, `map::del_span`, `map::count`, `map::last_found`) over SoA columns (`map.kmeta` packing `[state:2 | koff:30 | klen:30]`, `map.hash`, `map.val`, `map.keys` + zero-copy `RegionDrop`/`RegionMove` scratch regions), supporting up to `33,554,432` slots (`23.48M` live keys at `0.7` load, exceeding the `~14.92M` theoretical distinct-key ceiling of a `128 MiB` KV stream) and `128 MiB` compacted live key bytes, tombstone deletion dispatched via `BrTable`, live-key compaction during rehash and under dead-key churn, chunked hash/copy/compare/rehash/probe loops, and `Leased -> Leased` on `std.io.in`.
+- **Three separately verified, `rul link`-assembled exit programs & safe-Rust references (`perf/v0_6_exit/`, `src/v06_stdlib_tests.rs`)**:
+  - Within the declared `128 MiB` input / `256 MiB` output bounds (and shared `MAX_JSON_DEPTH = 128` for `json_parser`), all three linked exit programs match their safe-Rust `rustc -O` references byte-for-byte across `Tier 0 == ELF64 AOT == rustc -O`:
+  - `json_parser.{rls,rs}` (`stdlib/string.rls` + `stdlib/vec.rls`): zero-GC RFC 8259 JSON parser with `BrTable` token dispatch, `str::utf8_validate` on strings under live `RegionLease`, and shared deterministic `MAX_JSON_DEPTH = 128`.
+  - `kv_store.{rls,rs}` (`stdlib/hashmap.rls` + `stdlib/string.rls`): line-delimited batch KV store (`SET`/`GET`/`DEL`/`COUNT`) using 64-bit FNV-1a hashing in both Rul and safe `std`-only Rust, backed by a `1 MiB` flush-on-full scratch buffer into `std.io.out` (`<= 256 MiB`).
+  - `wc_grep.{rls,rs}` (`stdlib/string.rls`): buffer-level `wc` (`lines`/`words`/`bytes`) + `grep` (`matches` + 63-bit FNV-1a matched-line digest) using `str::find_substr` under live `RegionLease`.
+  - Added single-pass `ScRegAllocState::live_gpr_mask` tracking, in-place GPR-immediate ALU fast path, single-lookup node analysis/emission, and `fn_body_buf` pre-reservation in `src/aot.rs` (preserving `Tier 0 == ELF64 AOT` equivalence while keeping `stress_60k` codegen well under `50 ns/node` on an unthrottled host).
+  - **Representative `v0.6` Performance Gate (`x86_64`, release build, min of 5 alternating single-threaded runs, `Tier 0 == ELF64 AOT == rustc -O`, `>= 100 ms` reference; exact timings vary with host CPU frequency/load)**:
+    - `json_parser` (`100.80 MiB`, 900k records): `631.42 ms` vs `rustc -O` `373.15 ms` (**`1.69x`** `<= 2.0x`, `25,506 B` ELF64)
+    - `kv_store` (`32.80 MiB`, 2.0M ops, FNV-1a): `631.99 ms` vs `rustc -O` `406.86 ms` (**`1.55x`** `<= 2.0x`, `25,110 B` ELF64)
+    - `wc_grep` (`86.64 MiB`, 1.4M lines): `885.27 ms` vs `rustc -O` `530.86 ms` (**`1.67x`** `<= 2.0x`, `12,880 B` ELF64)
+  - **Measured `v0.6` Linearity Gate (`x86_64`, release build, 2-module 6,000-node vs 60,000-node stress inputs & exit programs; load average ~9.4)**:
+    - `stress_6k` (6,000 nodes): verify `230.13 us`, link `532.33 us`, AOT codegen `179.24 us` (`29.87 ns/node`)
+    - `stress_60k` (60,000 nodes): verify `2.30 ms` (**`10.01x`** `<= 15.0x`), link `5.58 ms` (**`10.48x`** `<= 15.0x`), AOT codegen `1.87 ms` (**`31.17 ns/node`** `<= 50 ns/node`, **`10.43x`** `<= 15.0x`)
+    - Linked exit programs: `json_parser` (3,477 nodes: `161.07 us` verify / `389.86 us` link / `219.08 us` codegen), `kv_store` (2,666 nodes: `128.49 us` / `313.55 us` / `181.46 us`), `wc_grep` (1,369 nodes: `63.78 us` / `156.52 us` / `79.64 us`).
+- **Specification & Roadmap Finalization (`docs/rul_spec_v0.md`, `ROADMAP.md`, `CHANGELOG.md`)**:
+  - Updated `docs/rul_spec_v0.md` to the full 68-opcode `v0.6` catalog, Section 5a/5b binary layout, `ProofRuleKind` `1..=12`, `ArenaVersionTrie` `O(N + A)` multi-arena joins, `FuncRegionEffect` `pre=leased` exact-match semantics, exit code `76`, `rul check --json`, `rul link`, and `stdlib/`.
+  - Aligned `ROADMAP.md` terminology to "statically named, typestate-tracked regions" and recorded all Milestone 2 deliverables and measured benchmark ratios.
+
+### Added (`v0-6-linker-3` — Section 5b `link_meta`, Separate Verification & Verified `rul link`)
+- Added Section 5b (`link_meta`, canonical `RLMK` v1 symbol table, `RulHeader[44..48]`, max `2 MiB`), lossless `.rls` `export`/`import` directives (`func` and `region`), `verify_module` vs fail-closed `UnresolvedImport` in `verify_program`, and `link_modules` / `rul link` enforcing zero silent capability escalation, exact `FuncSig`/`FuncRegionContract`/`RegionDecl` checking, Section 5a + proof relocation with `<= 255` deduplicated node-proof ceiling, and deterministic min-heap Kahn topological ordering (`src/linker.rs`, `src/bin/rul.rs`, `src/v06_linker_tests.rs`, `tests/cli_link_v06.rs`).
+
+### Added (`v0-6-data-dispatch-2` — 68-Opcode ISA: Section 5a `const_data`, Dense `BrTable` & Typed `CallIndirect`)
+- Added Section 5a (`const_data`, `RulHeader[40..44]`, max `8 MiB`, `PF_R` ELF64 segment), domain-separated 64-bit FNV-1a hashing (preserving `v0.5.0` binary/hash compatibility when empty), and `RulCasStore` hash-collision rejection.
+- Added `ConstDataLen = 0x08`, `ConstDataLoad = 0x09`, `BrTable = 0x5B` (inline PC-relative jump table), `CallIndirect = 0x5C` (fail-closed exit code `76` / `AOT_EXIT_INDIRECT_CALL_OOB` on out-of-range table index), and `ProofRuleKind` `9..=12` (`ConstDataSeg`, `ConstDataInBounds`, `BrTableSpec`, `CallTable`) (`src/v06_data_dispatch_tests.rs`).
+
+### Added (`v0-6-ownership-1` — 64-Opcode ISA: `ArenaVersionTrie`, Region Typestate, Frame Rule & `StaticCostSummary`)
+- Added `ArenaVersionTrie` (`O(N + A)` multi-arena `AffineToken` tracking with `O(1)` canonical root-ID joins across control-flow boundaries).
+- Added statically named, typestate-tracked region ownership (`Owned`/`Leased`/`Moved` bitmasks), `RegionLease = 0x66`, `RegionEndLease = 0x67`, `RegionMove = 0x68`, `RegionDrop = 0x69`, and `ProofRuleKind::FuncRegionEffect = 8` (frame-rule composition with exact `pre=leased` semantics).
+- Added `CAP_NONE` `StaticCostSummary` and `rul check --json` (`src/v06_ownership_tests.rs`, `tests/cli_check_v06.rs`).
+
+---
+
 ## [0.5.0] — 2026-11-20
 
 Milestone 1 (**Turing-Complete Core**: `v0-5-tc-core-1` through `v0-5-tc-core-4`) plus Phase P0 (Safety & Correctness), Phase P1 (AOT `YMM` Register Allocation), and Phase P1b (`Opcode::Fma` & AVX2 Vectorized `Ln`/`Exp`).

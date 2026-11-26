@@ -35,6 +35,8 @@ mod v06_data_dispatch_tests;
 mod v06_linker_tests;
 #[cfg(test)]
 mod v06_ownership_tests;
+#[cfg(test)]
+mod v06_stdlib_tests;
 
 #[cfg(test)]
 mod tests {
