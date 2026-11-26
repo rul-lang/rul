@@ -1635,6 +1635,7 @@ fn emit_alu64_rm_rbp(code: &mut Vec<u8>, op: u8, dst: u8, disp: i32) {
     emit_rbp_disp_modrm(code, dst, disp);
 }
 
+#[inline]
 fn emit_alu64_ri(code: &mut Vec<u8>, ext: u8, dst: u8, imm: i64) {
     // `ext`: 0=add, 1=or, 4=and, 5=sub, 6=xor, 7=cmp
     if let Ok(i8v) = i8::try_from(imm) {
@@ -2754,6 +2755,7 @@ fn emit_sc_int_cmp(
     }
 }
 
+#[inline]
 fn emit_sc_int_binary(
     code: &mut Vec<u8>,
     opcode: Opcode,
@@ -2763,6 +2765,28 @@ fn emit_sc_int_binary(
     dst_home: ScHome,
     spill_base_slot: u32,
 ) {
+    // Fast path: in-place I64 register-immediate ALU (`dst == a`, `b` is ConstI64).
+    if elem != ElemType::U8 && opcode != Opcode::Mul {
+        if let (
+            ScHome::Gpr(ra) | ScHome::AliasGpr(ra),
+            ScHome::ConstI64(v),
+            ScHome::Gpr(rd) | ScHome::AliasGpr(rd),
+        ) = (home_a, home_b, dst_home)
+        {
+            if ra == rd && !(opcode == Opcode::BitAnd && v == 0xFFFF_FFFF) {
+                let ext = match opcode {
+                    Opcode::Add => 0,
+                    Opcode::Sub => 5,
+                    Opcode::BitAnd | Opcode::MaskAnd => 4,
+                    Opcode::BitOr | Opcode::MaskOr => 1,
+                    _ => 6, // BitXor
+                };
+                emit_alu64_ri(code, ext, rd, v);
+                return;
+            }
+        }
+    }
+
     // Fast path: `BitAnd` with `0xFFFF_FFFF` lowers to a single 32-bit zero-extending move.
     if opcode == Opcode::BitAnd && elem == ElemType::I64 {
         let masked_src = match (home_a, home_b) {
@@ -3108,7 +3132,7 @@ fn sc_analyze_unit(
         }
     }
 
-    let record_use = |scratch: &mut ScUnitScratch, v: usize, at_idx: usize| {
+    let record_use = |scratch: &mut ScUnitScratch, v: usize, at_idx: usize| -> Option<ElemType> {
         let at_u32 = u32::try_from(at_idx).unwrap_or(u32::MAX);
         if let Some(info) = scratch.nodes.get_mut(v) {
             info.inc_use();
@@ -3121,6 +3145,9 @@ fn sc_analyze_unit(
                     info.outer_loop_header = hdr;
                 }
             }
+            Some(info.elem())
+        } else {
+            None
         }
     };
 
@@ -3133,8 +3160,10 @@ fn sc_analyze_unit(
             }
         }
         let loop_depth_u16 = u16::try_from(scratch.loop_stack.len()).unwrap_or(u16::MAX);
-        if let Some(info) = scratch.nodes.get_mut(idx) {
-            info.home_data = loop_depth_u16;
+        if loop_depth_u16 != 0 {
+            if let Some(info) = scratch.nodes.get_mut(idx) {
+                info.home_data = loop_depth_u16;
+            }
         }
         let idx_u32 = u32::try_from(idx).unwrap_or(0);
         let a_idx = frame.in_a as usize;
@@ -3228,14 +3257,12 @@ fn sc_analyze_unit(
             | Opcode::Shl
             | Opcode::ShrU
             | Opcode::ShrS => {
-                record_use(scratch, a_idx, idx);
+                let el_a = record_use(scratch, a_idx, idx).unwrap_or(frame.type_lane.elem);
                 record_use(scratch, b_idx, idx);
-                let el_a = scratch
-                    .nodes
-                    .get(a_idx)
-                    .map_or(frame.type_lane.elem, |n| n.elem());
-                if let Some(info) = scratch.nodes.get_mut(idx) {
-                    info.set_elem(el_a);
+                if el_a != ElemType::I64 {
+                    if let Some(info) = scratch.nodes.get_mut(idx) {
+                        info.set_elem(el_a);
+                    }
                 }
             }
             Opcode::Min | Opcode::Max => {
@@ -3625,6 +3652,7 @@ fn sc_analyze_unit(
 struct ScRegAllocState {
     free_gpr_mask: u16,
     free_xmm_mask: u16,
+    live_gpr_mask: u16,
     gpr_expire: [u32; 16],
     xmm_expire: [u32; 16],
     min_gpr_expire: u32,
@@ -3639,6 +3667,7 @@ impl ScRegAllocState {
         Self {
             free_gpr_mask,
             free_xmm_mask,
+            live_gpr_mask: 0,
             gpr_expire: [u32::MAX; 16],
             xmm_expire: [u32::MAX; 16],
             min_gpr_expire: u32::MAX,
@@ -3728,6 +3757,7 @@ impl ScRegAllocState {
             };
             if let Some(reg) = chosen {
                 self.free_gpr_mask &= !(1u16 << reg);
+                self.live_gpr_mask |= 1u16 << reg;
                 if (SC_CALLEE_SAVED_MASK & (1u16 << reg)) != 0 {
                     self.used_callee_saved_mask |= 1u16 << reg;
                 }
@@ -3758,7 +3788,12 @@ impl ScRegAllocState {
             return None;
         }
         let r = info.home_data as u8;
-        if scratch.eff_last_use(src_idx) != dst_idx {
+        let src_elu = if !scratch.has_any_loop || info.outer_loop_header == u32::MAX {
+            info.last_use as usize
+        } else {
+            scratch.eff_last_use(src_idx)
+        };
+        if src_elu != dst_idx {
             return None;
         }
         if dst_spans_barrier && (SC_CALLEE_SAVED_MASK & (1u16 << r)) == 0 {
@@ -3768,7 +3803,7 @@ impl ScRegAllocState {
         if let Some(ex) = self.gpr_expire.get_mut(usize::from(r)) {
             *ex = lu_u32;
         }
-        if lu_u32 < self.min_gpr_expire {
+        if self.live_gpr_mask == (1u16 << r) || lu_u32 < self.min_gpr_expire {
             self.min_gpr_expire = lu_u32;
         }
         Some(ScHome::Gpr(r))
@@ -3809,12 +3844,16 @@ impl ScRegAllocState {
         let idx_u32 = u32::try_from(idx).unwrap_or(u32::MAX);
         if idx_u32 >= self.min_gpr_expire {
             let mut next_min = u32::MAX;
-            for &r in &SC_ALL_GPRS_ORDER {
+            let mut mask = self.live_gpr_mask;
+            while mask != 0 {
+                let r = u8::try_from(mask.trailing_zeros()).unwrap_or(0);
+                mask &= mask - 1;
                 if let Some(ex) = self.gpr_expire.get_mut(usize::from(r)) {
                     let v = *ex;
                     if v <= idx_u32 {
                         *ex = u32::MAX;
                         self.free_gpr_mask |= 1u16 << r;
+                        self.live_gpr_mask &= !(1u16 << r);
                     } else if v < next_min {
                         next_min = v;
                     }
@@ -4237,6 +4276,9 @@ fn sc_emit_unit(
 
     let mut fn_body_buf = std::mem::take(&mut scratch.fn_body);
     fn_body_buf.clear();
+    if func_mode {
+        fn_body_buf.reserve(len.saturating_mul(8));
+    }
     let body_call_patch_start = patches.call_patches.len();
     let body_call_table_patch_start = patches.call_table_patches.len();
     let body_rodata_patch_start = patches.rodata_patches.len();
@@ -4290,8 +4332,21 @@ fn sc_emit_unit(
             let b_idx = frame.in_b as usize;
             let home_a = scratch.get_home(a_idx, unit_nodes);
             let home_b = scratch.get_home(b_idx, unit_nodes);
-            let uc = scratch.nodes.get(idx).map_or(0, |n| n.use_count());
-            let eff_lu = scratch.eff_last_use(idx);
+            let (uc, eff_lu) = if let Some(info) = scratch.nodes.get(idx) {
+                let lu = info.last_use as usize;
+                let elu = if !scratch.has_any_loop || info.outer_loop_header == u32::MAX {
+                    lu
+                } else {
+                    let lend = scratch
+                        .nodes
+                        .get(info.outer_loop_header as usize)
+                        .map_or(0, |h| h.aux as usize);
+                    lu.max(lend)
+                };
+                (info.use_count(), elu)
+            } else {
+                (0, 0)
+            };
             let spans_bar = scratch.spans_barrier(idx, eff_lu);
 
             match frame.opcode {
@@ -4460,17 +4515,25 @@ fn sc_emit_unit(
                             emit_store_xmm_into_home(out, dst, work_x, spill_base_slot);
                             scratch.set_home(idx, dst)?;
                         } else {
-                            let direct_ret = if uc == 1
-                                && is_immediate_func_return(idx)
-                                && !(frame.opcode == Opcode::Sub
-                                    && home_b.gpr_reg() == Some(REG_RAX))
-                            {
-                                Some(ScHome::AliasGpr(REG_RAX))
+                            let direct = if uc == 1
+                                && unit_nodes.get(idx + 1).is_some_and(|nf| {
+                                    matches!(
+                                        nf.opcode,
+                                        Opcode::LocalSet | Opcode::Return | Opcode::End
+                                    )
+                                }) {
+                                if is_immediate_func_return(idx)
+                                    && !(frame.opcode == Opcode::Sub
+                                        && home_b.gpr_reg() == Some(REG_RAX))
+                                {
+                                    Some(ScHome::AliasGpr(REG_RAX))
+                                } else {
+                                    direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                                }
                             } else {
                                 None
                             };
-                            let dst = direct_ret
-                                .or_else(|| direct_local_dst(unit_nodes, scratch, &local_home, idx))
+                            let dst = direct
                                 .or_else(|| {
                                     alloc.try_reuse_gpr(a_idx, idx, eff_lu, spans_bar, scratch)
                                 })
@@ -4589,13 +4652,19 @@ fn sc_emit_unit(
                 | Opcode::MaskOr => {
                     if uc > 0 {
                         let elem = scratch.node_elem(idx);
-                        let direct_ret = if uc == 1 && is_immediate_func_return(idx) {
-                            Some(ScHome::AliasGpr(REG_RAX))
+                        let direct = if uc == 1
+                            && unit_nodes.get(idx + 1).is_some_and(|nf| {
+                                matches!(nf.opcode, Opcode::LocalSet | Opcode::Return | Opcode::End)
+                            }) {
+                            if is_immediate_func_return(idx) {
+                                Some(ScHome::AliasGpr(REG_RAX))
+                            } else {
+                                direct_local_dst(unit_nodes, scratch, &local_home, idx)
+                            }
                         } else {
                             None
                         };
-                        let dst = direct_ret
-                            .or_else(|| direct_local_dst(unit_nodes, scratch, &local_home, idx))
+                        let dst = direct
                             .or_else(|| alloc.try_reuse_gpr(a_idx, idx, eff_lu, spans_bar, scratch))
                             .or_else(|| alloc.try_reuse_gpr(b_idx, idx, eff_lu, spans_bar, scratch))
                             .unwrap_or_else(|| {
