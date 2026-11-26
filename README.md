@@ -10,8 +10,8 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23722094.svg)](https://doi.org/10.5281/zenodo.23722094)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](./LICENSE-APACHE)
-[![Spec: Rul v0.5](https://img.shields.io/badge/Spec-.rl%20v0.5%20(128--bit%20Binary%20IR)-success.svg)](./docs/rul_spec_v0.md)
-[![Roadmap: v1.0](https://img.shields.io/badge/Roadmap-v0.5%20to%20v1.0-informational.svg)](./ROADMAP.md)
+[![Spec: Rul v0.6](https://img.shields.io/badge/Spec-.rl%20v0.6%20(128--bit%20Binary%20IR)-success.svg)](./docs/rul_spec_v0.md)
+[![Roadmap: v1.0](https://img.shields.io/badge/Roadmap-v0.6%20to%20v1.0-informational.svg)](./ROADMAP.md)
 [![Whitepaper: v0.1](https://img.shields.io/badge/Whitepaper-Zenodo%20Open%20Archive-orange.svg)](./docs/WHITEPAPER_RUL_V0_1.md)
 
 ## What is Rul in Plain English?
@@ -141,14 +141,14 @@ A common question is: *"If humans do not write `.rl` code, how do teams debug or
 
 We intentionally restricted `v0.1` through `v0.4.0` to **array and vector dataflow pipelines** (`29 opcodes` at the `v0.4.0` release) to prove the 16-byte binary instruction format, single-pass `O(N)` verifier, and zero-LLVM native `ELF64` compiler on real hardware first.
 
-**Milestone 1 (`v0.5.0` — Turing-Complete Core) is now shipped** across a **60-opcode** 128-bit ISA: structured control flow (`Block`, `Loop`, `If`, `Else`, `End`, `Br`, `BrIf`), typed scalar locals, `CAP_DIVERGE` termination policy, `I64`/`U8` bitwise & checked arithmetic, statically declared growable regions (`mmap`/`mremap`) with byte I/O and proof-based bounds elision, a modular function table with `CAP_DIVERGE`-gated recursion under host-independent call-depth and stack-unit budgets, and a single-pass linear-scan scalar register allocator (10 GPRs + 14 XMMs). All five `v0.5` exit programs (**Brainf\*ck interpreter**, recursive `fib`, `quicksort`, prime `sieve`, and `sha256`) pass `Tier 0 == ELF64 AOT` byte-for-byte and run within **`1.13x`–`1.98x`** of `rustc -O` (`<= 2.0x` gate) with `O(N)` codegen (`~32 ns/node`).
+**Milestone 1 (`v0.5.0` — Turing-Complete Core) and Milestone 2 (`v0.6.0` — Ownership Across Joins, Linking & Rul Standard Library) are now shipped** across a **68-opcode** 128-bit ISA: structured control flow (`Block`, `Loop`, `If`, `Else`, `End`, `Br`, `BrIf`, `BrTable`), typed scalar locals, `CAP_DIVERGE` termination policy, `I64`/`U8` bitwise & checked arithmetic, statically named, typestate-tracked growable regions (`RegionLease`, `RegionEndLease`, `RegionMove`, `RegionDrop`) with frame-rule `FuncRegionEffect` footprints and `ArenaVersionTrie` `O(N + A)` multi-arena joins, `CAP_NONE` `StaticCostSummary` + `rul check --json`, Section 5a read-only `const_data` segments (`ConstDataLen`, `ConstDataLoad`), typed `CallIndirect`, Section 5b `link_meta` separate verification & verified module linking (`rul link`), and a zero-new-opcode Rul standard library (`stdlib/vec.rls`, `stdlib/string.rls`, `stdlib/hashmap.rls`). All five `v0.5` exit programs (**Brainf\*ck**, `fib`, `quicksort`, `sieve`, `sha256` at `1.13x`–`1.98x` vs `rustc -O`) and all three linked `v0.6` exit programs (**JSON parser**, **in-memory KV store**, and **`wc`/`grep`** at **`1.55x`–`1.69x`** vs `rustc -O`, `<= 2.0x` gate, `~31 ns/node` `O(N)` AOT codegen) pass `Tier 0 == ELF64 AOT == rustc -O` byte-for-byte.
 
 We are executing a six-milestone roadmap (see **[`ROADMAP.md`](./ROADMAP.md)**) to expand Rul from a columnar compute engine into a **general-purpose systems language capable of replacing Rust and Go for AI-generated software**. Each milestone is defined by programs that must run identically in `Tier 0` and as native binaries:
 
 1. **Milestone 1 (`v0.5` — Shipped): Turing-Complete Core**
    - Integer and byte arithmetic, declared growable memory regions with runtime bounds checks, byte input and output, a function table with recursion guarded by host-independent call-depth and stack limits, and single-pass scalar register allocation. Exit programs passing `Tier 0 == ELF64 AOT` (`1.13x`–`1.98x` vs `rustc -O`): a Brainf\*ck interpreter written in Rul, recursive `fib`, `quicksort`, a prime `sieve`, and `sha256`.
-2. **Milestone 2 (`v0.6`): Ownership Across Joins, Linking & Standard Library**
-   - Region ownership and leases checked across branches, loops, and calls in `O(N)`, a constant data section, linking of separately verified modules, and `Vec`, `String`, and `HashMap` written in Rul.
+2. **Milestone 2 (`v0.6` — Shipped): Ownership Across Joins, Linking & Standard Library**
+   - Statically named, typestate-tracked region ownership and leases with frame-rule footprints across branches, loops, and calls in `O(N)`, `ArenaVersionTrie` `O(N + A)` multi-arena joins, `CAP_NONE` `StaticCostSummary` + `rul check --json`, Section 5a read-only `const_data` segments, dense `BrTable` and typed `CallIndirect`, Section 5b `link_meta` + `rul link` verified module linking with zero silent capability escalation, and `stdlib/` (`Vec`, `String` + RFC 3629 `utf8_validate`, `HashMap`) written in Rul with zero new opcodes. Linked exit programs passing `Tier 0 == ELF64 AOT == rustc -O` (`1.55x`–`1.69x` vs `rustc -O`): zero-GC `json_parser`, `kv_store`, and `wc_grep`.
 3. **Milestone 3 (`v0.7`): Capability-Gated Linux I/O & Columnar Bridge**
    - File, clock, and network syscalls gated by fine-grained `CapabilityMask` bits, and a region-as-arena view so general programs call the columnar SIMD engine.
 4. **Milestone 4 (`v0.8`): Thread-Per-Core Concurrency & Network Servers**
@@ -177,21 +177,24 @@ We are executing a six-milestone roadmap (see **[`ROADMAP.md`](./ROADMAP.md)**) 
 ## Repository Architecture
 
 1. **16-Byte Binary Format ([`src/bytecode.rs`](./src/bytecode.rs)) & Symbolic Assembler ([`src/transpiler.rs`](./src/transpiler.rs))**:
-   - 64-byte `RulHeader`, 16-byte `ArenaDescriptor` table, 16-byte `ProofEntry` table, and 16-byte `NodeFrame` instructions across 60 opcodes (30 columnar dataflow opcodes plus 30 structured control-flow, scalar `I64`/`U8`, growable region, and modular function opcodes).
-   - Lossless `.rls` <-> `.rl` assembler and decompiler (`assemble_rls`, `program_to_rls`).
-2. **Single-Pass `O(N)` Static Verifier ([`src/verifier.rs`](./src/verifier.rs))**:
-   - Checks acyclic instruction ordering (`in_a < idx`), memory version transitions (`AffineConsume` / `ReadLease`), slice/gather/region bounds (`ProofEntry`), `FuncSig` / `BlockSig` / `LoopBound` witnesses, and `CapabilityMask` permissions in one pass.
+   - 64-byte `RulHeader` (including Section 5a `const_data` and Section 5b `link_meta` lengths), 16-byte `ArenaDescriptor` table, 16-byte `ProofEntry` table (`12` rule kinds), and 16-byte `NodeFrame` instructions across 68 opcodes (30 columnar dataflow opcodes, 30 `v0.5` Turing-complete core opcodes, and 8 `v0.6` ownership, constant-data, and dispatch opcodes).
+   - Lossless `.rls` <-> `.rl` assembler and decompiler (`assemble_rls`, `program_to_rls`) including `data seg`, `br_table`, `call_table`, and module `export`/`import` directives.
+2. **Single-Pass `O(N)` Static Verifier ([`src/verifier.rs`](./src/verifier.rs)) & Verified Linker ([`src/linker.rs`](./src/linker.rs))**:
+   - Unified `verify_program` / `verify_module` single-pass verifier checking acyclic instruction ordering (`in_a < idx`), `ArenaVersionTrie` `O(N + A)` multi-arena `AffineConsume`/`ReadLease` joins, statically named region typestate & `FuncRegionEffect` frame-rule footprints, slice/gather/region/const-data bounds proofs, `BrTable`/`CallIndirect` safety, `CapabilityMask` permissions, and `CAP_NONE` `StaticCostSummary`.
+   - Zero-dependency module linker (`link_modules` / `rul link`) enforcing zero silent capability escalation, exact signature/region/effect compatibility, `<= 255` deduplicated node-proof ceiling, full relocation, and deterministic Kahn topological ordering.
 3. **3-Tier Execution Engine & Autotuner ([`src/engine.rs`](./src/engine.rs))**:
-   - **Tier 0 (`execute_tier0_interpreter`)**: Reference interpreter and golden oracle (including structured control flow, regions, and explicit heap-stack function calls).
+   - **Tier 0 (`execute_tier0_interpreter`)**: Reference interpreter and golden oracle (including structured control flow, regions, constant segments, `BrTable`, `CallIndirect`, and explicit heap-stack function calls).
    - **Tier 1 (`execute_tier1_stencil`)**: 8-lane vectorized column kernels.
    - **Tier 2 (`execute_tier2_fused` & `execute_tier2_with_zonemap`)**: L1-cache tile fusion (`1,024` elements/tile), multi-core execution, and `ArenaZoneMap` tile skipping.
    - **White-Box Tracer (`trace_program`)**: Computes per-node `min`, `max`, `sum`, `NaN/Inf` counts, and sample values.
 4. **Direct Linux `x86_64` AVX2 & Scalar `ELF64` Compiler ([`src/aot.rs`](./src/aot.rs))**:
-   - Emits standalone Linux `x86_64` `ELF64` binaries in microseconds with zero `LLVM` or `libc` dependencies: 256-bit AVX2 `YMM` linear-scan allocation (`ymm2..ymm13`) + FMA3/vectorized `Ln`/`Exp` for columnar pipelines, and a single-pass linear-scan scalar allocator (10 GPRs + 14 `XMM`s) with private guarded stack and `mmap`/`mremap` regions for Turing-complete programs.
-5. **Model Context Protocol Server ([`src/mcp.rs`](./src/mcp.rs) & [`src/bin/rul_mcp.rs`](./src/bin/rul_mcp.rs))**:
+   - Emits standalone Linux `x86_64` `ELF64` binaries in microseconds with zero `LLVM` or `libc` dependencies: 256-bit AVX2 `YMM` linear-scan allocation (`ymm2..ymm13`) + FMA3/vectorized `Ln`/`Exp` for columnar pipelines, and a single-pass linear-scan scalar allocator (10 GPRs + 14 `XMM`s) with private guarded stack, `mmap`/`mremap` regions, W^X `PF_R` `const_data` `PT_LOAD` segment, inline `BrTable` jump tables, and bounds-checked `CallIndirect` dispatch.
+5. **Region-Backed Rul Standard Library ([`stdlib/`](./stdlib/))**:
+   - Separately verifiable, zero-new-opcode Rul library modules (`stdlib/vec.rls`, `stdlib/string.rls` with RFC 3629 `str::utf8_validate`, and `stdlib/hashmap.rls` with 64-bit FNV-1a open addressing and tombstones) linked cleanly via `rul link`.
+6. **Model Context Protocol Server ([`src/mcp.rs`](./src/mcp.rs) & [`src/bin/rul_mcp.rs`](./src/bin/rul_mcp.rs))**:
    - In-memory `stdio` JSON-RPC 2.0 MCP server (`rul-mcp`) providing 6 tools for AI agents: `rul_assemble_and_verify`, `rul_test_differential`, `rul_autotune_schedule`, `rul_compile_standalone`, `rul_trace`, and `rul_cas_intrinsics`.
-6. **Content-Addressed Intrinsics ([`src/cas.rs`](./src/cas.rs)) & Embedding API ([`src/ffi.rs`](./src/ffi.rs))**:
-   - 64-bit FNV-1a content-addressed store (`RulCasStore`) with `I64`/`U8` kernels (`sort`, `hash_join`, `group_by`, `simd_scan_byte`, `fnv1a_hash`) and zero-panic `#[repr(C)]` embedding functions under `#![forbid(unsafe_code)]`.
+7. **Content-Addressed Intrinsics ([`src/cas.rs`](./src/cas.rs)) & Embedding API ([`src/ffi.rs`](./src/ffi.rs))**:
+   - Collision-safe 64-bit FNV-1a content-addressed store (`RulCasStore`) with `I64`/`U8` kernels (`sort`, `hash_join`, `group_by`, `simd_scan_byte`, `fnv1a_hash`) and zero-panic `#[repr(C)]` embedding functions under `#![forbid(unsafe_code)]`.
 
 ---
 
@@ -207,11 +210,12 @@ cargo install --git https://github.com/rul-lang/rul --bins --force
 # CLI workflow
 rul new my-ai-pipeline
 cd my-ai-pipeline
-rul check      # Run single-pass O(N) static verifier
-rul build      # Assemble .rls -> build/main.rl and emit standalone ELF64 binary
-rul run        # Execute Tier 2 + ELF64 AOT with differential verification
-rul trace      # Print per-node min/max/sum/NaN inspection table
-rul autotune   # Sweep ScheduleHint policies and pick fastest schedule
+rul check          # Run single-pass O(N) static verifier + StaticCostSummary (--json supported)
+rul link a.rls b.rls -o app.rl  # Verify and deterministically link modular .rl/.rls units
+rul build          # Assemble .rls -> build/main.rl and emit standalone ELF64 binary
+rul run            # Execute Tier 2 / Tier 0 + ELF64 AOT with differential verification
+rul trace          # Print per-node min/max/sum/NaN inspection table
+rul autotune       # Sweep ScheduleHint policies and pick fastest schedule
 
 # Run the full 10-pipeline differential and AOT benchmark suite
 rul-bench
@@ -227,8 +231,8 @@ cargo test
 
 ## Documentation
 
-- **[`ROADMAP.md`](./ROADMAP.md)**: Six-Milestone Technical Roadmap from the `v0.4` Columnar Engine through `v0.5` Turing-Complete Core to the `v1.0` General-Purpose Systems Language.
-- **[`docs/rul_spec_v0.md`](./docs/rul_spec_v0.md)**: Official `.rl` Binary Layout, 128-Bit Instruction Frame & `O(N)` Verifier Specification (`v0.5.0` 60-opcode ISA).
+- **[`ROADMAP.md`](./ROADMAP.md)**: Six-Milestone Technical Roadmap from the `v0.4` Columnar Engine through `v0.5` Turing-Complete Core and `v0.6` Ownership/Linking/Stdlib to the `v1.0` General-Purpose Systems Language.
+- **[`docs/rul_spec_v0.md`](./docs/rul_spec_v0.md)**: Official `.rl` Binary Layout, 128-Bit Instruction Frame & `O(N)` Verifier Specification (`v0.6.0` 68-opcode ISA).
 - **[`docs/about_rul.md`](./docs/about_rul.md)**: Plain-English Overview of How Rul Works.
 - **[`docs/new_language_for_AI.md`](./docs/new_language_for_AI.md)**: Design Notes & Architectural Breakdown.
 - **[`docs/WHITEPAPER_RUL_V0_1.md`](./docs/WHITEPAPER_RUL_V0_1.md)**: Technical Whitepaper & Empirical Evaluation (Zenodo Archive).
