@@ -44,6 +44,18 @@ pub const MAX_CONST_DATA_BYTES: u32 = 8 * 1024 * 1024;
 /// Maximum permitted byte length of Section 5b (`link_meta`: `2 MiB`).
 pub const MAX_LINK_META_BYTES: u32 = 2 * 1024 * 1024;
 
+/// Magic header bytes identifying canonical Section 5b (`link_meta`) module symbol metadata.
+pub const LINK_META_MAGIC: [u8; 4] = *b"RLMK";
+
+/// Binary schema version of Section 5b (`link_meta`).
+pub const LINK_META_VERSION: u16 = 1;
+
+/// Maximum permitted number of export/import declarations in Section 5b (`link_meta`).
+pub const MAX_LINK_ENTRIES: usize = 4096;
+
+/// Maximum permitted ASCII byte length of a single exported or imported symbol name.
+pub const MAX_LINK_NAME_LEN: usize = 128;
+
 /// Maximum permitted number of table entries in a [`ProofRuleKind::BrTableSpec`] or [`ProofRuleKind::CallTable`].
 pub const MAX_TABLE_ENTRIES: u32 = 4096;
 
@@ -1271,6 +1283,238 @@ impl NodeFrame {
     }
 }
 
+/// Direction of a module symbol declaration in Section 5b (`link_meta`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum LinkDirection {
+    /// Symbol exported by this module (`0`).
+    Export = 0,
+    /// Symbol imported by this module from another module (`1`).
+    Import = 1,
+}
+
+impl LinkDirection {
+    const fn from_u8(raw: u8) -> Result<Self, RulFormatError> {
+        match raw {
+            0 => Ok(Self::Export),
+            1 => Ok(Self::Import),
+            _ => Err(RulFormatError::InvalidLinkMetadata(
+                "invalid link symbol direction byte",
+            )),
+        }
+    }
+}
+
+/// Entity kind referenced by a module symbol declaration in Section 5b (`link_meta`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum LinkSymbolKind {
+    /// Function identifier (`0`).
+    Func = 0,
+    /// Region slot (`1`).
+    Region = 1,
+}
+
+impl LinkSymbolKind {
+    const fn from_u8(raw: u8) -> Result<Self, RulFormatError> {
+        match raw {
+            0 => Ok(Self::Func),
+            1 => Ok(Self::Region),
+            _ => Err(RulFormatError::InvalidLinkMetadata(
+                "invalid link symbol kind byte",
+            )),
+        }
+    }
+}
+
+/// Validates a canonical module export/import symbol name (`1..=128` ASCII bytes in `[A-Za-z0-9_.:/-]+`).
+#[must_use]
+pub fn is_valid_link_symbol_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_LINK_NAME_LEN
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'))
+}
+
+/// Single canonical export or import declaration stored in Section 5b (`link_meta`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSymbol {
+    /// Export (`0`) or Import (`1`).
+    pub direction: LinkDirection,
+    /// Function (`0`) or Region (`1`).
+    pub kind: LinkSymbolKind,
+    /// Module-local `func_id` or region `slot`.
+    pub local_id: u16,
+    /// Canonical ASCII symbol name (`1..=128` bytes, `[A-Za-z0-9_.:/-]+`).
+    pub name: String,
+}
+
+/// Decoded Section 5b (`link_meta`) module interface table (`RLMK` v1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkMetadata {
+    /// Ordered module export and import declarations.
+    pub entries: Vec<LinkSymbol>,
+}
+
+impl LinkMetadata {
+    /// Encodes the module link metadata into canonical Section 5b bytes (`RLMK` v1).
+    ///
+    /// An empty entry list encodes to an empty byte vector (`Vec::new()`) to preserve
+    /// `v0.5.0` binary and hash compatibility for self-contained executables.
+    ///
+    /// # Errors
+    /// Returns [`RulFormatError::InvalidLinkMetadata`] if entry count, symbol names, or total byte size exceed bounds.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, RulFormatError> {
+        if self.entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.entries.len() > MAX_LINK_ENTRIES {
+            return Err(RulFormatError::InvalidLinkMetadata(
+                "link_meta entry count exceeds 4096",
+            ));
+        }
+        let mut total_bytes: usize = 8;
+        for entry in &self.entries {
+            if !is_valid_link_symbol_name(&entry.name) {
+                return Err(RulFormatError::InvalidLinkMetadata(
+                    "invalid link symbol name (must be 1..=128 ASCII chars in [A-Za-z0-9_.:/-])",
+                ));
+            }
+            total_bytes = total_bytes
+                .checked_add(6)
+                .and_then(|v| v.checked_add(entry.name.len()))
+                .ok_or(RulFormatError::InvalidLinkMetadata(
+                    "link_meta byte length overflow",
+                ))?;
+        }
+        if total_bytes > (MAX_LINK_META_BYTES as usize) {
+            return Err(RulFormatError::InvalidLinkMetadata(
+                "link_meta exceeds MAX_LINK_META_BYTES (2 MiB)",
+            ));
+        }
+        let entry_count = u16::try_from(self.entries.len()).map_err(|_e| {
+            RulFormatError::InvalidLinkMetadata("link_meta entry count exceeds u16::MAX")
+        })?;
+
+        let mut out = Vec::with_capacity(total_bytes);
+        out.extend_from_slice(&LINK_META_MAGIC);
+        out.extend_from_slice(&LINK_META_VERSION.to_le_bytes());
+        out.extend_from_slice(&entry_count.to_le_bytes());
+        for entry in &self.entries {
+            let name_len = u16::try_from(entry.name.len()).map_err(|_e| {
+                RulFormatError::InvalidLinkMetadata("link symbol name exceeds 128 bytes")
+            })?;
+            out.push(entry.direction as u8);
+            out.push(entry.kind as u8);
+            out.extend_from_slice(&entry.local_id.to_le_bytes());
+            out.extend_from_slice(&name_len.to_le_bytes());
+            out.extend_from_slice(entry.name.as_bytes());
+        }
+        Ok(out)
+    }
+
+    /// Decodes and validates canonical Section 5b (`link_meta`) bytes (`RLMK` v1).
+    ///
+    /// An empty byte slice decodes to an empty [`LinkMetadata`].
+    ///
+    /// # Errors
+    /// Returns [`RulFormatError::InvalidLinkMetadata`] if magic, version, entry count, bounds,
+    /// symbol names, or trailing bytes are invalid.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RulFormatError> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        if bytes.len() > (MAX_LINK_META_BYTES as usize) {
+            return Err(RulFormatError::InvalidLinkMetadata(
+                "link_meta exceeds MAX_LINK_META_BYTES (2 MiB)",
+            ));
+        }
+        let header: &[u8; 8] = bytes.get(0..8).and_then(|s| s.try_into().ok()).ok_or(
+            RulFormatError::InvalidLinkMetadata("truncated link_meta header"),
+        )?;
+        if header[0..4] != LINK_META_MAGIC {
+            return Err(RulFormatError::InvalidLinkMetadata(
+                "invalid link_meta magic (expected RLMK)",
+            ));
+        }
+        let version = u16::from_le_bytes([header[4], header[5]]);
+        if version != LINK_META_VERSION {
+            return Err(RulFormatError::InvalidLinkMetadata(
+                "unsupported link_meta version (expected 1)",
+            ));
+        }
+        let entry_count = usize::from(u16::from_le_bytes([header[6], header[7]]));
+        if entry_count > MAX_LINK_ENTRIES {
+            return Err(RulFormatError::InvalidLinkMetadata(
+                "link_meta entry count exceeds 4096",
+            ));
+        }
+
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut offset: usize = 8;
+        for _ in 0..entry_count {
+            let fixed_end = offset
+                .checked_add(6)
+                .ok_or(RulFormatError::InvalidLinkMetadata(
+                    "link_meta offset overflow",
+                ))?;
+            let fixed: &[u8; 6] = bytes
+                .get(offset..fixed_end)
+                .and_then(|s| s.try_into().ok())
+                .ok_or(RulFormatError::InvalidLinkMetadata(
+                    "truncated link_meta entry header",
+                ))?;
+            offset = fixed_end;
+
+            let direction = LinkDirection::from_u8(fixed[0])?;
+            let kind = LinkSymbolKind::from_u8(fixed[1])?;
+            let local_id = u16::from_le_bytes([fixed[2], fixed[3]]);
+            let name_len = usize::from(u16::from_le_bytes([fixed[4], fixed[5]]));
+            if name_len == 0 || name_len > MAX_LINK_NAME_LEN {
+                return Err(RulFormatError::InvalidLinkMetadata(
+                    "link_meta symbol name length must be in 1..=128",
+                ));
+            }
+            let name_end =
+                offset
+                    .checked_add(name_len)
+                    .ok_or(RulFormatError::InvalidLinkMetadata(
+                        "link_meta name offset overflow",
+                    ))?;
+            let name_bytes =
+                bytes
+                    .get(offset..name_end)
+                    .ok_or(RulFormatError::InvalidLinkMetadata(
+                        "truncated link_meta symbol name",
+                    ))?;
+            offset = name_end;
+
+            let name_str = std::str::from_utf8(name_bytes).map_err(|_e| {
+                RulFormatError::InvalidLinkMetadata("non-UTF8 link_meta symbol name")
+            })?;
+            if !is_valid_link_symbol_name(name_str) {
+                return Err(RulFormatError::InvalidLinkMetadata(
+                    "invalid link_meta symbol name characters",
+                ));
+            }
+            entries.push(LinkSymbol {
+                direction,
+                kind,
+                local_id,
+                name: name_str.to_owned(),
+            });
+        }
+        if offset != bytes.len() {
+            return Err(RulFormatError::InvalidLinkMetadata(
+                "trailing bytes after link_meta entries",
+            ));
+        }
+        Ok(Self { entries })
+    }
+}
+
 /// Complete in-memory representation of a `.rl` binary program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RulProgram {
@@ -1311,6 +1555,26 @@ impl RulProgram {
                         | ProofRuleKind::CallTable
                 )
             })
+    }
+
+    /// Decodes and validates Section 5b (`link_meta`) module export/import declarations.
+    ///
+    /// # Errors
+    /// Returns [`RulFormatError::InvalidLinkMetadata`] if `link_meta` is non-empty and does not match the `RLMK` v1 schema.
+    pub fn decode_link_meta(&self) -> Result<LinkMetadata, RulFormatError> {
+        LinkMetadata::from_bytes(&self.link_meta)
+    }
+
+    /// Returns `true` if Section 5b (`link_meta`) declares at least one unresolved `import`.
+    ///
+    /// # Errors
+    /// Returns [`RulFormatError::InvalidLinkMetadata`] if `link_meta` is malformed.
+    pub fn has_unresolved_imports(&self) -> Result<bool, RulFormatError> {
+        let meta = self.decode_link_meta()?;
+        Ok(meta
+            .entries
+            .iter()
+            .any(|e| e.direction == LinkDirection::Import))
     }
 
     /// Returns `true` if the program contains any `Func` node or `FuncSig` proof entry.
@@ -1596,6 +1860,8 @@ pub enum RulFormatError {
     InvalidProofRule(u16),
     /// Non-zero trailing reserved bytes in `RulHeader[48..64]`.
     InvalidReservedHeader,
+    /// Malformed or out-of-bounds Section 5b (`link_meta`) module metadata.
+    InvalidLinkMetadata(&'static str),
 }
 
 impl fmt::Display for RulFormatError {
@@ -1623,6 +1889,9 @@ impl fmt::Display for RulFormatError {
             Self::InvalidProofRule(rule) => write!(f, "invalid ProofRuleKind: {rule}"),
             Self::InvalidReservedHeader => {
                 write!(f, "non-zero reserved bytes in .rl header[48..64]")
+            }
+            Self::InvalidLinkMetadata(reason) => {
+                write!(f, "invalid Section 5b link_meta: {reason}")
             }
         }
     }

@@ -19,6 +19,7 @@ pub mod bytecode;
 pub mod cas;
 pub mod engine;
 pub mod ffi;
+pub mod linker;
 pub mod mcp;
 pub mod suite10;
 pub mod transpiler;
@@ -30,6 +31,8 @@ mod tc_core3_tests;
 mod tc_core4_tests;
 #[cfg(test)]
 mod v06_data_dispatch_tests;
+#[cfg(test)]
+mod v06_linker_tests;
 #[cfg(test)]
 mod v06_ownership_tests;
 
