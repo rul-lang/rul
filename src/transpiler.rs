@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 
 use crate::bytecode::{
-    ArenaDescriptor, ElemType, ExecPolicy, NodeFrame, Opcode, ProofEntry, ProofRuleKind,
-    RegionRole, RegionState, RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane,
+    is_valid_link_symbol_name, ArenaDescriptor, ElemType, ExecPolicy, LinkDirection, LinkMetadata,
+    LinkSymbol, LinkSymbolKind, NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole,
+    RegionState, RulProgram, ScheduleHint, SimdWidth, TokenMode, TokenOp, TypeLane,
     CALL_ARG_SENTINEL, CAP_DIVERGE, CAP_GPU_DISPATCH, CAP_NET_RING, CAP_NONE, CAP_STORAGE_DMA,
     REGION_FOOTPRINT_NONE,
 };
@@ -512,7 +513,29 @@ pub fn program_to_rls(program: &RulProgram) -> String {
         );
     }
     if !program.link_meta.is_empty() {
-        let _ = writeln!(out, "link_meta hex \"{}\"", encode_hex(&program.link_meta));
+        let emitted_structured = LinkMetadata::from_bytes(&program.link_meta)
+            .ok()
+            .filter(|meta| {
+                !meta.entries.is_empty()
+                    && meta.to_bytes().ok().as_deref() == Some(program.link_meta.as_slice())
+            })
+            .map(|meta| {
+                for sym in &meta.entries {
+                    let dir_s = match sym.direction {
+                        LinkDirection::Export => "export",
+                        LinkDirection::Import => "import",
+                    };
+                    let kind_s = match sym.kind {
+                        LinkSymbolKind::Func => "func",
+                        LinkSymbolKind::Region => "region",
+                    };
+                    let _ = writeln!(out, "{dir_s} {kind_s} {} {}", sym.name, sym.local_id);
+                }
+            })
+            .is_some();
+        if !emitted_structured {
+            let _ = writeln!(out, "link_meta hex \"{}\"", encode_hex(&program.link_meta));
+        }
     }
 
     for (idx, proof) in program.proofs.iter().enumerate() {
@@ -946,6 +969,8 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
     let mut nodes: Vec<NodeFrame> = Vec::new();
     let mut const_data: Vec<u8> = Vec::new();
     let mut link_meta: Vec<u8> = Vec::new();
+    let mut link_entries: Vec<LinkSymbol> = Vec::new();
+    let mut has_raw_link_meta = false;
     let mut seg_symbols: HashMap<String, u16> = HashMap::new();
     let mut next_seg_id: u16 = 0;
     let mut global_symbols: HashMap<String, u32> = HashMap::new();
@@ -996,8 +1021,32 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
                 const_data.extend_from_slice(&bytes);
             }
             "link_meta" => {
+                if !link_entries.is_empty() {
+                    return Err(RlsError::LineParse {
+                        line: line_no,
+                        message: "cannot mix raw link_meta directive with export/import directives"
+                            .to_owned(),
+                    });
+                }
+                has_raw_link_meta = true;
                 let bytes = parse_hex_section_line(line_no, line, "link_meta")?;
                 link_meta.extend_from_slice(&bytes);
+            }
+            "export" | "import" => {
+                if has_raw_link_meta {
+                    return Err(RlsError::LineParse {
+                        line: line_no,
+                        message: "cannot mix export/import directives with raw link_meta directive"
+                            .to_owned(),
+                    });
+                }
+                let direction = if directive == "export" {
+                    LinkDirection::Export
+                } else {
+                    LinkDirection::Import
+                };
+                let sym = parse_link_symbol_line(line_no, direction, parts)?;
+                link_entries.push(sym);
             }
             "br_table" => {
                 let proof = parse_br_table_line(line_no, parts, &mut const_data)?;
@@ -1041,6 +1090,17 @@ pub fn assemble_rls(source: &str) -> Result<RulProgram, RlsError> {
 
     if nodes.is_empty() {
         return Err(RlsError::EmptyProgram);
+    }
+
+    if !link_entries.is_empty() {
+        link_meta = LinkMetadata {
+            entries: link_entries,
+        }
+        .to_bytes()
+        .map_err(|e| RlsError::LineParse {
+            line: 0,
+            message: e.to_string(),
+        })?;
     }
 
     let output_node = if let Some(sym) = explicit_output {
@@ -2679,4 +2739,63 @@ fn parse_call_table_line<'a>(
         count = count.saturating_add(1);
     }
     Ok(ProofEntry::call_table(table_id, offset, count))
+}
+
+fn parse_link_symbol_line<'a>(
+    line_no: usize,
+    direction: LinkDirection,
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Result<LinkSymbol, RlsError> {
+    let dir_label = match direction {
+        LinkDirection::Export => "export",
+        LinkDirection::Import => "import",
+    };
+    let kind_tok = parts.next().ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: format!("{dir_label} requires kind ('func' or 'region')"),
+    })?;
+    let kind = match kind_tok {
+        "func" => LinkSymbolKind::Func,
+        "region" => LinkSymbolKind::Region,
+        other => {
+            return Err(RlsError::LineParse {
+                line: line_no,
+                message: format!(
+                    "invalid {dir_label} kind '{other}' (expected 'func' or 'region')"
+                ),
+            });
+        }
+    };
+    let name = parts.next().ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: format!("{dir_label} {kind_tok} requires symbol name"),
+    })?;
+    if !is_valid_link_symbol_name(name) {
+        return Err(RlsError::LineParse {
+            line: line_no,
+            message: format!(
+                "invalid {dir_label} symbol name '{name}' (expected 1..=128 ASCII chars in [A-Za-z0-9_.:/-])"
+            ),
+        });
+    }
+    let id_tok = parts.next().ok_or_else(|| RlsError::LineParse {
+        line: line_no,
+        message: format!("{dir_label} {kind_tok} '{name}' requires local id"),
+    })?;
+    let local_id = id_tok.parse::<u16>().map_err(|_e| RlsError::LineParse {
+        line: line_no,
+        message: format!("invalid {dir_label} local id '{id_tok}'"),
+    })?;
+    if let Some(extra) = parts.next() {
+        return Err(RlsError::LineParse {
+            line: line_no,
+            message: format!("unexpected trailing token '{extra}' in {dir_label} directive"),
+        });
+    }
+    Ok(LinkSymbol {
+        direction,
+        kind,
+        local_id,
+        name: name.to_owned(),
+    })
 }

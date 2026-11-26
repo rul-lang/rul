@@ -3,6 +3,7 @@
 //! Provides a complete Cargo-free / `rustc`-free project workflow for Rul (`.rl` / `.rls`):
 //! - `rul new <dir>`      : Create a pure Rul project (`rul.toml`, `src/main.rls`, `data/arena_0.bin`)
 //! - `rul check [path]`   : Run the single-pass O(N) static verifier
+//! - `rul link <mods...> -o <out.rl>`: Verify and link modular `.rl`/`.rls` libraries into one verified `.rl`
 //! - `rul build [path]`   : Assemble `.rls` -> `.rl` and compile a standalone Linux `x86_64` AVX2 `ELF64` binary
 //! - `rul run [path]`     : Execute `.rl`/`.rls` via Tier 2 Fused SIMD + native `ELF64` AOT with telemetry
 //! - `rul autotune [path]`: Sweep hardware schedules (`AutoL1Tile`, `SimdStream`, `MultiCore`) for max reward
@@ -33,6 +34,7 @@ use rul::engine::{
     autotune_schedule, execute_tier0_interpreter, execute_tier0_interpreter_with_input,
     execute_tier2_fused, format_trace_table, trace_program, RuntimeValue,
 };
+use rul::linker::{link_modules, LinkOptions};
 use rul::mcp::escape_json_string;
 use rul::suite10::{load_rl_file, save_rl_file, MAX_RL_FILE_BYTES};
 use rul::transpiler::{assemble_rls, disassemble_rl, program_to_rls};
@@ -69,6 +71,8 @@ USAGE:
 COMMANDS:
     new <dir>             Create a new pure Rul project (rul.toml, src/main.rls, data/arena_0.bin)
     check [--json] [file] Run the single-pass O(N) static verifier (defaults to src/main.rls)
+    link <mods...> -o <out.rl> [--entry <name>] [--cap <hex>]
+                          Verify and link modular .rl/.rls files into a single verified .rl executable
     build [file]        Pack .rls -> build/*.rl and compile standalone x86_64 AVX2 ELF64 binary
     run [file]          Verify, execute (Tier 2 SIMD + ELF64 AOT), and print HardwareTelemetry
     autotune [file]     Autotune hardware ScheduleHint (AutoL1Tile, SimdStream, MultiCore)
@@ -334,6 +338,118 @@ fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn parse_cap_flag(raw: &str) -> Result<u64, String> {
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        if hex.is_empty() {
+            return Err(format!("invalid --cap hex value `{raw}`"));
+        }
+        u64::from_str_radix(hex, 16).map_err(|_e| format!("invalid --cap hex value `{raw}`"))
+    } else {
+        raw.parse::<u64>()
+            .map_err(|_e| format!("invalid --cap value `{raw}` (expected hex like 0x0 or 0x8)"))
+    }
+}
+
+fn cmd_link(args: &[String]) -> Result<(), String> {
+    let mut input_paths: Vec<PathBuf> = Vec::new();
+    let mut out_path: Option<PathBuf> = None;
+    let mut entry_export: Option<String> = None;
+    let mut capability_mask: Option<u64> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let Some(tok) = args.get(i).map(String::as_str) else {
+            break;
+        };
+        match tok {
+            "-o" | "--output" => {
+                if out_path.is_some() {
+                    return Err("duplicate `-o` output path for `rul link`".to_owned());
+                }
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "missing output path after `-o`".to_owned())?;
+                out_path = Some(PathBuf::from(val));
+            }
+            "--entry" => {
+                if entry_export.is_some() {
+                    return Err("duplicate `--entry` flag for `rul link`".to_owned());
+                }
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "missing export name after `--entry`".to_owned())?;
+                entry_export = Some(val.clone());
+            }
+            "--cap" => {
+                if capability_mask.is_some() {
+                    return Err("duplicate `--cap` flag for `rul link`".to_owned());
+                }
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "missing hex mask after `--cap`".to_owned())?;
+                capability_mask = Some(parse_cap_flag(val)?);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown flag `{other}` for `rul link`"));
+            }
+            path_str => {
+                input_paths.push(PathBuf::from(path_str));
+            }
+        }
+        i += 1;
+    }
+
+    if input_paths.is_empty() {
+        return Err(
+            "usage: rul link <mod1> <mod2> ... -o <out.rl> [--entry <name>] [--cap <hex>]"
+                .to_owned(),
+        );
+    }
+    let out_file = out_path.ok_or_else(|| {
+        "missing required `-o <out.rl>` output path (usage: rul link <mod1> <mod2> ... -o <out.rl> [--entry <name>] [--cap <hex>])"
+            .to_owned()
+    })?;
+
+    let t0 = Instant::now();
+    let mut modules = Vec::with_capacity(input_paths.len());
+    for path in &input_paths {
+        let prog = load_program(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        modules.push(prog);
+    }
+
+    let options = LinkOptions {
+        entry_export,
+        capability_mask,
+    };
+    let report = link_modules(&modules, &options).map_err(|e| e.to_string())?;
+
+    if let Some(parent) = out_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+    }
+    let out_str = out_file
+        .to_str()
+        .ok_or_else(|| format!("non-UTF8 output path: {}", out_file.display()))?;
+    let out_bytes = save_rl_file(out_str, &report.program).map_err(|e| e.to_string())?;
+    let elapsed_us = t0.elapsed().as_secs_f64() * 1e6;
+
+    println!(
+        "[RUL LINK OK] -> {} ({out_bytes} B) | Cap={:#x} | Modules={} | Funcs={} | Regions={} | ConstData={} B | Time={elapsed_us:.1} us",
+        out_file.display(),
+        report.capability_mask,
+        report.module_count,
+        report.func_count,
+        report.region_count,
+        report.const_data_bytes,
+    );
+    Ok(())
 }
 
 fn cmd_build(arg: Option<&str>) -> Result<(PathBuf, PathBuf, RulProgram, VerifiedSummary), String> {
@@ -696,6 +812,7 @@ fn main() -> ExitCode {
             dir.and_then(cmd_new).map(|()| ExitCode::SUCCESS)
         }
         "check" | "verify" => cmd_check(args.get(2..).unwrap_or(&[])),
+        "link" => cmd_link(args.get(2..).unwrap_or(&[])).map(|()| ExitCode::SUCCESS),
         "build" | "compile" => {
             cmd_build(args.get(2).map(String::as_str)).map(|_| ExitCode::SUCCESS)
         }

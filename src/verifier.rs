@@ -8,14 +8,15 @@
 //!    with strict `origin_arena` binding (preventing cross-arena proof spoofing).
 //! 4. Zero-trust hardware [`CAP_NET_RING`] capability sandboxing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::bytecode::{
-    func_frame_units, ElemType, FuncSigInfo, NodeFrame, Opcode, ProofEntry, ProofRuleKind,
-    RegionRole, RegionState, RulProgram, SimdWidth, TokenMode, TypeLane, CALL_ARG_SENTINEL,
-    CAP_DIVERGE, CAP_NET_RING, MAX_CONST_DATA_BYTES, MAX_FUNC_NODES, MAX_LINK_META_BYTES,
-    MAX_REGION_BYTES, MAX_REGION_SLOTS, MAX_SECTION_ITEMS, MAX_TABLE_ENTRIES,
+    func_frame_units, ElemType, FuncSigInfo, LinkDirection, LinkMetadata, LinkSymbolKind,
+    NodeFrame, Opcode, ProofEntry, ProofRuleKind, RegionRole, RegionState, RulFormatError,
+    RulProgram, SimdWidth, TokenMode, TypeLane, CALL_ARG_SENTINEL, CAP_DIVERGE, CAP_NET_RING,
+    MAX_CONST_DATA_BYTES, MAX_FUNC_NODES, MAX_LINK_META_BYTES, MAX_REGION_BYTES, MAX_REGION_SLOTS,
+    MAX_SECTION_ITEMS, MAX_TABLE_ENTRIES,
 };
 
 /// Shape and static length inferred in $O(1)$ per node during the single-pass scan.
@@ -274,6 +275,20 @@ pub enum VerifyErrorKind {
     },
     /// `CallIndirect` referenced an undeclared `CallTable` identifier.
     UnknownCallTable(u32),
+    /// Program contains an unresolved module import and cannot execute until linked via `rul link`.
+    UnresolvedImport {
+        /// Imported symbol kind (`Func` or `Region`).
+        kind: LinkSymbolKind,
+        /// Module-local function ID or region slot.
+        local_id: u16,
+        /// Unresolved imported symbol name.
+        name: String,
+    },
+    /// Invalid or inconsistent Section 5b (`link_meta`) module export/import declaration.
+    InvalidLinkMetadata {
+        /// Reason the link metadata was rejected.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for VerifyDiagnostic {
@@ -322,12 +337,12 @@ impl NodeMeta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RegionDeclInfo {
-    slot: u16,
-    min_len: u32,
-    max_len: u32,
-    elem: ElemType,
-    role: RegionRole,
+pub(crate) struct RegionDeclInfo {
+    pub(crate) slot: u16,
+    pub(crate) min_len: u32,
+    pub(crate) max_len: u32,
+    pub(crate) elem: ElemType,
+    pub(crate) role: RegionRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,12 +376,12 @@ struct CompletedFunc {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FuncRegionContract {
-    dom_mask: u64,
-    pre_owned: u64,
-    pre_leased: u64,
-    post_owned: u64,
-    post_leased: u64,
+pub(crate) struct FuncRegionContract {
+    pub(crate) dom_mask: u64,
+    pub(crate) pre_owned: u64,
+    pub(crate) pre_leased: u64,
+    pub(crate) post_owned: u64,
+    pub(crate) post_leased: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,10 +405,22 @@ struct CallTableSummary {
     rep_func_id: u16,
     sig: FuncSigInfo,
     contract: FuncRegionContract,
-    max_func_id: u32,
+    max_local_func_id: Option<u32>,
     offset: u32,
     entry_count: u32,
     cost_summary: Option<(u64, u32, u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyMode {
+    Executable,
+    Module,
+}
+
+struct ScannedLinkMeta {
+    has_imports: bool,
+    imported_funcs: Vec<bool>,
+    imported_func_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,10 +812,14 @@ struct VerifierState {
     call_tables: Vec<CallTableSummary>,
     func_sigs: Vec<FuncSigInfo>,
     func_contracts: Vec<FuncRegionContract>,
+    imported_funcs: Vec<bool>,
+    has_imports: bool,
     current_func: Option<ActiveFunc>,
     pending_call_arg: Option<PendingCallArg>,
     next_func_id: u32,
-    completed_funcs: Vec<CompletedFunc>,
+    completed_funcs: Vec<Option<CompletedFunc>>,
+    completed_func_count: usize,
+    last_completed_func: Option<CompletedFunc>,
     has_func_mode: bool,
     seen_non_func_top_level: bool,
     cur_steps: u64,
@@ -796,7 +827,7 @@ struct VerifierState {
     cur_max_callee_stack_units: u32,
 }
 
-fn scan_func_sigs(program: &RulProgram) -> Result<Vec<FuncSigInfo>, VerifyDiagnostic> {
+pub(crate) fn scan_func_sigs(program: &RulProgram) -> Result<Vec<FuncSigInfo>, VerifyDiagnostic> {
     let mut raw: Vec<FuncSigInfo> = Vec::new();
     for proof in &program.proofs {
         if proof.rule_kind != ProofRuleKind::FuncSig {
@@ -860,7 +891,7 @@ fn scan_func_sigs(program: &RulProgram) -> Result<Vec<FuncSigInfo>, VerifyDiagno
     Ok(dense)
 }
 
-fn scan_region_decls(
+pub(crate) fn scan_region_decls(
     program: &RulProgram,
 ) -> Result<[Option<RegionDeclInfo>; MAX_REGION_SLOTS], VerifyDiagnostic> {
     let mut regions: [Option<RegionDeclInfo>; MAX_REGION_SLOTS] = [None; MAX_REGION_SLOTS];
@@ -1002,7 +1033,7 @@ const fn shape_steps(shape: ValueShape) -> u64 {
     }
 }
 
-fn declared_region_mask(regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS]) -> u64 {
+pub(crate) fn declared_region_mask(regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS]) -> u64 {
     let mut mask = 0u64;
     for (idx, opt) in regions.iter().enumerate() {
         if opt.is_some() {
@@ -1035,11 +1066,12 @@ fn compute_max_region_bytes(
     total
 }
 
-fn scan_func_region_contracts(
+pub(crate) fn scan_func_region_contracts(
     program: &RulProgram,
     regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS],
     declared_mask: u64,
     func_sigs: &[FuncSigInfo],
+    mode: VerifyMode,
 ) -> Result<Vec<FuncRegionContract>, VerifyDiagnostic> {
     #[derive(Clone, Copy, Default)]
     struct RawContract {
@@ -1173,28 +1205,220 @@ fn scan_func_region_contracts(
         contracts.push(c);
     }
 
-    if let Some(entry_contract) = contracts.last().copied() {
-        let entry_id = u16::try_from(func_count.saturating_sub(1)).unwrap_or(0);
-        if (entry_contract.pre_owned & entry_contract.dom_mask) != entry_contract.dom_mask
-            || entry_contract.pre_leased != 0
-        {
-            return Err(VerifyDiagnostic {
-                node_idx: 0,
-                kind: VerifyErrorKind::InvalidRegionEffect {
-                    func_id: entry_id,
-                    reason: "entry function precondition must be Owned for every region in its footprint",
-                },
-            });
+    if mode == VerifyMode::Executable {
+        if let Some(entry_contract) = contracts.last().copied() {
+            let entry_id = u16::try_from(func_count.saturating_sub(1)).unwrap_or(0);
+            if (entry_contract.pre_owned & entry_contract.dom_mask) != entry_contract.dom_mask
+                || entry_contract.pre_leased != 0
+            {
+                return Err(VerifyDiagnostic {
+                    node_idx: 0,
+                    kind: VerifyErrorKind::InvalidRegionEffect {
+                        func_id: entry_id,
+                        reason: "entry function precondition must be Owned for every region in its footprint",
+                    },
+                });
+            }
         }
     }
 
     Ok(contracts)
 }
 
-fn func_sig_matches(a: FuncSigInfo, b: FuncSigInfo) -> bool {
+pub(crate) fn func_sig_matches(a: FuncSigInfo, b: FuncSigInfo) -> bool {
     a.arity == b.arity
         && a.ret_elem == b.ret_elem
         && (0..usize::from(a.arity)).all(|i| a.params.get(i) == b.params.get(i))
+}
+
+fn scan_link_meta(
+    program: &RulProgram,
+    mode: VerifyMode,
+    regions: &[Option<RegionDeclInfo>; MAX_REGION_SLOTS],
+    func_sigs: &[FuncSigInfo],
+) -> Result<ScannedLinkMeta, VerifyDiagnostic> {
+    let meta = LinkMetadata::from_bytes(&program.link_meta).map_err(|err| {
+        let reason = match err {
+            RulFormatError::InvalidLinkMetadata(r) => r,
+            _ => "malformed link_meta section",
+        };
+        VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidLinkMetadata { reason },
+        }
+    })?;
+
+    let mut seen_export_names: HashSet<&str> = HashSet::with_capacity(meta.entries.len());
+    let mut seen_import_names: HashSet<&str> = HashSet::with_capacity(meta.entries.len());
+    let mut imported_funcs: Vec<bool> = vec![false; func_sigs.len()];
+    let mut imported_func_count: usize = 0;
+    let mut imported_regions_mask: u64 = 0;
+    let mut exported_funcs: Vec<u16> = Vec::new();
+    let mut exported_regions: Vec<u16> = Vec::new();
+    let mut first_import: Option<(LinkSymbolKind, u16, String)> = None;
+
+    for entry in &meta.entries {
+        match entry.direction {
+            LinkDirection::Export => {
+                if !seen_export_names.insert(entry.name.as_str()) {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidLinkMetadata {
+                            reason: "duplicate export symbol name in module",
+                        },
+                    });
+                }
+                match entry.kind {
+                    LinkSymbolKind::Func => {
+                        if usize::from(entry.local_id) >= func_sigs.len() {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidLinkMetadata {
+                                    reason: "export func references non-existent func_id",
+                                },
+                            });
+                        }
+                        exported_funcs.push(entry.local_id);
+                    }
+                    LinkSymbolKind::Region => {
+                        if regions
+                            .get(usize::from(entry.local_id))
+                            .and_then(|r| *r)
+                            .is_none()
+                        {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidLinkMetadata {
+                                    reason: "export region references non-existent region slot",
+                                },
+                            });
+                        }
+                        exported_regions.push(entry.local_id);
+                    }
+                }
+            }
+            LinkDirection::Import => {
+                if first_import.is_none() {
+                    first_import = Some((entry.kind, entry.local_id, entry.name.clone()));
+                }
+                if !seen_import_names.insert(entry.name.as_str()) {
+                    return Err(VerifyDiagnostic {
+                        node_idx: 0,
+                        kind: VerifyErrorKind::InvalidLinkMetadata {
+                            reason: "duplicate import symbol name in module",
+                        },
+                    });
+                }
+                match entry.kind {
+                    LinkSymbolKind::Func => {
+                        let Some(slot) = imported_funcs.get_mut(usize::from(entry.local_id)) else {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidLinkMetadata {
+                                    reason: "import func references non-existent FuncSig func_id",
+                                },
+                            });
+                        };
+                        if *slot {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidLinkMetadata {
+                                    reason: "duplicate import func targeting the same func_id",
+                                },
+                            });
+                        }
+                        *slot = true;
+                        imported_func_count = imported_func_count.saturating_add(1);
+                    }
+                    LinkSymbolKind::Region => {
+                        if regions
+                            .get(usize::from(entry.local_id))
+                            .and_then(|r| *r)
+                            .is_none()
+                        {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidLinkMetadata {
+                                    reason: "import region references non-existent region slot",
+                                },
+                            });
+                        }
+                        let bit = 1u64 << entry.local_id;
+                        if (imported_regions_mask & bit) != 0 {
+                            return Err(VerifyDiagnostic {
+                                node_idx: 0,
+                                kind: VerifyErrorKind::InvalidLinkMetadata {
+                                    reason: "duplicate import region targeting the same slot",
+                                },
+                            });
+                        }
+                        imported_regions_mask |= bit;
+                    }
+                }
+            }
+        }
+    }
+
+    for &exp_name in &seen_export_names {
+        if seen_import_names.contains(exp_name) {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidLinkMetadata {
+                    reason: "symbol name cannot be both imported and exported by the same module",
+                },
+            });
+        }
+    }
+    for fid in exported_funcs {
+        if imported_funcs
+            .get(usize::from(fid))
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidLinkMetadata {
+                    reason: "cannot export an imported func_id",
+                },
+            });
+        }
+    }
+    for slot in exported_regions {
+        if (imported_regions_mask & (1u64 << slot)) != 0 {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::InvalidLinkMetadata {
+                    reason: "cannot export an imported region slot",
+                },
+            });
+        }
+    }
+
+    if mode == VerifyMode::Executable {
+        if let Some((kind, local_id, name)) = first_import {
+            return Err(VerifyDiagnostic {
+                node_idx: 0,
+                kind: VerifyErrorKind::UnresolvedImport {
+                    kind,
+                    local_id,
+                    name,
+                },
+            });
+        }
+    }
+
+    Ok(ScannedLinkMeta {
+        has_imports: first_import.is_some(),
+        imported_funcs,
+        imported_func_count,
+    })
+}
+
+fn advance_next_func_id(mut id: u32, imported_funcs: &[bool]) -> u32 {
+    while imported_funcs.get(id as usize).copied().unwrap_or(false) {
+        id = id.saturating_add(1);
+    }
+    id
 }
 
 struct ScannedConstTables {
@@ -1211,6 +1435,7 @@ fn scan_const_data_tables(
     program: &RulProgram,
     func_sigs: &[FuncSigInfo],
     func_contracts: &[FuncRegionContract],
+    imported_funcs: &[bool],
 ) -> Result<ScannedConstTables, VerifyDiagnostic> {
     if program.const_data.len() > (MAX_CONST_DATA_BYTES as usize) {
         return Err(VerifyDiagnostic {
@@ -1342,7 +1567,7 @@ fn scan_const_data_tables(
                 let mut expected_sig: Option<FuncSigInfo> = None;
                 let mut expected_contract: Option<FuncRegionContract> = None;
                 let mut rep_func_id: u16 = 0;
-                let mut max_func_id: u32 = 0;
+                let mut max_local_func_id: Option<u32> = None;
                 for chunk in slice.as_chunks::<4>().0 {
                     let fid = u32::from_le_bytes(*chunk);
                     let sig = func_sigs
@@ -1385,7 +1610,9 @@ fn scan_const_data_tables(
                     } else {
                         expected_contract = Some(contract);
                     }
-                    max_func_id = max_func_id.max(fid);
+                    if !imported_funcs.get(fid as usize).copied().unwrap_or(false) {
+                        max_local_func_id = Some(max_local_func_id.map_or(fid, |cur| cur.max(fid)));
+                    }
                 }
                 let (Some(sig), Some(contract)) = (expected_sig, expected_contract) else {
                     return Err(VerifyDiagnostic {
@@ -1400,7 +1627,7 @@ fn scan_const_data_tables(
                     rep_func_id,
                     sig,
                     contract,
-                    max_func_id,
+                    max_local_func_id,
                     offset: proof.bound_lo,
                     entry_count,
                     cost_summary: None,
@@ -1508,23 +1735,46 @@ fn scan_const_data_tables(
     })
 }
 
-/// Verifies an [`RulProgram`] in a single forward pass ($O(N)$ time and $O(N)$ state).
+/// Verifies a self-contained executable [`RulProgram`] in a single forward pass ($O(N)$ time and $O(N)$ state).
+///
+/// Fails closed with [`VerifyErrorKind::UnresolvedImport`] if the binary contains any unresolved
+/// module imports in Section 5b (`link_meta`).
 ///
 /// # Errors
 /// Returns a structured [`VerifyDiagnostic`] pinpointing the exact node index and rule
-/// violation if any safety, ownership, bounds, or capability invariant fails.
+/// violation if any safety, ownership, bounds, capability, or link-import invariant fails.
 pub fn verify_program(program: &RulProgram) -> Result<VerifiedSummary, VerifyDiagnostic> {
-    verify_program_core(program).map(|(summary, _)| summary)
+    verify_program_core(program, VerifyMode::Executable).map(|(summary, _)| summary)
+}
+
+/// Verifies a standalone or partial library module [`RulProgram`] in a single forward pass ($O(N)$).
+///
+/// Shares the exact core verification pass with [`verify_program`], permitting unresolved `import func`
+/// and `import region` declarations in Section 5b (`link_meta`). When any unresolved import is present,
+/// returns `VerifiedSummary.static_cost = None` (static cost is computed only after linking).
+///
+/// # Errors
+/// Returns a structured [`VerifyDiagnostic`] if any module interface, type, region typestate,
+/// frame-rule, bounds, or capability invariant fails.
+pub fn verify_module(program: &RulProgram) -> Result<VerifiedSummary, VerifyDiagnostic> {
+    verify_program_core(program, VerifyMode::Module).map(|(summary, _)| summary)
 }
 
 #[cfg(test)]
 pub(crate) fn verify_program_with_join_work(
     program: &RulProgram,
 ) -> Result<(VerifiedSummary, u64), VerifyDiagnostic> {
-    verify_program_core(program)
+    verify_program_core(program, VerifyMode::Executable)
 }
 
-fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), VerifyDiagnostic> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass O(N) core verifier shared by verify_program and verify_module"
+)]
+fn verify_program_core(
+    program: &RulProgram,
+    mode: VerifyMode,
+) -> Result<(VerifiedSummary, u64), VerifyDiagnostic> {
     let node_count = program.nodes.len();
     if node_count == 0 || (program.output_node as usize) >= node_count {
         return Err(VerifyDiagnostic {
@@ -1533,20 +1783,29 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
         });
     }
 
-    // One linear pre-scan of the proof table to index declared regions, function signatures, region contracts, and constant-data tables.
+    // One linear pre-scan of the proof table and Section 5b link metadata to index declared regions,
+    // function signatures, module imports/exports, region contracts, and constant-data tables.
     let regions = scan_region_decls(program)?;
     let declared_mask = declared_region_mask(&regions);
     let func_sigs = scan_func_sigs(program)?;
-    let func_contracts = scan_func_region_contracts(program, &regions, declared_mask, &func_sigs)?;
+    let ScannedLinkMeta {
+        has_imports,
+        imported_funcs,
+        imported_func_count,
+    } = scan_link_meta(program, mode, &regions, &func_sigs)?;
+    let func_contracts =
+        scan_func_region_contracts(program, &regions, declared_mask, &func_sigs, mode)?;
     let ScannedConstTables {
         const_data_segs,
         br_tables,
         call_tables,
-    } = scan_const_data_tables(program, &func_sigs, &func_contracts)?;
+    } = scan_const_data_tables(program, &func_sigs, &func_contracts, &imported_funcs)?;
     let br_table_used = vec![false; br_tables.len()];
     let has_func_mode = !func_sigs.is_empty();
     let sandbox_mode = (program.capability_mask & CAP_DIVERGE) == 0;
     let max_region_bytes = compute_max_region_bytes(program, &regions);
+    let next_func_id = advance_next_func_id(0, &imported_funcs);
+    let completed_funcs = vec![None; func_sigs.len()];
 
     // Track inferred ValueShape, ElemType, and origin Arena per SSA node.
     let mut metas: Vec<NodeMeta> = Vec::with_capacity(node_count);
@@ -1567,10 +1826,14 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
         call_tables,
         func_sigs,
         func_contracts,
+        imported_funcs,
+        has_imports,
         current_func: None,
         pending_call_arg: None,
-        next_func_id: 0,
-        completed_funcs: Vec::new(),
+        next_func_id,
+        completed_funcs,
+        completed_func_count: 0,
+        last_completed_func: None,
         has_func_mode,
         seen_non_func_top_level: false,
         cur_steps: 0,
@@ -1706,26 +1969,70 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
     }
 
     if state.has_func_mode {
-        if state.completed_funcs.len() != state.func_sigs.len() {
+        let expected_defined = state.func_sigs.len().saturating_sub(imported_func_count);
+        if state.completed_func_count != expected_defined {
             return Err(VerifyDiagnostic {
                 node_idx: 0,
                 kind: VerifyErrorKind::InvalidFuncSig {
-                    func_id: u32::try_from(state.completed_funcs.len()).unwrap_or(u32::MAX),
+                    func_id: state.next_func_id,
                     reason: "Func count does not match FuncSig proof count",
                 },
             });
         }
-        let entry = state
-            .completed_funcs
-            .last()
-            .copied()
-            .ok_or(VerifyDiagnostic {
-                node_idx: 0,
-                kind: VerifyErrorKind::InvalidFuncSig {
-                    func_id: 0,
-                    reason: "function program must declare at least one Func",
+        if mode == VerifyMode::Module {
+            let last = state.last_completed_func;
+            let output_elem = last.and_then(|f| f.sig.ret_elem).unwrap_or(ElemType::I64);
+            let static_cost = if !state.has_imports && sandbox_mode {
+                last.and_then(|entry| {
+                    let entry_contract = state
+                        .func_contracts
+                        .get(usize::from(entry.sig.func_id))
+                        .copied()?;
+                    let entry_pre_owned = (entry_contract.pre_owned & entry_contract.dom_mask)
+                        == entry_contract.dom_mask
+                        && entry_contract.pre_leased == 0;
+                    if entry.sig.arity == 0
+                        && entry.sig.ret_elem.is_some()
+                        && program.output_node == entry.start_node
+                        && entry_pre_owned
+                    {
+                        let max_stack_bytes = u64::from(entry.max_stack_units)
+                            .saturating_mul(8)
+                            .saturating_add(4096);
+                        Some(StaticCostSummary {
+                            worst_case_steps: entry.worst_case_steps,
+                            max_call_depth: entry.max_call_depth,
+                            max_stack_units: entry.max_stack_units,
+                            max_stack_bytes,
+                            max_region_bytes,
+                        })
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            return Ok((
+                VerifiedSummary {
+                    node_count,
+                    fusion_groups: usize::from(max_fusion_group),
+                    output_shape: ValueShape::Scalar,
+                    output_elem,
+                    zero_runtime_bounds_checks: !has_gather && !state.has_unproven_region_access,
+                    static_cost,
                 },
-            })?;
+                state.arena_state.join_work_steps(),
+            ));
+        }
+
+        let entry = state.last_completed_func.ok_or(VerifyDiagnostic {
+            node_idx: 0,
+            kind: VerifyErrorKind::InvalidFuncSig {
+                func_id: 0,
+                reason: "function program must declare at least one Func",
+            },
+        })?;
         if entry.sig.arity != 0 {
             return Err(VerifyDiagnostic {
                 node_idx: entry.start_node,
@@ -1797,7 +2104,7 @@ fn verify_program_core(program: &RulProgram) -> Result<(VerifiedSummary, u64), V
         });
     }
 
-    let static_cost = if sandbox_mode {
+    let static_cost = if sandbox_mode && !state.has_imports {
         Some(StaticCostSummary {
             worst_case_steps: state.cur_steps,
             max_call_depth: 1,
@@ -4000,13 +4307,18 @@ fn verify_node_semantics(
                     state.cur_steps = 0;
                     state.cur_max_callee_depth = 0;
                     state.cur_max_callee_stack_units = 0;
-                    state.completed_funcs.push(CompletedFunc {
+                    let completed = CompletedFunc {
                         sig,
                         start_node,
                         worst_case_steps,
                         max_call_depth,
                         max_stack_units,
-                    });
+                    };
+                    if let Some(slot) = state.completed_funcs.get_mut(usize::from(sig.func_id)) {
+                        *slot = Some(completed);
+                    }
+                    state.completed_func_count = state.completed_func_count.saturating_add(1);
+                    state.last_completed_func = Some(completed);
                 }
             }
 
@@ -4802,6 +5114,20 @@ fn verify_node_semantics(
                     ),
                 });
             }
+            if state
+                .imported_funcs
+                .get(frame.in_a as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidFuncSig {
+                        func_id: frame.in_a,
+                        reason: "imported function cannot define a Func body",
+                    },
+                });
+            }
             let expected_id = state.next_func_id;
             if frame.in_a != expected_id {
                 return Err(VerifyDiagnostic {
@@ -4872,7 +5198,8 @@ fn verify_node_semantics(
                 sig,
                 start_node: node_idx,
             });
-            state.next_func_id = expected_id.saturating_add(1);
+            state.next_func_id =
+                advance_next_func_id(expected_id.saturating_add(1), &state.imported_funcs);
             let entry_arena_root = state.arena_state.commit_root(program);
             state.control_stack.push(ControlFrame {
                 kind: ControlKind::Func {
@@ -5050,7 +5377,13 @@ fn verify_node_semantics(
                         node_idx,
                         kind: VerifyErrorKind::UnknownFunction(target_id),
                     })?;
-            if target_id >= u32::from(active.sig.func_id)
+            let target_is_imported = state
+                .imported_funcs
+                .get(target_id as usize)
+                .copied()
+                .unwrap_or(false);
+            if !target_is_imported
+                && target_id >= u32::from(active.sig.func_id)
                 && (program.capability_mask & CAP_DIVERGE) == 0
             {
                 return Err(VerifyDiagnostic {
@@ -5193,7 +5526,9 @@ fn verify_node_semantics(
                 state.region_leased = (state.region_leased & !dom) | callee_contract.post_leased;
 
                 if (program.capability_mask & CAP_DIVERGE) == 0 {
-                    if let Some(callee) = state.completed_funcs.get(target_id as usize).copied() {
+                    if let Some(Some(callee)) =
+                        state.completed_funcs.get(target_id as usize).copied()
+                    {
                         state.cur_steps = state
                             .cur_steps
                             .saturating_add(1)
@@ -5552,7 +5887,9 @@ fn verify_node_semantics(
                 });
             }
             if (program.capability_mask & CAP_DIVERGE) == 0
-                && table.max_func_id >= u32::from(active.sig.func_id)
+                && table
+                    .max_local_func_id
+                    .is_some_and(|max_local| max_local >= u32::from(active.sig.func_id))
             {
                 return Err(VerifyDiagnostic {
                     node_idx,
@@ -5696,7 +6033,9 @@ fn verify_node_semantics(
                         {
                             for chunk in slice.as_chunks::<4>().0 {
                                 let fid = u32::from_le_bytes(*chunk);
-                                if let Some(cf) = state.completed_funcs.get(fid as usize).copied() {
+                                if let Some(Some(cf)) =
+                                    state.completed_funcs.get(fid as usize).copied()
+                                {
                                     ms = ms.max(cf.worst_case_steps);
                                     md = md.max(cf.max_call_depth);
                                     msu = msu.max(cf.max_stack_units);
